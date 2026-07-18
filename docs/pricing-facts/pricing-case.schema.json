@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://qintopia.local/schemas/pricing-case.schema.json",
+  "title": "QinTopia real pricing fact",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["caseId", "anonymizedOrderRef", "businessExplanation", "businessPlan", "scenarioTags", "propertyTimeZone", "currency", "inventoryUnitKind", "arrivalDate", "departureDate", "departureCharged", "priceInputs", "coverageSet", "amendments", "rounding", "expected"],
+  "properties": {
+    "caseId": { "type": "string", "minLength": 1 },
+    "anonymizedOrderRef": { "type": "string", "minLength": 1 },
+    "businessExplanation": { "type": "string", "minLength": 1 },
+    "businessPlan": { "enum": ["TRANSIENT", "WEEKLY", "MONTHLY", "CUSTOM", "FIXED_TERM", "ROLLING", "FREE"] },
+    "scenarioTags": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "enum": ["BASELINE", "SHORTEN", "EXTEND", "MOVE", "CROSS_MONTH", "PARTIAL_MEMBER_COVERAGE", "MANUAL_ADJUSTMENT", "BOUNDARY"] }
+    },
+    "propertyTimeZone": { "type": "string", "minLength": 1 },
+    "currency": { "type": "string", "pattern": "^[A-Z]{3}$" },
+    "inventoryUnitKind": { "enum": ["ROOM", "BED"] },
+    "arrivalDate": { "type": "string", "format": "date" },
+    "departureDate": { "type": "string", "format": "date" },
+    "departureCharged": { "type": "boolean" },
+    "priceInputs": { "type": "object", "additionalProperties": true },
+    "coverageSet": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["serviceDate", "unitKind"],
+        "properties": { "serviceDate": { "type": "string", "format": "date" }, "unitKind": { "enum": ["ROOM_NIGHT", "BED_NIGHT"] } }
+      }
+    },
+    "amendments": { "type": "array", "items": { "type": "object", "additionalProperties": true } },
+    "rounding": { "type": "object", "additionalProperties": true },
+    "expected": {
+      "type": "object",
+      "required": ["cashLines", "cashRemainderMinor", "currentContractAmountMinor"],
+      "properties": {
+        "cashLines": { "type": "array", "items": { "type": "object", "additionalProperties": true } },
+        "cashRemainderMinor": { "type": "integer" },
+        "currentContractAmountMinor": { "type": "integer" }
+      }
+    }
+  }
+}

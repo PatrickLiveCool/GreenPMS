@@ -1,0 +1,18 @@
+{
+  "name": "@qintopia/db",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "migrate": "tsx src/migrate.ts",
+    "seed": "tsx src/seed.ts",
+    "reset": "tsx src/reset.ts"
+  },
+  "dependencies": {
+    "@qintopia/contracts": "0.1.0",
+    "@qintopia/domain": "0.1.0"
+  }
+}

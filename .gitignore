@@ -1,0 +1,8 @@
+node_modules/
+apps/web/dist/
+playwright-report/
+test-results/
+.env
+.DS_Store
+coverage/
+backups/*.dump

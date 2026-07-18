@@ -1,0 +1,885 @@
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import type { AuthPrincipal, CommandEnvelope, ReceiptDto } from "@qintopia/contracts";
+import { confirmCommandPreview, createCommandPreview, findCommandResult, getOrderView, listAvailability, loadActiveStayTimeline, loadOrderContext, type Database } from "@qintopia/db";
+import { newOpaqueSecret } from "@qintopia/domain";
+import { sql, type Kysely } from "kysely";
+import { demo } from "../../packages/db/src/seed.ts";
+import { createQuoteForTesting as createQuote } from "../../packages/db/src/pricing-service.ts";
+import { resetTestDatabase } from "../helpers/database.ts";
+
+let db: Kysely<Database>;
+const principal: AuthPrincipal = {
+  subjectId: demo.agentSubjectId,
+  credentialId: "token_demo_write",
+  credentialType: "TOKEN",
+  displayName: "Demo Agent",
+  propertyAccess: new Map([[demo.propertyId, "WRITE"]])
+};
+
+let sequence = 0;
+function metadata(prefix: string) {
+  sequence += 1;
+  return { idempotencyKey: `${prefix}-${sequence}`, correlationId: `${prefix}-${sequence}` };
+}
+
+async function previewAndConfirm(envelope: CommandEnvelope, prefix: string): Promise<ReceiptDto> {
+  const preview = await createCommandPreview(db, principal, envelope, metadata(`${prefix}-preview`));
+  return confirmCommandPreview(db, principal, preview.preview.previewId, {
+    propertyId: envelope.input.propertyId as string,
+    commandType: envelope.commandType,
+    confirmation: true,
+    expectedEffectHash: preview.preview.effectHash,
+    reason: { code: "AUTOMATED_ACCEPTANCE", note: "Database integration acceptance" }
+  }, metadata(`${prefix}-confirm`));
+}
+
+async function quote(unitId: string, options: { member?: boolean; stayType?: "TRANSIENT" | "FREE"; arrival?: string; departure?: string } = {}) {
+  const stayType = options.stayType ?? "TRANSIENT";
+  return createQuote(db, {
+    propertyId: demo.propertyId,
+    inventoryUnitId: unitId,
+    stayType,
+    arrivalDate: options.arrival ?? "2026-07-21",
+    departureDate: options.departure ?? "2026-07-24",
+    pricingPolicyVersionId: stayType === "FREE" ? demo.freePolicyId : demo.transientPolicyId,
+    ...(options.member ? { memberContractId: demo.memberContractId } : {})
+  });
+}
+
+async function createOrder(unitId: string, prefix: string, options: { member?: boolean; stayType?: "TRANSIENT" | "FREE"; arrival?: string; departure?: string } = {}) {
+  const priced = await quote(unitId, options);
+  return previewAndConfirm({
+    commandType: "CREATE_ORDER",
+    input: { propertyId: demo.propertyId, quoteId: priced.quoteId, primaryGuest: { fullName: `Guest ${prefix}` } }
+  }, prefix);
+}
+
+async function within<T>(promise: Promise<T>, milliseconds: number): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(`Timed out after ${milliseconds}ms`)), milliseconds);
+      })
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+beforeEach(async () => {
+  db = await resetTestDatabase();
+});
+
+afterEach(async () => {
+  if (db) await db.destroy();
+});
+
+describe("PostgreSQL core operations", () => {
+  it("forms coverage before cash and locks policy/versioned order history", async () => {
+    const priced = await quote(demo.roomId, { member: true });
+    expect(priced.coverageSet).toHaveLength(2);
+    expect(priced.cashLines).toHaveLength(1);
+    expect(priced.cashRemainder.minorUnits).toBe(12_000);
+    const receipt = await previewAndConfirm({
+      commandType: "CREATE_ORDER",
+      input: { propertyId: demo.propertyId, quoteId: priced.quoteId, primaryGuest: { fullName: "Member Guest" } }
+    }, "member-order");
+    expect(receipt.businessCommitted).toBe(true);
+    const view = await getOrderView(db, receipt.result!.orderId as string);
+    expect(view.order.pricing_policy_version_id).toBe(demo.transientPolicyId);
+    expect(view.pricingRevisions).toHaveLength(1);
+    expect(view.amounts.currentContractAmount.minorUnits).toBe(12_000);
+  });
+
+  it("reconciles newly available entitlement into real coverage exactly once", async () => {
+    const created = await createOrder(demo.roomId, "reprice-coverage", { member: true });
+    const orderId = created.result!.orderId as string;
+    expect((await getOrderView(db, orderId)).coverageSet.filter((item) => item.status === "HELD")).toHaveLength(2);
+
+    await previewAndConfirm({
+      commandType: "ADJUST_MEMBER_ENTITLEMENT",
+      input: {
+        propertyId: demo.propertyId,
+        entitlementLotId: demo.roomLotId,
+        quantityDelta: 1,
+        adjustmentReason: "Cover the third service date"
+      }
+    }, "reprice-coverage-adjust");
+    await previewAndConfirm({
+      commandType: "REPRICE_ORDER",
+      input: { propertyId: demo.propertyId, orderId, manualAdjustmentMinor: 1 }
+    }, "reprice-coverage-first");
+
+    let activeCoverage = (await getOrderView(db, orderId)).coverageSet.filter((item) => item.status === "HELD");
+    expect(activeCoverage).toHaveLength(3);
+    expect(new Set(activeCoverage.map((item) => item.service_date)).size).toBe(3);
+    expect(await db.selectFrom("entitlement_ledger").select("fact_id")
+      .where("order_id", "=", orderId).where("entry_type", "=", "HOLD").execute()).toHaveLength(3);
+    let balance = await db.selectFrom("entitlement_lots")
+      .leftJoin("entitlement_ledger", "entitlement_ledger.lot_id", "entitlement_lots.id")
+      .select([
+        "entitlement_lots.total_units",
+        sql<number>`cast(coalesce(sum(entitlement_ledger.quantity_delta), 0) as integer)`.as("ledger_delta")
+      ])
+      .where("entitlement_lots.id", "=", demo.roomLotId)
+      .groupBy("entitlement_lots.total_units")
+      .executeTakeFirstOrThrow();
+    expect(balance.total_units + Number(balance.ledger_delta)).toBe(0);
+
+    await previewAndConfirm({
+      commandType: "REPRICE_ORDER",
+      input: { propertyId: demo.propertyId, orderId, manualAdjustmentMinor: 2 }
+    }, "reprice-coverage-second");
+    activeCoverage = (await getOrderView(db, orderId)).coverageSet.filter((item) => item.status === "HELD");
+    expect(activeCoverage).toHaveLength(3);
+    expect(await db.selectFrom("entitlement_ledger").select("fact_id")
+      .where("order_id", "=", orderId).where("entry_type", "=", "HOLD").execute()).toHaveLength(3);
+    balance = await db.selectFrom("entitlement_lots")
+      .leftJoin("entitlement_ledger", "entitlement_ledger.lot_id", "entitlement_lots.id")
+      .select([
+        "entitlement_lots.total_units",
+        sql<number>`cast(coalesce(sum(entitlement_ledger.quantity_delta), 0) as integer)`.as("ledger_delta")
+      ])
+      .where("entitlement_lots.id", "=", demo.roomLotId)
+      .groupBy("entitlement_lots.total_units")
+      .executeTakeFirstOrThrow();
+    expect(balance.total_units + Number(balance.ledger_delta)).toBe(0);
+  });
+
+  it("enforces one active coverage per order date and moves coverage with a new permanent ID", async () => {
+    const created = await createOrder(demo.roomId, "coverage-unique", {
+      member: true,
+      arrival: "2026-07-21",
+      departure: "2026-07-23"
+    });
+    const orderId = created.result!.orderId as string;
+    const before = await getOrderView(db, orderId);
+    const oldCoverage = before.coverageSet.find((item) => item.service_date === "2026-07-22" && item.status === "HELD")!;
+    await expect(db.insertInto("coverage_items").values({
+      id: "coverage_duplicate_order_date",
+      order_id: orderId,
+      contract_id: demo.memberContractId,
+      lot_id: demo.roomLotId,
+      inventory_unit_id: demo.secondRoomId,
+      service_date: "2026-07-22",
+      unit_kind: "ROOM_NIGHT",
+      status: "HELD",
+      held_by_revision_id: before.order.current_revision_id!
+    }).execute()).rejects.toMatchObject({ constraint: "coverage_items_active_order_date_idx" });
+
+    await previewAndConfirm({
+      commandType: "MOVE_UNIT",
+      input: {
+        propertyId: demo.propertyId,
+        orderId,
+        newInventoryUnitId: demo.secondRoomId,
+        effectiveDate: "2026-07-22"
+      }
+    }, "coverage-unique-move");
+    const movedCoverage = (await getOrderView(db, orderId)).coverageSet.filter((item) => item.service_date === "2026-07-22");
+    expect(movedCoverage).toHaveLength(2);
+    expect(movedCoverage.find((item) => item.id === oldCoverage.id)?.status).toBe("RELEASED");
+    const active = movedCoverage.find((item) => item.status === "HELD")!;
+    expect(active.id).not.toBe(oldCoverage.id);
+    expect(active.inventory_unit_id).toBe(demo.secondRoomId);
+  });
+
+  it("rejects FREE membership before holding entitlement and during defensive command recalculation", async () => {
+    await expect(quote(demo.roomId, { member: true, stayType: "FREE" }))
+      .rejects.toMatchObject({ code: "PRICING_POLICY_UNCONFIGURED" });
+    expect(await db.selectFrom("quotes").select("id").execute()).toHaveLength(0);
+    expect(await db.selectFrom("entitlement_ledger").select("fact_id").execute()).toHaveLength(0);
+
+    const forged = await quote(demo.roomId, { stayType: "FREE" });
+    await db.updateTable("quotes").set({ member_contract_id: demo.memberContractId }).where("id", "=", forged.quoteId).execute();
+    await expect(createCommandPreview(db, principal, {
+      commandType: "CREATE_ORDER",
+      input: { propertyId: demo.propertyId, quoteId: forged.quoteId, primaryGuest: { fullName: "No entitlement debit" } }
+    }, metadata("free-member-command-denied"))).rejects.toMatchObject({ code: "PRICING_POLICY_UNCONFIGURED" });
+    expect(await db.selectFrom("orders").select("id").execute()).toHaveLength(0);
+    expect(await db.selectFrom("entitlement_ledger").select("fact_id").execute()).toHaveLength(0);
+  });
+
+  it("creates a new permanent coverage and HOLD fact when a released night is extended back", async () => {
+    await previewAndConfirm({
+      commandType: "ADJUST_MEMBER_ENTITLEMENT",
+      input: { propertyId: demo.propertyId, entitlementLotId: demo.roomLotId, quantityDelta: 1, adjustmentReason: "Three-night re-hold acceptance" }
+    }, "rehold-adjust");
+    const created = await createOrder(demo.roomId, "rehold", { member: true });
+    const orderId = created.result!.orderId as string;
+    const initialView = await getOrderView(db, orderId);
+    const initialCoverage = initialView.coverageSet.find((item) => item.service_date === "2026-07-23")!;
+
+    await previewAndConfirm({
+      commandType: "SHORTEN_STAY",
+      input: { propertyId: demo.propertyId, orderId, newDepartureDate: "2026-07-23" }
+    }, "rehold-shorten");
+    expect((await getOrderView(db, orderId)).coverageSet.find((item) => item.id === initialCoverage.id)?.status).toBe("RELEASED");
+
+    const extended = await previewAndConfirm({
+      commandType: "EXTEND_STAY",
+      input: { propertyId: demo.propertyId, orderId, newDepartureDate: "2026-07-24" }
+    }, "rehold-extend");
+    expect(extended.businessCommitted).toBe(true);
+    const view = await getOrderView(db, orderId);
+    const coverageForReturnedNight = view.coverageSet.filter((item) => item.service_date === "2026-07-23");
+    expect(coverageForReturnedNight).toHaveLength(2);
+    expect(coverageForReturnedNight.map((item) => item.status).sort()).toEqual(["HELD", "RELEASED"]);
+    const activeCoverage = coverageForReturnedNight.find((item) => item.status === "HELD")!;
+    expect(activeCoverage.id).not.toBe(initialCoverage.id);
+    const ledger = await db.selectFrom("entitlement_ledger").select(["fact_id", "entry_type", "coverage_id", "quantity_delta"])
+      .where("order_id", "=", orderId).where("service_date", "=", "2026-07-23").execute();
+    expect(ledger.filter((entry) => entry.entry_type === "HOLD")).toHaveLength(2);
+    expect(ledger.filter((entry) => entry.entry_type === "HOLD").map((entry) => entry.coverage_id)).toContain(activeCoverage.id);
+    expect(new Set(ledger.map((entry) => entry.fact_id)).size).toBe(ledger.length);
+  });
+
+  it("serializes whole-room versus child-bed claims while allowing different beds", async () => {
+    const roomQuote = await quote(demo.roomId, { stayType: "FREE" });
+    const bedQuote = await quote(demo.bedAId, { stayType: "FREE" });
+    const [roomPreview, bedPreview] = await Promise.all([
+      createCommandPreview(db, principal, { commandType: "CREATE_ORDER", input: { propertyId: demo.propertyId, quoteId: roomQuote.quoteId, primaryGuest: { fullName: "Room Guest" } } }, metadata("room-preview")),
+      createCommandPreview(db, principal, { commandType: "CREATE_ORDER", input: { propertyId: demo.propertyId, quoteId: bedQuote.quoteId, primaryGuest: { fullName: "Bed Guest" } } }, metadata("bed-preview"))
+    ]);
+    const [roomResult, bedResult] = await Promise.all([
+      confirmCommandPreview(db, principal, roomPreview.preview.previewId, { propertyId: demo.propertyId, commandType: "CREATE_ORDER", confirmation: true, expectedEffectHash: roomPreview.preview.effectHash, reason: { code: "TEST", note: "race" } }, metadata("room-confirm")),
+      confirmCommandPreview(db, principal, bedPreview.preview.previewId, { propertyId: demo.propertyId, commandType: "CREATE_ORDER", confirmation: true, expectedEffectHash: bedPreview.preview.effectHash, reason: { code: "TEST", note: "race" } }, metadata("bed-confirm"))
+    ]);
+    expect([roomResult.businessCommitted, bedResult.businessCommitted].filter(Boolean)).toHaveLength(1);
+    const availability = await listAvailability(db, demo.propertyId, "2026-07-21", "2026-07-24");
+    expect(availability.find((unit) => unit.id === demo.roomId)?.available).toBe(false);
+
+    await db.destroy();
+    db = await resetTestDatabase();
+    const [bedA, bedB] = await Promise.all([createOrder(demo.bedAId, "bed-a", { stayType: "FREE" }), createOrder(demo.bedBId, "bed-b", { stayType: "FREE" })]);
+    expect(bedA.businessCommitted).toBe(true);
+    expect(bedB.businessCommitted).toBe(true);
+  });
+
+  it("completes concurrent member order creation and entitlement adjustment without a lock-order deadlock", async () => {
+    const priced = await quote(demo.secondRoomId, { member: true, arrival: "2026-08-01", departure: "2026-08-02" });
+    const createPreview = await createCommandPreview(db, principal, {
+      commandType: "CREATE_ORDER",
+      input: { propertyId: demo.propertyId, quoteId: priced.quoteId, primaryGuest: { fullName: "Lock Order Guest" } }
+    }, metadata("lock-order-create-preview"));
+    const adjustPreview = await createCommandPreview(db, principal, {
+      commandType: "ADJUST_MEMBER_ENTITLEMENT",
+      input: { propertyId: demo.propertyId, entitlementLotId: demo.roomLotId, quantityDelta: 1, adjustmentReason: "Concurrent lock-order acceptance" }
+    }, metadata("lock-order-adjust-preview"));
+    const outcomes = await within(Promise.allSettled([
+      confirmCommandPreview(db, principal, createPreview.preview.previewId, {
+        propertyId: demo.propertyId, commandType: "CREATE_ORDER",
+        confirmation: true, expectedEffectHash: createPreview.preview.effectHash,
+        reason: { code: "LOCK_ORDER_TEST", note: "Create order concurrently" }
+      }, metadata("lock-order-create-confirm")),
+      confirmCommandPreview(db, principal, adjustPreview.preview.previewId, {
+        propertyId: demo.propertyId, commandType: "ADJUST_MEMBER_ENTITLEMENT",
+        confirmation: true, expectedEffectHash: adjustPreview.preview.effectHash,
+        reason: { code: "LOCK_ORDER_TEST", note: "Adjust entitlement concurrently" }
+      }, metadata("lock-order-adjust-confirm"))
+    ]), 5_000);
+    expect(outcomes.every((outcome) => outcome.status === "fulfilled")).toBe(true);
+    const receipts = outcomes.flatMap((outcome) => outcome.status === "fulfilled" ? [outcome.value] : []);
+    expect(receipts.filter((receipt) => receipt.businessCommitted)).toHaveLength(1);
+    expect(receipts.filter((receipt) => !receipt.businessCommitted).map((receipt) => receipt.error?.code)).toEqual(["PREVIEW_STALE"]);
+  });
+
+  it("rejects a stale preview with zero domain writes and preserves a durable rejection receipt", async () => {
+    const firstQuote = await quote(demo.secondRoomId, { stayType: "FREE" });
+    const stale = await createCommandPreview(db, principal, { commandType: "CREATE_ORDER", input: { propertyId: demo.propertyId, quoteId: firstQuote.quoteId, primaryGuest: { fullName: "Stale Guest" } } }, metadata("stale-preview"));
+    await createOrder(demo.secondRoomId, "winner", { stayType: "FREE" });
+    const countBefore = await db.selectFrom("orders").select(({ fn }) => fn.countAll<number>().as("count")).executeTakeFirstOrThrow();
+    const rejected = await confirmCommandPreview(db, principal, stale.preview.previewId, { propertyId: demo.propertyId, commandType: "CREATE_ORDER", confirmation: true, expectedEffectHash: stale.preview.effectHash, reason: { code: "TEST", note: "stale" } }, metadata("stale-confirm"));
+    const countAfter = await db.selectFrom("orders").select(({ fn }) => fn.countAll<number>().as("count")).executeTakeFirstOrThrow();
+    expect(rejected.businessCommitted).toBe(false);
+    expect(rejected.error?.code).toBe("PREVIEW_STALE");
+    expect(Number(countAfter.count)).toBe(Number(countBefore.count));
+  });
+
+  it("rolls back domain facts when receipt persistence fails", async () => {
+    const priced = await quote(demo.roomId, { stayType: "FREE" });
+    const preview = await createCommandPreview(db, principal, { commandType: "CREATE_ORDER", input: { propertyId: demo.propertyId, quoteId: priced.quoteId, primaryGuest: { fullName: "Rollback Guest" } } }, metadata("rollback-preview"));
+    await sql.raw("CREATE OR REPLACE FUNCTION fail_receipt() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'forced receipt failure'; END $$; CREATE TRIGGER force_receipt_failure BEFORE INSERT ON command_receipts FOR EACH ROW EXECUTE FUNCTION fail_receipt()").execute(db);
+    await expect(confirmCommandPreview(db, principal, preview.preview.previewId, { propertyId: demo.propertyId, commandType: "CREATE_ORDER", confirmation: true, expectedEffectHash: preview.preview.effectHash, reason: { code: "TEST", note: "rollback" } }, metadata("rollback-confirm"))).rejects.toThrow(/forced receipt failure/);
+    const orders = await db.selectFrom("orders").select("id").execute();
+    const claims = await db.selectFrom("inventory_claims").select("id").execute();
+    expect(orders).toHaveLength(0);
+    expect(claims).toHaveLength(0);
+  });
+
+  it("completes collection, shortening, referenced refund, check-in, and check-out", async () => {
+    const created = await createOrder(demo.roomId, "journey", { member: true });
+    const orderId = created.result!.orderId as string;
+    const firstCollection = await previewAndConfirm({
+      commandType: "RECORD_COLLECTION",
+      input: { propertyId: demo.propertyId, orderId, amountMinor: 6_000, method: "CASH", note: "first installment" }
+    }, "collection-one");
+    await previewAndConfirm({
+      commandType: "RECORD_COLLECTION",
+      input: { propertyId: demo.propertyId, orderId, amountMinor: 6_000, method: "BANK_TRANSFER", note: "second installment" }
+    }, "collection-two");
+    const shortened = await previewAndConfirm({
+      commandType: "SHORTEN_STAY",
+      input: { propertyId: demo.propertyId, orderId, newDepartureDate: "2026-07-23" }
+    }, "shorten");
+    expect(shortened.businessCommitted).toBe(true);
+    const refund = await previewAndConfirm({
+      commandType: "RECORD_REFUND",
+      input: { propertyId: demo.propertyId, orderId, amountMinor: 3_000, referencesFactId: firstCollection.factRefs[0], method: "CASH", note: "referenced partial refund" }
+    }, "refund");
+    expect(refund.factRefs).toHaveLength(1);
+    await previewAndConfirm({ commandType: "CHECK_IN", input: { propertyId: demo.propertyId, orderId } }, "check-in");
+    await previewAndConfirm({ commandType: "CHECK_OUT", input: { propertyId: demo.propertyId, orderId } }, "check-out");
+    const view = await getOrderView(db, orderId);
+    expect(view.order.status).toBe("CHECKED_OUT");
+    expect(view.pricingRevisions).toHaveLength(2);
+    expect(view.collectionFacts).toHaveLength(3);
+    expect(view.amounts).toEqual({
+      currentContractAmount: { currency: "CNY", minorUnits: 0 },
+      netRecordedCollection: { currency: "CNY", minorUnits: 9_000 },
+      collectionDifference: { currency: "CNY", minorUnits: -9_000 }
+    });
+    expect(view.coverageSet.every((item) => item.status === "CONSUMED")).toBe(true);
+    const activeClaims = await db.selectFrom("inventory_claims").select("id").where("active", "=", true).execute();
+    expect(activeClaims).toHaveLength(0);
+  });
+
+  it("appends extension and move revisions while retaining the locked policy", async () => {
+    const created = await createOrder(demo.roomId, "move", { stayType: "FREE", arrival: "2026-07-21", departure: "2026-07-22" });
+    const orderId = created.result!.orderId as string;
+    await previewAndConfirm({ commandType: "EXTEND_STAY", input: { propertyId: demo.propertyId, orderId, newDepartureDate: "2026-07-24" } }, "extend");
+    await previewAndConfirm({ commandType: "MOVE_UNIT", input: { propertyId: demo.propertyId, orderId, newInventoryUnitId: demo.secondRoomId, effectiveDate: "2026-07-22" } }, "move");
+    const view = await getOrderView(db, orderId);
+    expect(view.segments).toHaveLength(3);
+    expect(view.pricingRevisions).toHaveLength(3);
+    expect(view.pricingRevisions.every((revision) => revision.policy_version_id === demo.freePolicyId)).toBe(true);
+    expect(view.currentSegment.inventoryUnitId).toBe(demo.secondRoomId);
+    const availability = await listAvailability(db, demo.propertyId, "2026-07-22", "2026-07-24");
+    expect(availability.find((unit) => unit.id === demo.roomId)?.available).toBe(true);
+    expect(availability.find((unit) => unit.id === demo.secondRoomId)?.available).toBe(false);
+  });
+
+  it("recalculates each service date from the active inventory timeline across repeated moves", async () => {
+    await previewAndConfirm({
+      commandType: "ADJUST_MEMBER_ENTITLEMENT",
+      input: { propertyId: demo.propertyId, entitlementLotId: demo.roomLotId, quantityDelta: 2, adjustmentReason: "Four-night timeline acceptance" }
+    }, "timeline-adjust");
+    const created = await createOrder(demo.roomId, "timeline", { member: true, arrival: "2026-07-21", departure: "2026-07-25" });
+    const orderId = created.result!.orderId as string;
+    await previewAndConfirm({
+      commandType: "MOVE_UNIT",
+      input: { propertyId: demo.propertyId, orderId, newInventoryUnitId: demo.secondRoomId, effectiveDate: "2026-07-23" }
+    }, "timeline-move-one");
+    await previewAndConfirm({
+      commandType: "SHORTEN_STAY",
+      input: { propertyId: demo.propertyId, orderId, newDepartureDate: "2026-07-24" }
+    }, "timeline-shorten");
+
+    let context = await loadOrderContext(db, orderId);
+    expect(await loadActiveStayTimeline(db, context)).toEqual([
+      { serviceDate: "2026-07-21", inventoryUnitId: demo.roomId },
+      { serviceDate: "2026-07-22", inventoryUnitId: demo.roomId },
+      { serviceDate: "2026-07-23", inventoryUnitId: demo.secondRoomId }
+    ]);
+    let view = await getOrderView(db, orderId);
+    let activeCoverage = view.coverageSet.filter((item) => item.status === "HELD");
+    expect(activeCoverage).toHaveLength(3);
+    expect(new Set(activeCoverage.map((item) => item.service_date)).size).toBe(3);
+    expect(activeCoverage.find((item) => item.service_date === "2026-07-21")?.inventory_unit_id).toBe(demo.roomId);
+    expect(activeCoverage.find((item) => item.service_date === "2026-07-23")?.inventory_unit_id).toBe(demo.secondRoomId);
+
+    await previewAndConfirm({
+      commandType: "EXTEND_STAY",
+      input: { propertyId: demo.propertyId, orderId, newDepartureDate: "2026-07-25" }
+    }, "timeline-extend");
+    await previewAndConfirm({
+      commandType: "REPRICE_ORDER",
+      input: { propertyId: demo.propertyId, orderId, manualAdjustmentMinor: -500 }
+    }, "timeline-reprice");
+    view = await getOrderView(db, orderId);
+    expect(view.pricingRevisions.at(-1)?.manual_adjustment_minor).toBe(-500);
+    expect(view.amounts.currentContractAmount.minorUnits).toBe(-500);
+
+    await previewAndConfirm({
+      commandType: "MOVE_UNIT",
+      input: { propertyId: demo.propertyId, orderId, newInventoryUnitId: demo.roomId, effectiveDate: "2026-07-23" }
+    }, "timeline-move-two");
+    context = await loadOrderContext(db, orderId);
+    expect(await loadActiveStayTimeline(db, context)).toEqual([
+      { serviceDate: "2026-07-21", inventoryUnitId: demo.roomId },
+      { serviceDate: "2026-07-22", inventoryUnitId: demo.roomId },
+      { serviceDate: "2026-07-23", inventoryUnitId: demo.roomId },
+      { serviceDate: "2026-07-24", inventoryUnitId: demo.roomId }
+    ]);
+    view = await getOrderView(db, orderId);
+    activeCoverage = view.coverageSet.filter((item) => item.status === "HELD");
+    expect(activeCoverage).toHaveLength(4);
+    expect(new Set(activeCoverage.map((item) => item.service_date)).size).toBe(4);
+    expect(activeCoverage.every((item) => item.inventory_unit_id === demo.roomId)).toBe(true);
+    expect(view.pricingRevisions.at(-1)?.manual_adjustment_minor).toBe(0);
+    expect(view.amounts.currentContractAmount.minorUnits).toBe(0);
+    expect(view.pricingRevisions.every((revision) => revision.policy_version_id === demo.transientPolicyId)).toBe(true);
+    expect(view.currentSegment.arrivalDate).toBe("2026-07-21");
+  });
+
+  it("shortens exactly to and then before the latest move effective date", async () => {
+    const created = await createOrder(demo.roomId, "shorten-move-boundary", {
+      stayType: "FREE",
+      arrival: "2026-07-21",
+      departure: "2026-07-25"
+    });
+    const orderId = created.result!.orderId as string;
+    await previewAndConfirm({
+      commandType: "MOVE_UNIT",
+      input: { propertyId: demo.propertyId, orderId, newInventoryUnitId: demo.secondRoomId, effectiveDate: "2026-07-23" }
+    }, "shorten-move-boundary-move");
+    await previewAndConfirm({
+      commandType: "SHORTEN_STAY",
+      input: { propertyId: demo.propertyId, orderId, newDepartureDate: "2026-07-23" }
+    }, "shorten-at-move-boundary");
+    let context = await loadOrderContext(db, orderId);
+    expect(await loadActiveStayTimeline(db, context)).toEqual([
+      { serviceDate: "2026-07-21", inventoryUnitId: demo.roomId },
+      { serviceDate: "2026-07-22", inventoryUnitId: demo.roomId }
+    ]);
+    expect(context.currentSegment.inventoryUnitId).toBe(demo.roomId);
+
+    await previewAndConfirm({
+      commandType: "SHORTEN_STAY",
+      input: { propertyId: demo.propertyId, orderId, newDepartureDate: "2026-07-22" }
+    }, "shorten-before-move-boundary");
+    context = await loadOrderContext(db, orderId);
+    expect(await loadActiveStayTimeline(db, context)).toEqual([
+      { serviceDate: "2026-07-21", inventoryUnitId: demo.roomId }
+    ]);
+  });
+
+  it("supports move, extension, and shortening while checked in", async () => {
+    const created = await createOrder(demo.roomId, "checked-in-amendments", {
+      stayType: "FREE",
+      arrival: "2026-07-21",
+      departure: "2026-07-24"
+    });
+    const orderId = created.result!.orderId as string;
+    await previewAndConfirm({ commandType: "CHECK_IN", input: { propertyId: demo.propertyId, orderId } }, "checked-in-amendments-check-in");
+    await previewAndConfirm({
+      commandType: "MOVE_UNIT",
+      input: { propertyId: demo.propertyId, orderId, newInventoryUnitId: demo.secondRoomId, effectiveDate: "2026-07-22" }
+    }, "checked-in-amendments-move");
+    await previewAndConfirm({
+      commandType: "EXTEND_STAY",
+      input: { propertyId: demo.propertyId, orderId, newDepartureDate: "2026-07-25" }
+    }, "checked-in-amendments-extend");
+    await previewAndConfirm({
+      commandType: "SHORTEN_STAY",
+      input: { propertyId: demo.propertyId, orderId, newDepartureDate: "2026-07-24" }
+    }, "checked-in-amendments-shorten");
+    const context = await loadOrderContext(db, orderId);
+    expect(context.order.status).toBe("CHECKED_IN");
+    expect(await loadActiveStayTimeline(db, context)).toEqual([
+      { serviceDate: "2026-07-21", inventoryUnitId: demo.roomId },
+      { serviceDate: "2026-07-22", inventoryUnitId: demo.secondRoomId },
+      { serviceDate: "2026-07-23", inventoryUnitId: demo.secondRoomId }
+    ]);
+  });
+
+  it("rejects impossible or timestamp MOVE effective dates as validation errors", async () => {
+    const created = await createOrder(demo.roomId, "move-date-validation", { stayType: "FREE" });
+    const orderId = created.result!.orderId as string;
+    for (const effectiveDate of ["2026-02-30", "2026-07-22T00:00:00Z"]) {
+      await expect(createCommandPreview(db, principal, {
+        commandType: "MOVE_UNIT",
+        input: { propertyId: demo.propertyId, orderId, newInventoryUnitId: demo.secondRoomId, effectiveDate }
+      }, metadata("move-date-validation-denied"))).rejects.toMatchObject({ code: "VALIDATION_ERROR" });
+    }
+    expect((await getOrderView(db, orderId)).segments).toHaveLength(1);
+  });
+
+  it("issues, rotates, and revokes only self-bound narrowed tokens", async () => {
+    const issuedSecret = newOpaqueSecret("qtp");
+    const issued = await previewAndConfirm({
+      commandType: "ISSUE_TOKEN",
+      input: {
+        propertyId: demo.propertyId,
+        subjectId: demo.agentSubjectId,
+        label: "Acceptance token",
+        accessCeiling: "READ",
+        expiresAt: "2029-01-01T00:00:00.000Z",
+        tokenSecret: issuedSecret
+      }
+    }, "issue-token");
+    expect(issued.result).not.toHaveProperty("tokenSecret");
+    const tokenId = issued.result!.tokenId as string;
+    const replacementSecret = newOpaqueSecret("qtp");
+    const rotated = await previewAndConfirm({
+      commandType: "ROTATE_TOKEN",
+      input: { propertyId: demo.propertyId, tokenId, tokenSecret: replacementSecret }
+    }, "rotate-token");
+    expect(rotated.result).not.toHaveProperty("tokenSecret");
+    const newTokenId = rotated.result!.tokenId as string;
+    const old = await db.selectFrom("api_tokens").selectAll().where("id", "=", tokenId).executeTakeFirstOrThrow();
+    expect(old.revoked_at).not.toBeNull();
+    expect(old.replaced_by_id).toBe(newTokenId);
+    await previewAndConfirm({ commandType: "REVOKE_TOKEN", input: { propertyId: demo.propertyId, tokenId: newTokenId } }, "revoke-token");
+    const replacement = await db.selectFrom("api_tokens").select("revoked_at").where("id", "=", newTokenId).executeTakeFirstOrThrow();
+    expect(replacement.revoked_at).not.toBeNull();
+  });
+
+  it("expires only the available entitlement balance after the inclusive expiry date", async () => {
+    await previewAndConfirm({
+      commandType: "ADJUST_MEMBER_ENTITLEMENT",
+      input: {
+        propertyId: demo.propertyId,
+        entitlementLotId: demo.roomLotId,
+        quantityDelta: 3,
+        adjustmentReason: "Expiration acceptance setup"
+      }
+    }, "expire-setup-adjustment");
+
+    await expect(createCommandPreview(db, principal, {
+      commandType: "EXPIRE_MEMBER_ENTITLEMENT",
+      input: { propertyId: demo.propertyId, entitlementLotId: demo.roomLotId, asOfDate: "2029-12-31" }
+    }, metadata("expire-on-inclusive-date"))).rejects.toMatchObject({ code: "ENTITLEMENT_CONFLICT" });
+
+    const stalePreview = await createCommandPreview(db, principal, {
+      commandType: "EXPIRE_MEMBER_ENTITLEMENT",
+      input: { propertyId: demo.propertyId, entitlementLotId: demo.roomLotId, asOfDate: "2030-01-01" }
+    }, metadata("expire-stale-preview"));
+    expect(stalePreview.preview.effect).toMatchObject({
+      entitlementLotId: demo.roomLotId,
+      remainingAvailable: 5,
+      quantityDelta: -5,
+      asOfDate: "2030-01-01",
+      entryType: "EXPIRE"
+    });
+    const storedStalePreview = await db.selectFrom("command_previews").select("basis_versions").where("id", "=", stalePreview.preview.previewId).executeTakeFirstOrThrow();
+    expect(storedStalePreview.basis_versions).toMatchObject({ lotVersion: 2, contractVersion: 2, remainingAvailable: 5 });
+
+    await previewAndConfirm({
+      commandType: "ADJUST_MEMBER_ENTITLEMENT",
+      input: {
+        propertyId: demo.propertyId,
+        entitlementLotId: demo.roomLotId,
+        quantityDelta: 1,
+        adjustmentReason: "Make expiration preview stale"
+      }
+    }, "expire-stale-adjustment");
+    const staleResult = await confirmCommandPreview(db, principal, stalePreview.preview.previewId, {
+      propertyId: demo.propertyId,
+      commandType: "EXPIRE_MEMBER_ENTITLEMENT",
+      confirmation: true,
+      expectedEffectHash: stalePreview.preview.effectHash,
+      reason: { code: "ENTITLEMENT_EXPIRY", note: "Confirm stale expiration preview" }
+    }, metadata("expire-stale-confirm"));
+    expect(staleResult).toMatchObject({ businessCommitted: false, error: { code: "PREVIEW_STALE" } });
+    expect(await db.selectFrom("entitlement_ledger").select("fact_id").where("lot_id", "=", demo.roomLotId).where("entry_type", "=", "EXPIRE").execute()).toHaveLength(0);
+
+    const freshPreview = await createCommandPreview(db, principal, {
+      commandType: "EXPIRE_MEMBER_ENTITLEMENT",
+      input: { propertyId: demo.propertyId, entitlementLotId: demo.roomLotId, asOfDate: "2030-01-01" }
+    }, metadata("expire-fresh-preview"));
+    expect(freshPreview.preview.effect).toMatchObject({ remainingAvailable: 6, quantityDelta: -6 });
+    const confirmation = {
+      propertyId: demo.propertyId,
+      commandType: "EXPIRE_MEMBER_ENTITLEMENT" as const,
+      confirmation: true as const,
+      expectedEffectHash: freshPreview.preview.effectHash,
+      reason: { code: "ENTITLEMENT_EXPIRY", note: "Expire the available balance after lot expiry" }
+    };
+    const confirmMetadata = { idempotencyKey: "expire-success-confirm", correlationId: "expire-success-confirm" };
+    const expired = await confirmCommandPreview(db, principal, freshPreview.preview.previewId, confirmation, confirmMetadata);
+    const replay = await confirmCommandPreview(db, principal, freshPreview.preview.previewId, confirmation, confirmMetadata);
+    expect(replay.receiptId).toBe(expired.receiptId);
+    expect(expired.result).toMatchObject({
+      entitlementLotId: demo.roomLotId,
+      contractId: demo.memberContractId,
+      factId: expired.factRefs[0],
+      entryType: "EXPIRE",
+      expiredUnits: 6,
+      remainingAvailable: 0,
+      asOfDate: "2030-01-01"
+    });
+    expect(expired.resourceRefs).toEqual([demo.memberContractId, demo.roomLotId]);
+    expect(expired.factRefs).toHaveLength(1);
+
+    const fact = await db.selectFrom("entitlement_ledger").selectAll().where("fact_id", "=", expired.factRefs[0]!).executeTakeFirstOrThrow();
+    expect(fact).toMatchObject({
+      lot_id: demo.roomLotId,
+      entry_type: "EXPIRE",
+      quantity_delta: -6,
+      service_date: null,
+      order_id: null,
+      coverage_id: null,
+      reason: "ENTITLEMENT_EXPIRED asOfDate=2030-01-01"
+    });
+    const balance = await db.selectFrom("entitlement_lots")
+      .leftJoin("entitlement_ledger", "entitlement_ledger.lot_id", "entitlement_lots.id")
+      .select([
+        "entitlement_lots.total_units",
+        sql<number>`cast(coalesce(sum(entitlement_ledger.quantity_delta), 0) as integer)`.as("ledger_delta")
+      ])
+      .where("entitlement_lots.id", "=", demo.roomLotId)
+      .groupBy("entitlement_lots.total_units")
+      .executeTakeFirstOrThrow();
+    expect(balance.total_units + Number(balance.ledger_delta)).toBe(0);
+    const lot = await db.selectFrom("entitlement_lots").select("version").where("id", "=", demo.roomLotId).executeTakeFirstOrThrow();
+    const contract = await db.selectFrom("member_contracts").select("version").where("id", "=", demo.memberContractId).executeTakeFirstOrThrow();
+    expect(lot.version).toBe(4);
+    expect(contract.version).toBe(4);
+  });
+
+  it("rejects integer command inputs outside PostgreSQL's safe integer range", async () => {
+    await expect(createCommandPreview(db, principal, {
+      commandType: "ADJUST_MEMBER_ENTITLEMENT",
+      input: {
+        propertyId: demo.propertyId,
+        entitlementLotId: demo.roomLotId,
+        quantityDelta: 2_147_483_648,
+        adjustmentReason: "Out-of-range acceptance"
+      }
+    }, metadata("integer-range-denied"))).rejects.toMatchObject({ code: "VALIDATION_ERROR" });
+  });
+
+  it("records a zero-quantity expiration marker and prevents release or adjustment from reviving the lot", async () => {
+    const created = await createOrder(demo.roomId, "expire-held", { member: true, arrival: "2026-07-21", departure: "2026-07-23" });
+    const orderId = created.result!.orderId as string;
+    const expired = await previewAndConfirm({
+      commandType: "EXPIRE_MEMBER_ENTITLEMENT",
+      input: { propertyId: demo.propertyId, entitlementLotId: demo.roomLotId, asOfDate: "2030-01-01" }
+    }, "expire-held-marker");
+    expect(expired.result).toMatchObject({ expiredUnits: 0, remainingAvailable: 0 });
+    const marker = await db.selectFrom("entitlement_ledger").selectAll().where("fact_id", "=", expired.factRefs[0]!).executeTakeFirstOrThrow();
+    expect(marker).toMatchObject({ entry_type: "EXPIRE", quantity_delta: 0 });
+
+    await expect(createCommandPreview(db, principal, {
+      commandType: "ADJUST_MEMBER_ENTITLEMENT",
+      input: { propertyId: demo.propertyId, entitlementLotId: demo.roomLotId, quantityDelta: 1, adjustmentReason: "Must not revive expired lot" }
+    }, metadata("expired-adjust-denied"))).rejects.toMatchObject({ code: "ENTITLEMENT_CONFLICT" });
+    const laterQuote = await quote(demo.secondRoomId, { member: true, arrival: "2026-07-24", departure: "2026-07-25" });
+    expect(laterQuote.coverageSet).toHaveLength(0);
+    expect(laterQuote.cashRemainder.minorUnits).toBe(12_000);
+
+    await previewAndConfirm({ commandType: "CANCEL_ORDER", input: { propertyId: demo.propertyId, orderId } }, "expire-held-cancel");
+    const balance = await db.selectFrom("entitlement_lots")
+      .leftJoin("entitlement_ledger", "entitlement_ledger.lot_id", "entitlement_lots.id")
+      .select([
+        "entitlement_lots.total_units",
+        sql<number>`cast(coalesce(sum(entitlement_ledger.quantity_delta), 0) as integer)`.as("ledger_delta")
+      ])
+      .where("entitlement_lots.id", "=", demo.roomLotId)
+      .groupBy("entitlement_lots.total_units")
+      .executeTakeFirstOrThrow();
+    expect(balance.total_units + Number(balance.ledger_delta)).toBe(0);
+    const releaseExpirations = await db.selectFrom("entitlement_ledger").selectAll()
+      .where("lot_id", "=", demo.roomLotId).where("entry_type", "=", "EXPIRE").where("reason", "=", "RELEASE_AFTER_EXPIRY").execute();
+    expect(releaseExpirations).toHaveLength(2);
+    expect(releaseExpirations.every((entry) => entry.quantity_delta === -1)).toBe(true);
+  });
+
+  it("keeps a manual adjustment in one revision and does not inherit it", async () => {
+    const created = await createOrder(demo.roomId, "manual-adjustment");
+    const orderId = created.result!.orderId as string;
+    await previewAndConfirm({
+      commandType: "REPRICE_ORDER",
+      input: { propertyId: demo.propertyId, orderId, manualAdjustmentMinor: -1_000 }
+    }, "manual-reprice");
+    let view = await getOrderView(db, orderId);
+    expect(view.amounts.currentContractAmount.minorUnits).toBe(35_000);
+    expect(view.pricingRevisions.at(-1)?.manual_adjustment_minor).toBe(-1_000);
+    await previewAndConfirm({
+      commandType: "SHORTEN_STAY",
+      input: { propertyId: demo.propertyId, orderId, newDepartureDate: "2026-07-23" }
+    }, "shorten-after-reprice");
+    view = await getOrderView(db, orderId);
+    expect(view.amounts.currentContractAmount.minorUnits).toBe(24_000);
+    expect(view.pricingRevisions.at(-1)?.manual_adjustment_minor).toBe(0);
+  });
+
+  it("uses the shared inventory path for maintenance and releases cancellation/no-show claims", async () => {
+    const locked = await previewAndConfirm({
+      commandType: "LOCK_MAINTENANCE",
+      input: { propertyId: demo.propertyId, inventoryUnitId: demo.roomId, arrivalDate: "2026-07-21", departureDate: "2026-07-23", reason: "Planned electrical inspection" }
+    }, "maintenance-lock");
+    let availability = await listAvailability(db, demo.propertyId, "2026-07-21", "2026-07-23");
+    expect(availability.find((unit) => unit.id === demo.bedAId)?.available).toBe(false);
+    await previewAndConfirm({
+      commandType: "RELEASE_MAINTENANCE",
+      input: { propertyId: demo.propertyId, maintenanceLockId: locked.result!.maintenanceLockId }
+    }, "maintenance-release");
+    availability = await listAvailability(db, demo.propertyId, "2026-07-21", "2026-07-23");
+    expect(availability.find((unit) => unit.id === demo.bedAId)?.available).toBe(true);
+
+    const cancelled = await createOrder(demo.roomId, "cancel", { member: true });
+    const cancelledOrderId = cancelled.result!.orderId as string;
+    await previewAndConfirm({ commandType: "CANCEL_ORDER", input: { propertyId: demo.propertyId, orderId: cancelledOrderId } }, "cancel");
+    const cancelledView = await getOrderView(db, cancelledOrderId);
+    expect(cancelledView.order.status).toBe("CANCELLED");
+    expect(cancelledView.coverageSet.every((item) => item.status === "RELEASED")).toBe(true);
+
+    const noShow = await createOrder(demo.secondRoomId, "no-show", { stayType: "FREE" });
+    const noShowOrderId = noShow.result!.orderId as string;
+    await previewAndConfirm({ commandType: "MARK_NO_SHOW", input: { propertyId: demo.propertyId, orderId: noShowOrderId } }, "no-show");
+    expect((await getOrderView(db, noShowOrderId)).order.status).toBe("NO_SHOW");
+    expect(await db.selectFrom("inventory_claims").select("id").where("active", "=", true).execute()).toHaveLength(0);
+  });
+
+  it("reverses a collection without overwriting the original fact", async () => {
+    const created = await createOrder(demo.roomId, "reversal", { stayType: "FREE" });
+    const orderId = created.result!.orderId as string;
+    const collection = await previewAndConfirm({
+      commandType: "RECORD_COLLECTION",
+      input: { propertyId: demo.propertyId, orderId, amountMinor: 5_000, method: "CASH", note: "recorded manually" }
+    }, "reversal-collection");
+    await previewAndConfirm({
+      commandType: "REVERSE_FACT",
+      input: { propertyId: demo.propertyId, orderId, reversesFactId: collection.factRefs[0], note: "duplicate entry" }
+    }, "reversal");
+    const view = await getOrderView(db, orderId);
+    expect(view.collectionFacts).toHaveLength(2);
+    expect(view.collectionFacts[0]?.fact_type).toBe("COLLECTION");
+    expect(view.collectionFacts[1]?.fact_type).toBe("REVERSAL");
+    expect(view.amounts.netRecordedCollection.minorUnits).toBe(0);
+  });
+
+  it("rejects refunds of reversed collections and reversal of collections with active refunds", async () => {
+    const reversedOrder = await createOrder(demo.roomId, "refund-after-reversal", { stayType: "FREE" });
+    const reversedOrderId = reversedOrder.result!.orderId as string;
+    const reversedCollection = await previewAndConfirm({
+      commandType: "RECORD_COLLECTION",
+      input: { propertyId: demo.propertyId, orderId: reversedOrderId, amountMinor: 5_000, method: "CASH", note: "to reverse" }
+    }, "refund-after-reversal-collection");
+    await previewAndConfirm({
+      commandType: "REVERSE_FACT",
+      input: { propertyId: demo.propertyId, orderId: reversedOrderId, reversesFactId: reversedCollection.factRefs[0], note: "reversed first" }
+    }, "refund-after-reversal-reverse");
+    await expect(createCommandPreview(db, principal, {
+      commandType: "RECORD_REFUND",
+      input: { propertyId: demo.propertyId, orderId: reversedOrderId, referencesFactId: reversedCollection.factRefs[0], amountMinor: 1_000, method: "CASH" }
+    }, metadata("refund-after-reversal-denied"))).rejects.toMatchObject({ code: "FACT_ALREADY_REVERSED" });
+
+    const refundedOrder = await createOrder(demo.secondRoomId, "reversal-after-refund", { stayType: "FREE" });
+    const refundedOrderId = refundedOrder.result!.orderId as string;
+    const refundedCollection = await previewAndConfirm({
+      commandType: "RECORD_COLLECTION",
+      input: { propertyId: demo.propertyId, orderId: refundedOrderId, amountMinor: 5_000, method: "CASH", note: "partially refunded" }
+    }, "reversal-after-refund-collection");
+    await previewAndConfirm({
+      commandType: "RECORD_REFUND",
+      input: { propertyId: demo.propertyId, orderId: refundedOrderId, referencesFactId: refundedCollection.factRefs[0], amountMinor: 1_000, method: "CASH" }
+    }, "reversal-after-refund-refund");
+    await expect(createCommandPreview(db, principal, {
+      commandType: "REVERSE_FACT",
+      input: { propertyId: demo.propertyId, orderId: refundedOrderId, reversesFactId: refundedCollection.factRefs[0], note: "must reverse refund first" }
+    }, metadata("reversal-after-refund-denied"))).rejects.toMatchObject({ code: "REFUND_LIMIT_EXCEEDED" });
+    const facts = (await getOrderView(db, refundedOrderId)).collectionFacts;
+    expect(facts.map((fact) => fact.fact_type)).toEqual(["COLLECTION", "REFUND"]);
+  });
+
+  it("serializes a concurrent refund and reversal of the same collection fact", async () => {
+    const created = await createOrder(demo.roomId, "refund-reversal-race", { stayType: "FREE" });
+    const orderId = created.result!.orderId as string;
+    const collection = await previewAndConfirm({
+      commandType: "RECORD_COLLECTION",
+      input: { propertyId: demo.propertyId, orderId, amountMinor: 5_000, method: "CASH", note: "race source" }
+    }, "refund-reversal-race-collection");
+    const factId = collection.factRefs[0]!;
+    const [refundPreview, reversalPreview] = await Promise.all([
+      createCommandPreview(db, principal, {
+        commandType: "RECORD_REFUND",
+        input: { propertyId: demo.propertyId, orderId, referencesFactId: factId, amountMinor: 1_000, method: "CASH" }
+      }, metadata("refund-reversal-race-refund-preview")),
+      createCommandPreview(db, principal, {
+        commandType: "REVERSE_FACT",
+        input: { propertyId: demo.propertyId, orderId, reversesFactId: factId, note: "concurrent correction" }
+      }, metadata("refund-reversal-race-reversal-preview"))
+    ]);
+    const outcomes = await within(Promise.allSettled([
+      confirmCommandPreview(db, principal, refundPreview.preview.previewId, {
+        propertyId: demo.propertyId, commandType: "RECORD_REFUND",
+        confirmation: true,
+        expectedEffectHash: refundPreview.preview.effectHash,
+        reason: { code: "CONCURRENCY_TEST", note: "Concurrent refund" }
+      }, metadata("refund-reversal-race-refund-confirm")),
+      confirmCommandPreview(db, principal, reversalPreview.preview.previewId, {
+        propertyId: demo.propertyId, commandType: "REVERSE_FACT",
+        confirmation: true,
+        expectedEffectHash: reversalPreview.preview.effectHash,
+        reason: { code: "CONCURRENCY_TEST", note: "Concurrent reversal" }
+      }, metadata("refund-reversal-race-reversal-confirm"))
+    ]), 5_000);
+    const committed = outcomes.flatMap((outcome) => outcome.status === "fulfilled" && outcome.value.businessCommitted ? [outcome.value] : []);
+    expect(committed).toHaveLength(1);
+    const rejectedCodes = outcomes.flatMap((outcome) => {
+      if (outcome.status === "fulfilled") return outcome.value.businessCommitted ? [] : [outcome.value.error?.code];
+      const reason = outcome.reason as { code?: string };
+      return [reason.code];
+    });
+    expect(rejectedCodes).toHaveLength(1);
+    expect(["PREVIEW_STALE", "FACT_ALREADY_REVERSED", "REFUND_LIMIT_EXCEEDED"]).toContain(rejectedCodes[0]);
+    const facts = await db.selectFrom("collection_facts").select("fact_type").where("order_id", "=", orderId).execute();
+    expect(facts).toHaveLength(2);
+    expect(facts.filter((fact) => fact.fact_type === "REFUND" || fact.fact_type === "REVERSAL")).toHaveLength(1);
+  });
+
+  it("enforces pricing, guest snapshot, revision, and fact immutability in PostgreSQL", async () => {
+    const created = await createOrder(demo.roomId, "immutable", { stayType: "FREE" });
+    const orderId = created.result!.orderId as string;
+    const collection = await previewAndConfirm({
+      commandType: "RECORD_COLLECTION",
+      input: { propertyId: demo.propertyId, orderId, amountMinor: 100, method: "CASH", note: "immutable fact" }
+    }, "immutable-collection");
+    await expect(db.updateTable("pricing_policy_versions").set({ nightly_rate_minor: 1 }).where("id", "=", demo.freePolicyId).execute()).rejects.toThrow(/append-only/);
+    await expect(db.updateTable("orders").set({ primary_guest_snapshot: { fullName: "Changed" } }).where("id", "=", orderId).execute()).rejects.toThrow(/immutable/);
+    const view = await getOrderView(db, orderId);
+    await expect(db.updateTable("pricing_revisions").set({ current_contract_amount_minor: 999 }).where("id", "=", view.order.current_revision_id!).execute()).rejects.toThrow(/append-only/);
+    await expect(db.updateTable("collection_facts").set({ amount_minor: 999 }).where("fact_id", "=", collection.factRefs[0]!).execute()).rejects.toThrow(/append-only/);
+  });
+
+  it("persists deterministic recovery states and reports only an actively locked command as unknown", async () => {
+    const priced = await quote(demo.roomId, { stayType: "FREE" });
+    const preview = await createCommandPreview(db, principal, {
+      commandType: "CREATE_ORDER",
+      input: { propertyId: demo.propertyId, quoteId: priced.quoteId, primaryGuest: { fullName: "Recovery Guest" } }
+    }, { idempotencyKey: "recovery-preview", correlationId: "recovery" });
+    const confirmation = {
+      propertyId: demo.propertyId,
+      commandType: "CREATE_ORDER" as const,
+      confirmation: true as const,
+      expectedEffectHash: preview.preview.effectHash,
+      reason: { code: "RECOVERY_TEST", note: "stable replay" }
+    };
+    const first = await confirmCommandPreview(db, principal, preview.preview.previewId, confirmation, { idempotencyKey: "recovery-confirm", correlationId: "recovery" });
+    const replay = await confirmCommandPreview(db, principal, preview.preview.previewId, confirmation, { idempotencyKey: "recovery-confirm", correlationId: "recovery" });
+    expect(replay.receiptId).toBe(first.receiptId);
+    await expect(confirmCommandPreview(db, principal, preview.preview.previewId, { ...confirmation, reason: { code: "RECOVERY_TEST", note: "different request" } }, { idempotencyKey: "recovery-confirm", correlationId: "recovery" })).rejects.toMatchObject({ code: "IDEMPOTENCY_KEY_REUSED" });
+    expect(await findCommandResult(db, principal, demo.propertyId, "CREATE_ORDER", "recovery-confirm")).toMatchObject({ executionStatus: "EXECUTED", receiptId: first.receiptId });
+    expect(await findCommandResult(db, principal, demo.propertyId, "CREATE_ORDER", "never-executed")).toEqual({ executionStatus: "NOT_EXECUTED", businessCommitted: false });
+
+    const recoveryCommandType = "CHECK_IN";
+    const recoveryIdempotencyKey = "recovery-unknown";
+    const lockKey = `qintopia:command:${principal.subjectId}:${demo.propertyId}:${recoveryCommandType}:${recoveryIdempotencyKey}`;
+    let releaseLock!: () => void;
+    let reportLockAcquired!: () => void;
+    const releaseGate = new Promise<void>((resolve) => { releaseLock = resolve; });
+    const lockAcquired = new Promise<void>((resolve) => { reportLockAcquired = resolve; });
+    const lockOwner = db.connection().execute(async (connection) => {
+      await sql`select pg_advisory_lock(hashtextextended(${lockKey}, 0::bigint))`.execute(connection);
+      reportLockAcquired();
+      await releaseGate;
+      await sql`select pg_advisory_unlock(hashtextextended(${lockKey}, 0::bigint))`.execute(connection);
+    });
+    await lockAcquired;
+
+    try {
+      expect(await findCommandResult(db, principal, demo.propertyId, recoveryCommandType, recoveryIdempotencyKey))
+        .toEqual({ executionStatus: "UNKNOWN", businessCommitted: false });
+    } finally {
+      releaseLock();
+    }
+    await lockOwner;
+    expect(await findCommandResult(db, principal, demo.propertyId, recoveryCommandType, recoveryIdempotencyKey))
+      .toEqual({ executionStatus: "NOT_EXECUTED", businessCommitted: false });
+  });
+});

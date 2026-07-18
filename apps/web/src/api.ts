@@ -1,0 +1,176 @@
+import type { CommandEnvelope, CommandReason, CommandType, ReceiptDto } from "@qintopia/contracts";
+import type {
+  AvailabilityDto,
+  ClientCommandMetadata,
+  CommandPreviewResponse,
+  CreateQuoteCommandResponseDto,
+  MaintenanceLockDto,
+  MemberViewDto,
+  MetaDto,
+  OrderRowDto,
+  OrderViewDto,
+  PrincipalDto,
+  RecoverableCommandType,
+  TokenDto
+} from "./types";
+
+interface ErrorPayload {
+  code?: unknown;
+  message?: unknown;
+  correlationId?: unknown;
+  retryable?: unknown;
+  details?: unknown;
+}
+
+export class ApiError extends Error {
+  readonly status: number;
+  readonly code: string;
+  readonly correlationId: string;
+  readonly retryable: boolean;
+  readonly details: unknown;
+
+  constructor(status: number, payload: ErrorPayload) {
+    super(typeof payload.message === "string" ? payload.message : `Request failed (${status})`);
+    this.name = "ApiError";
+    this.status = status;
+    this.code = typeof payload.code === "string" ? payload.code : "REQUEST_FAILED";
+    this.correlationId = typeof payload.correlationId === "string" ? payload.correlationId : "";
+    this.retryable = payload.retryable === true;
+    this.details = payload.details;
+  }
+}
+
+async function parseBody(response: Response): Promise<unknown> {
+  if (response.status === 204) return undefined;
+  const contentType = response.headers.get("content-type") ?? "";
+  if (contentType.includes("application/json")) return response.json();
+  const text = await response.text();
+  return text ? { message: text } : undefined;
+}
+
+function isReceipt(value: unknown): value is ReceiptDto {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  return typeof record.executionStatus === "string" && typeof record.businessCommitted === "boolean";
+}
+
+async function request<T>(path: string, init: RequestInit = {}, acceptRejectedReceipt = false): Promise<T> {
+  const response = await fetch(path, {
+    credentials: "include",
+    ...init,
+    headers: {
+      Accept: "application/json",
+      ...(init.body ? { "Content-Type": "application/json" } : {}),
+      ...init.headers
+    }
+  });
+  const body = await parseBody(response);
+  if (!response.ok && !(acceptRejectedReceipt && isReceipt(body))) {
+    throw new ApiError(response.status, (body ?? {}) as ErrorPayload);
+  }
+  return body as T;
+}
+
+function commandHeaders(scope: string) {
+  const nonce = crypto.randomUUID();
+  return {
+    "Idempotency-Key": `web-${scope}-${nonce}`,
+    "X-Correlation-ID": `web-${nonce}`
+  };
+}
+
+function metadataHeaders(metadata: ClientCommandMetadata) {
+  return {
+    "Idempotency-Key": metadata.idempotencyKey,
+    "X-Correlation-ID": metadata.correlationId
+  };
+}
+
+export const api = {
+  commandMetadata: (scope: string): ClientCommandMetadata => {
+    const headers = commandHeaders(scope);
+    return { idempotencyKey: headers["Idempotency-Key"], correlationId: headers["X-Correlation-ID"] };
+  },
+  me: () => request<PrincipalDto>("/api/v1/me"),
+  login: async (username: string, password: string) => {
+    await request<unknown>("/api/v1/auth/login", {
+      method: "POST",
+      body: JSON.stringify({ username, password })
+    });
+    return request<PrincipalDto>("/api/v1/me");
+  },
+  logout: () => request<void>("/api/v1/auth/logout", { method: "POST" }),
+  meta: () => request<MetaDto>("/api/v1/meta"),
+  availability: (propertyId: string, arrivalDate: string, departureDate: string, unitKind?: "ROOM" | "BED") => {
+    const query = new URLSearchParams({ arrivalDate, departureDate });
+    if (unitKind) query.set("unitKind", unitKind);
+    return request<AvailabilityDto>(`/api/v1/properties/${encodeURIComponent(propertyId)}/availability?${query.toString()}`);
+  },
+  maintenanceLocks: (propertyId: string, status: "ACTIVE" | "RELEASED" = "ACTIVE") => {
+    const query = new URLSearchParams({ propertyId, status });
+    return request<{ maintenanceLocks: MaintenanceLockDto[] }>(`/api/v1/maintenance-locks?${query.toString()}`);
+  },
+  quote: (input: {
+    propertyId: string;
+    inventoryUnitId: string;
+    stayType: string;
+    arrivalDate: string;
+    departureDate: string;
+    pricingPolicyVersionId: string;
+    memberContractId?: string;
+  }, metadata: ClientCommandMetadata) => request<CreateQuoteCommandResponseDto>("/api/v1/quotes", {
+    method: "POST",
+    headers: metadataHeaders(metadata),
+    body: JSON.stringify(input)
+  }),
+  orders: (propertyId: string, status?: string) => {
+    const query = new URLSearchParams({ propertyId });
+    if (status) query.set("status", status);
+    return request<{ orders: OrderRowDto[] }>(`/api/v1/orders?${query.toString()}`);
+  },
+  order: (orderId: string) => request<OrderViewDto>(`/api/v1/orders/${encodeURIComponent(orderId)}`),
+  member: (memberContractId: string) => request<MemberViewDto>(`/api/v1/members/${encodeURIComponent(memberContractId)}`),
+  tokens: (propertyId: string) => {
+    const query = new URLSearchParams({ propertyId });
+    return request<{ tokens: TokenDto[] }>(`/api/v1/tokens?${query.toString()}`);
+  },
+  preview: (envelope: CommandEnvelope, metadata: ClientCommandMetadata) => request<CommandPreviewResponse>("/api/v1/command-previews", {
+    method: "POST",
+    headers: metadataHeaders(metadata),
+    body: JSON.stringify(envelope)
+  }),
+  confirm: (
+    previewId: string,
+    propertyId: string,
+    commandType: CommandType,
+    effectHash: string,
+    reason: CommandReason,
+    idempotencyKey: string
+  ) => request<ReceiptDto>(`/api/v1/command-previews/${encodeURIComponent(previewId)}/confirm`, {
+    method: "POST",
+    headers: {
+      "Idempotency-Key": idempotencyKey,
+      "X-Correlation-ID": `web-confirm-${crypto.randomUUID()}`
+    },
+    body: JSON.stringify({ propertyId, commandType, confirmation: true, expectedEffectHash: effectHash, reason })
+  }, true),
+  recoveryKey: (commandType: CommandType) => `web-confirm-${commandType.toLowerCase()}-${crypto.randomUUID()}`,
+  commandResult: (propertyId: string, commandType: RecoverableCommandType, idempotencyKey: string) => {
+    const query = new URLSearchParams({ propertyId, commandType, idempotencyKey });
+    return request<Partial<ReceiptDto> & Pick<ReceiptDto, "executionStatus" | "businessCommitted">>(`/api/v1/command-results?${query.toString()}`)
+      .then((result) => ({
+        receiptId: result.receiptId ?? "",
+        commandId: result.commandId ?? "",
+        executionStatus: result.executionStatus,
+        businessCommitted: result.businessCommitted,
+        correlationId: result.correlationId ?? "",
+        ...(result.result ? { result: result.result } : {}),
+        ...(result.error ? { error: result.error } : {}),
+        resourceRefs: result.resourceRefs ?? [],
+        factRefs: result.factRefs ?? [],
+        ...(result.committedAt ? { committedAt: result.committedAt } : {})
+      } satisfies ReceiptDto));
+  }
+};
+
+export type { ClientCommandMetadata } from "./types";

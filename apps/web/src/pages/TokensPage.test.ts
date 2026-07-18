@@ -1,0 +1,120 @@
+import { describe, expect, it } from "vitest";
+import type { RetainedTokenSecret, TokenDto } from "../types";
+import {
+  generateTokenSecret,
+  retainedTokenCommandUnresolved,
+  TOKEN_SECRET_BYTES,
+  tokenLifecycleStatus,
+  updateMatchingRetainedSecret,
+  updateMatchingRetainedSecretForAttempt
+} from "./TokensPage";
+
+function token(overrides: Partial<TokenDto> = {}): TokenDto {
+  return {
+    id: "token_test",
+    label: "Test token",
+    access_ceiling: "READ",
+    property_scope: "property_test",
+    expires_at: "2030-01-01T00:00:00.000Z",
+    revoked_at: null,
+    rotated_from_id: null,
+    replaced_by_id: null,
+    created_at: "2026-01-01T00:00:00.000Z",
+    ...overrides
+  };
+}
+
+describe("Token secret generation", () => {
+  it("requests exactly 256 bits and returns a qtp_ base64url secret", () => {
+    let requestedBytes = 0;
+    const secret = generateTokenSecret((bytes) => {
+      requestedBytes = bytes.byteLength;
+      bytes.forEach((_, index) => { bytes[index] = index; });
+      return bytes;
+    });
+
+    expect(requestedBytes).toBe(TOKEN_SECRET_BYTES);
+    expect(secret).toMatch(/^qtp_[A-Za-z0-9_-]{43}$/);
+    expect(secret).not.toContain("=");
+  });
+
+  it("rejects an injected entropy source with the wrong shape", () => {
+    expect(() => generateTokenSecret(() => new Uint8Array(31))).toThrow(/exactly 32 bytes/);
+  });
+});
+
+describe("Token lifecycle status", () => {
+  const now = new Date("2028-01-01T00:00:00.000Z");
+
+  it("distinguishes active, expired, revoked, and rotated tokens", () => {
+    expect(tokenLifecycleStatus(token(), now)).toBe("ACTIVE");
+    expect(tokenLifecycleStatus(token({ expires_at: "2027-12-31T23:59:59.000Z" }), now)).toBe("EXPIRED");
+    expect(tokenLifecycleStatus(token({ revoked_at: "2027-01-01T00:00:00.000Z" }), now)).toBe("REVOKED");
+    expect(tokenLifecycleStatus(token({ revoked_at: "2027-01-01T00:00:00.000Z", replaced_by_id: "token_replacement" }), now)).toBe("ROTATED");
+  });
+});
+
+describe("retained Token command identity", () => {
+  const retained: RetainedTokenSecret = {
+    operationId: "operation-a",
+    propertyId: "property_test",
+    operation: "ISSUE",
+    label: "Agent A",
+    value: `qtp_${"A".repeat(43)}`,
+    command: {
+      commandType: "ISSUE_TOKEN",
+      title: "Issue",
+      description: "Issue test Token",
+      input: { propertyId: "property_test" }
+    },
+    state: "CONFIRMING",
+    confirmationKey: "confirm-a"
+  };
+
+  it("ignores a delayed callback from another secret operation", () => {
+    expect(updateMatchingRetainedSecret(retained, "operation-old", { state: "EXECUTED" })).toBe(retained);
+    expect(updateMatchingRetainedSecret(retained, "operation-a", { state: "UNKNOWN" })).toEqual({
+      ...retained,
+      state: "UNKNOWN"
+    });
+  });
+
+  it("does not let a superseded dialog attempt regress the resolved operation", () => {
+    const previewMetadata = { idempotencyKey: "preview-key", correlationId: "preview-correlation" };
+    let current: RetainedTokenSecret | undefined = { ...retained, state: "PREVIEW_UNKNOWN", previewMetadata };
+
+    current = updateMatchingRetainedSecretForAttempt(current, "operation-a", "attempt-new", "attempt-new", {
+      state: "PREVIEWED",
+      previewMetadata,
+      previewId: "preview-a"
+    });
+    current = updateMatchingRetainedSecretForAttempt(current, "operation-a", "attempt-new", "attempt-new", {
+      state: "CONFIRMING",
+      previewId: "preview-a",
+      confirmationKey: "confirm-a"
+    });
+    current = updateMatchingRetainedSecretForAttempt(current, "operation-a", "attempt-new", "attempt-new", {
+      state: "EXECUTED",
+      confirmationKey: "confirm-a"
+    });
+    const resolved = current;
+
+    current = updateMatchingRetainedSecretForAttempt(current, "operation-a", "attempt-new", "attempt-old", {
+      state: "PREVIEW_UNKNOWN",
+      previewMetadata: { idempotencyKey: "old-key", correlationId: "old-correlation" }
+    });
+
+    expect(current).toBe(resolved);
+    expect(current).toMatchObject({ state: "EXECUTED", previewId: "preview-a", confirmationKey: "confirm-a" });
+  });
+
+  it("blocks clearing while Preview or Confirm remains unresolved", () => {
+    expect(retainedTokenCommandUnresolved(retained)).toBe(true);
+    expect(retainedTokenCommandUnresolved({ ...retained, state: "PREVIEWING" })).toBe(true);
+    expect(retainedTokenCommandUnresolved({ ...retained, state: "PREVIEW_UNKNOWN" })).toBe(true);
+    expect(retainedTokenCommandUnresolved({ ...retained, state: "PREVIEWED" })).toBe(true);
+    expect(retainedTokenCommandUnresolved({ ...retained, state: "UNKNOWN" })).toBe(true);
+    expect(retainedTokenCommandUnresolved({ ...retained, state: "NOT_EXECUTED" })).toBe(false);
+    expect(retainedTokenCommandUnresolved({ ...retained, state: "EXECUTED" })).toBe(false);
+  });
+});
