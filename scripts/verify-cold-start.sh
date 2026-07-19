@@ -12,11 +12,15 @@ workdir="$(mktemp -d)"
 cookie_jar="$workdir/cookies.txt"
 app_log="$workdir/app.log"
 app_pid=""
+app_container=""
 
 cleanup() {
   if [[ -n "$app_pid" ]]; then
     kill "$app_pid" >/dev/null 2>&1 || true
     wait "$app_pid" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "$app_container" ]]; then
+    docker rm -f "$app_container" >/dev/null 2>&1 || true
   fi
   docker exec "$container" dropdb -U "$user" --if-exists "$database" >/dev/null 2>&1 || true
   rm -rf "$workdir"
@@ -26,13 +30,27 @@ trap cleanup EXIT
 docker exec "$container" createdb -U "$user" "$database"
 database_url="postgres://$user:$password@127.0.0.1:$host_port/$database"
 
-DATABASE_URL="$database_url" npm run db:migrate
-DATABASE_URL="$database_url" npm run db:seed
-npm run build
+if [[ -n "${VERIFY_APP_IMAGE:-}" ]]; then
+  app_container="qintopia-cold-start-${run_id//_/-}"
+  docker run --detach --init --name "$app_container" \
+    --add-host host.docker.internal:host-gateway \
+    -p "127.0.0.1:$port:4100" \
+    -e "DATABASE_URL=postgres://$user:$password@host.docker.internal:$host_port/$database" \
+    -e PORT=4100 \
+    -e "WEB_ORIGIN=http://127.0.0.1:$port" \
+    -e SESSION_COOKIE_SECURE=false \
+    -e SEED_DEMO_DATA=true \
+    -e LOG_LEVEL=warn \
+    "$VERIFY_APP_IMAGE" >/dev/null
+else
+  DATABASE_URL="$database_url" npm run db:migrate
+  DATABASE_URL="$database_url" npm run db:seed
+  npm run build
 
-DATABASE_URL="$database_url" PORT="$port" WEB_ORIGIN="http://127.0.0.1:$port" SESSION_COOKIE_SECURE=false LOG_LEVEL=warn \
-  node --import tsx apps/api/src/main.ts >"$app_log" 2>&1 &
-app_pid="$!"
+  DATABASE_URL="$database_url" PORT="$port" WEB_ORIGIN="http://127.0.0.1:$port" SESSION_COOKIE_SECURE=false LOG_LEVEL=warn \
+    node --import tsx apps/api/src/main.ts >"$app_log" 2>&1 &
+  app_pid="$!"
+fi
 
 ready=false
 for _ in {1..60}; do
@@ -43,7 +61,11 @@ for _ in {1..60}; do
   sleep 1
 done
 if [[ "$ready" != "true" ]]; then
-  sed -n '1,200p' "$app_log" >&2
+  if [[ -n "$app_container" ]]; then
+    docker logs "$app_container" >&2 || true
+  else
+    sed -n '1,200p' "$app_log" >&2
+  fi
   printf 'Cold-start API did not become ready on port %s.\n' "$port" >&2
   exit 1
 fi

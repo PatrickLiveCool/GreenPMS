@@ -8,7 +8,11 @@ export type EntitlementUnitKind = "ROOM_NIGHT" | "BED_NIGHT";
 export const stayTypes = ["TRANSIENT", "WEEKLY", "MONTHLY", "CUSTOM", "FIXED_TERM", "ROLLING", "FREE"] as const;
 export type StayType = (typeof stayTypes)[number];
 
+export const bookingChannelCodes = ["YOUMUDAO", "CTRIP", "MEITUAN", "WECOM"] as const;
+export type BookingChannelCode = (typeof bookingChannelCodes)[number];
+
 export const commandTypes = [
+  "CREATE_MEMBER",
   "CREATE_ORDER",
   "EXTEND_STAY",
   "SHORTEN_STAY",
@@ -23,6 +27,8 @@ export const commandTypes = [
   "REVERSE_FACT",
   "CHECK_IN",
   "CHECK_OUT",
+  "REFRESH_MEMBER_COVERAGE",
+  "ADD_MEMBER_ENTITLEMENT_LOT",
   "ADJUST_MEMBER_ENTITLEMENT",
   "EXPIRE_MEMBER_ENTITLEMENT",
   "ISSUE_TOKEN",
@@ -49,7 +55,6 @@ export const errorCodes = [
   "IDEMPOTENCY_KEY_REUSED",
   "PREVIEW_REQUIRED",
   "PREVIEW_NOT_FOUND",
-  "PREVIEW_EXPIRED",
   "PREVIEW_STALE",
   "PREVIEW_ALREADY_USED",
   "CONFIRMATION_REQUIRED",
@@ -74,10 +79,126 @@ export const errorCodes = [
   "INTERNAL_ERROR"
 ] as const;
 export type ErrorCode = (typeof errorCodes)[number];
+export const errorCauseCodes = [...errorCodes, "PREVIEW_EXPIRED"] as const;
+export type ErrorCauseCode = (typeof errorCauseCodes)[number];
 
 export interface MoneyDto {
   currency: string;
   minorUnits: number;
+}
+
+export interface ReferenceCatalogBatchDto {
+  id: string;
+  propertyId: string;
+  sourceRevision: number;
+  sourceVersionDate: string | null;
+  contentHash: string;
+  executionState: "REFERENCE_ONLY";
+  createdAt: string;
+}
+
+export interface ReferenceInventoryCatalogEntryDto {
+  id: string;
+  typeCode: string;
+  typeName: string;
+  bathroomType: "SHARED" | "ENSUITE";
+  sellUnitKind: "ROOM" | "BED";
+  physicalRoomCount: number;
+  physicalBedCount: number;
+  unitsPerRoom: number | null;
+  sellableUnitCount: number;
+  separateElectricityCharge: false;
+  executionState: "REFERENCE_ONLY";
+  sourceSheet: string;
+  sourceRange: string;
+}
+
+export interface ReferencePhysicalRoomDto {
+  operationalCode: string;
+  buildingCode: string;
+  roomTypeKey: string;
+  sourceCode: string | null;
+  sourceLabel: string;
+  codeProvenance: "SOURCE_EXPLICIT" | "USER_CONFIRMED_RENAMED" | "PMS_GENERATED";
+  physicalBedCount: number;
+  physicalBedCodes: string[] | null;
+  saleMode: "INDEPENDENT_ROOM" | "BED_WITH_WHOLE_ROOM_COMBINATION";
+}
+
+export interface ReferencePricingRuleDto {
+  code: string;
+  version: number;
+  calculationKind: "DURATION_BAND_TOTAL";
+  effectiveFrom: string;
+  effectiveUntil: null;
+  transientMaximumNightsExclusive: 7;
+  bands: Array<{ minimumNights: number; maximumNightsExclusive: number | null; anchorNights: 1 | 7 | 14 | 30 }>;
+  rounding: { stage: "FINAL_STAY_TOTAL"; unit: "CNY_YUAN"; mode: "HALF_UP_POSITIVE" };
+  shorteningBasis: "FULL_STAY_FROM_ORIGINAL_ARRIVAL";
+  extensionBasis: "FULL_STAY_FROM_ORIGINAL_ARRIVAL";
+  crossCalendarMonthTreatment: "NO_SPLIT";
+  antiInversionRule: "NONE";
+  separateElectricityCharge: false;
+}
+
+export interface ReferencePricingProductDto {
+  productCode: string;
+  roomTypeKey: string;
+  inventoryUnitKind: InventoryUnitKind;
+  anchorMultiplier: 1 | 2 | 4;
+  anchorsMinor: { "1": number; "7": number; "14": number; "30": number };
+  derivation: "SOURCE_PUBLISHED" | "BED_ANCHORS_TIMES_PHYSICAL_BEDS";
+}
+
+export interface ReferenceRateDto {
+  id: string;
+  inventoryCatalogEntryId: string;
+  packageNights: 1 | 7 | 14 | 30;
+  packageAmountMinor: number;
+  currency: string;
+  executionState: "REFERENCE_ONLY";
+  sourceSheet: string;
+  sourceRange: string;
+}
+
+export interface ReferenceMembershipProductDto {
+  id: string;
+  inventoryCatalogEntryId: string;
+  code: string;
+  name: string;
+  priceMinor: number;
+  currency: string;
+  salesLimit: number;
+  entitlementNights: number;
+  validityPeriod: string;
+  executionState: "REFERENCE_ONLY";
+  terms: {
+    entitlementUnit: EntitlementUnitKind;
+    quotaMeaning: "MEMBERSHIP_SLOTS_NOT_INVENTORY";
+    validityStartsAt: "PAYMENT_DATE";
+    membershipRules: {
+      bookingRule: string;
+      refundPolicy: "NON_REFUNDABLE_MEMBERSHIP";
+      refundRule: string;
+      overriddenSourceRefundRule: string;
+      refundCalculation: null;
+      sourceRange: string;
+    };
+  };
+  sourceSheet: string;
+  sourceRange: string;
+}
+
+export interface ReferenceCatalogDto {
+  batch: ReferenceCatalogBatchDto;
+  inventoryEntries: ReferenceInventoryCatalogEntryDto[];
+  rates: ReferenceRateDto[];
+  rooms: ReferencePhysicalRoomDto[];
+  pricingRule: ReferencePricingRuleDto;
+  pricingProducts: ReferencePricingProductDto[];
+  rejectedSourceFigures: Array<{ name: string; value: number; reason: string }>;
+  membershipProducts: ReferenceMembershipProductDto[];
+  unresolvedIssues: Array<{ code: string; description: string }>;
 }
 
 export interface CoverageItemDto {
@@ -87,12 +208,35 @@ export interface CoverageItemDto {
   entitlementLotId: string;
 }
 
-export interface CashLineDto {
+export interface NightlyCashLineDto {
+  lineKind?: "NIGHT";
   serviceDate: string;
   inventoryUnitId: string;
   description: string;
   amount: MoneyDto;
 }
+
+export interface StayTotalCashLineDto {
+  lineKind: "STAY_TOTAL";
+  arrivalDate: string;
+  departureDate: string;
+  inventoryUnitId: string;
+  description: string;
+  pricingBandAnchorNights: 1 | 7 | 14 | 30;
+  calculationSegments: Array<{
+    inventoryUnitId: string;
+    pricingProductCode: string;
+    arrivalDate: string;
+    departureDate: string;
+    nights: number;
+    anchorAmountMinor: number;
+    numeratorMinor: number;
+    denominator: number;
+  }>;
+  amount: MoneyDto;
+}
+
+export type CashLineDto = NightlyCashLineDto | StayTotalCashLineDto;
 
 export interface QuoteDto {
   quoteId: string;
@@ -182,6 +326,27 @@ export interface AuthPrincipal {
 export interface CommandEnvelope {
   commandType: CommandType;
   input: Record<string, unknown>;
+}
+
+export interface CreateMemberInput {
+  propertyId: string;
+  fullName: string;
+  identityCardNumber: string;
+  phone: string;
+  wechat: string;
+  validFrom?: string;
+  validUntil?: string;
+  memberContractId?: string;
+  sourceApplicationRecordId?: string;
+}
+
+export interface CreateMemberResultDto {
+  memberId: string;
+  memberContractId: string | null;
+  memberCreated: boolean;
+  memberContractCreated: boolean;
+  memberExternalReferenceId: string | null;
+  externalReferenceCreated: boolean;
 }
 
 export interface ExpireMemberEntitlementInput {

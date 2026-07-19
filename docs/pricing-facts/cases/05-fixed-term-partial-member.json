@@ -1,0 +1,72 @@
+{
+  "caseId": "rev561-fixed-term-partial-member-p1-cash",
+  "anonymizedOrderRef": "OWNER-CONFIRMED-RULE-PARTIAL-MEMBER",
+  "businessExplanation": "Concrete dates are covered first; each of seven uncovered dates remains at P1 instead of entering the seven-night band.",
+  "businessPlan": "FIXED_TERM",
+  "scenarioTags": ["PARTIAL_MEMBER_COVERAGE"],
+  "propertyTimeZone": "Asia/Shanghai",
+  "currency": "CNY",
+  "inventoryUnitKind": "ROOM",
+  "arrivalDate": "2026-03-01",
+  "departureDate": "2026-03-11",
+  "departureCharged": false,
+  "priceInputs": {
+    "policyVersionReference": "policy_qintopia_public_2026_rev561_v1",
+    "initialProductCode": "shared_bath_single_room",
+    "initialInventoryUnitReference": "ROOM-201",
+    "memberCoverage": true
+  },
+  "coverageSet": [
+    { "serviceDate": "2026-03-01", "inventoryUnitReference": "ROOM-201", "unitKind": "ROOM_NIGHT" },
+    { "serviceDate": "2026-03-02", "inventoryUnitReference": "ROOM-201", "unitKind": "ROOM_NIGHT" },
+    { "serviceDate": "2026-03-03", "inventoryUnitReference": "ROOM-201", "unitKind": "ROOM_NIGHT" }
+  ],
+  "amendments": [],
+  "rounding": { "stage": "FINAL_CASH_REMAINDER", "unit": "CNY_YUAN", "mode": "HALF_UP_POSITIVE" },
+  "expected": {
+    "pricingRevisions": [{
+      "revisionNo": 1,
+      "amendmentType": "CREATE_ORDER",
+      "pricingPolicyVersionReference": "policy_qintopia_public_2026_rev561_v1",
+      "arrivalDate": "2026-03-01",
+      "departureDate": "2026-03-11",
+      "coverageSet": [
+        { "serviceDate": "2026-03-01", "inventoryUnitReference": "ROOM-201", "unitKind": "ROOM_NIGHT" },
+        { "serviceDate": "2026-03-02", "inventoryUnitReference": "ROOM-201", "unitKind": "ROOM_NIGHT" },
+        { "serviceDate": "2026-03-03", "inventoryUnitReference": "ROOM-201", "unitKind": "ROOM_NIGHT" }
+      ],
+      "cashLines": [{
+        "lineKind": "NIGHT_SET",
+        "lines": [
+          { "serviceDate": "2026-03-04", "inventoryUnitReference": "ROOM-201", "amountMinor": 13000 },
+          { "serviceDate": "2026-03-05", "inventoryUnitReference": "ROOM-201", "amountMinor": 13000 },
+          { "serviceDate": "2026-03-06", "inventoryUnitReference": "ROOM-201", "amountMinor": 13000 },
+          { "serviceDate": "2026-03-07", "inventoryUnitReference": "ROOM-201", "amountMinor": 13000 },
+          { "serviceDate": "2026-03-08", "inventoryUnitReference": "ROOM-201", "amountMinor": 13000 },
+          { "serviceDate": "2026-03-09", "inventoryUnitReference": "ROOM-201", "amountMinor": 13000 },
+          { "serviceDate": "2026-03-10", "inventoryUnitReference": "ROOM-201", "amountMinor": 13000 }
+        ],
+        "totalMinor": 91000
+      }],
+      "manualAdjustmentMinor": 0,
+      "cashRemainderMinor": 91000,
+      "currentContractAmountMinor": 91000,
+      "roundingEvidence": { "rule": "UNCOVERED_DATES_AT_P1_FINAL_WHOLE_YUAN_HALF_UP", "pricingBandAnchorNights": 7 }
+    }],
+    "cashLines": [{
+      "lineKind": "NIGHT_SET",
+      "lines": [
+        { "serviceDate": "2026-03-04", "inventoryUnitReference": "ROOM-201", "amountMinor": 13000 },
+        { "serviceDate": "2026-03-05", "inventoryUnitReference": "ROOM-201", "amountMinor": 13000 },
+        { "serviceDate": "2026-03-06", "inventoryUnitReference": "ROOM-201", "amountMinor": 13000 },
+        { "serviceDate": "2026-03-07", "inventoryUnitReference": "ROOM-201", "amountMinor": 13000 },
+        { "serviceDate": "2026-03-08", "inventoryUnitReference": "ROOM-201", "amountMinor": 13000 },
+        { "serviceDate": "2026-03-09", "inventoryUnitReference": "ROOM-201", "amountMinor": 13000 },
+        { "serviceDate": "2026-03-10", "inventoryUnitReference": "ROOM-201", "amountMinor": 13000 }
+      ],
+      "totalMinor": 91000
+    }],
+    "cashRemainderMinor": 91000,
+    "currentContractAmountMinor": 91000
+  }
+}

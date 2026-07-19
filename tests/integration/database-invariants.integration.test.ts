@@ -59,18 +59,29 @@ async function createOrder(prefix: string, options: { member?: boolean; arrival?
     input: {
       propertyId: demo.propertyId,
       quoteId: quote.quoteId,
-      primaryGuest: { fullName: `Invariant Guest ${prefix}` }
+      primaryGuest: { fullName: `Invariant Guest ${prefix}` },
+      bookingChannelCode: "YOUMUDAO",
+      channelOrderReference: `TEST-INVARIANT-ORDER-${prefix}`
     }
   }, prefix);
   return receipt.result!.orderId as string;
 }
 
-async function insertLot(suffix: string, totalUnits: number): Promise<{ contractId: string; lotId: string }> {
+async function insertLot(suffix: string, totalUnits: number): Promise<{ memberId: string; contractId: string; lotId: string }> {
+  const memberId = `member_profile_invariant_${suffix}`;
   const contractId = `member_invariant_${suffix}`;
   const lotId = `lot_invariant_${suffix}`;
+  await db.insertInto("members").values({
+    id: memberId,
+    identity_card_number: `TEST-INVARIANT-ID-${suffix}`.toUpperCase(),
+    full_name: `Invariant member ${suffix}`,
+    phone: `TEST-PHONE-${suffix}`,
+    wechat: `test-wechat-${suffix}`
+  }).execute();
   await db.insertInto("member_contracts").values({
     id: contractId,
     property_id: demo.propertyId,
+    member_id: memberId,
     member_name: `Invariant member ${suffix}`,
     status: "ACTIVE",
     valid_from: "2026-01-01",
@@ -85,7 +96,7 @@ async function insertLot(suffix: string, totalUnits: number): Promise<{ contract
     expires_on: "2035-12-31",
     version: 1
   }).execute();
-  return { contractId, lotId };
+  return { memberId, contractId, lotId };
 }
 
 async function insertToken(options: {
@@ -157,9 +168,9 @@ describe.sequential("database-owned invariants on PostgreSQL", () => {
     }).execute()).rejects.toMatchObject({ constraint: "inventory_units_bed_parent_room_same_property" });
 
     await expect(db.updateTable("inventory_units").set({ parent_room_id: demo.secondRoomId })
-      .where("id", "=", demo.bedAId).execute()).rejects.toThrow(/identity are immutable/);
+      .where("id", "=", demo.bedAId).execute()).rejects.toThrow(/inventory unit .*catalog identity.*pricing product are immutable/);
     await expect(db.updateTable("inventory_units").set({ property_id: "prop_invariant_other" })
-      .where("id", "=", demo.roomId).execute()).rejects.toThrow(/identity are immutable/);
+      .where("id", "=", demo.roomId).execute()).rejects.toThrow(/inventory unit .*catalog identity.*pricing product are immutable/);
     await expect(db.deleteFrom("inventory_units").where("id", "=", demo.secondRoomId).execute())
       .rejects.toThrow(/identity is immutable/);
 
@@ -208,6 +219,61 @@ describe.sequential("database-owned invariants on PostgreSQL", () => {
       status: "RELEASED",
       held_by_revision_id: coverage[0]!.held_by_revision_id
     }).execute()).rejects.toThrow(/created in HELD status/);
+  });
+
+  it("keeps each order current revision scoped to that order while allowing a valid new revision", async () => {
+    const firstOrderId = await createOrder("revision-owner-first", { arrival: "2028-07-01", departure: "2028-07-02" });
+    const secondOrderId = await createOrder("revision-owner-second", { arrival: "2028-07-03", departure: "2028-07-04" });
+    const firstRevisionId = (await db.selectFrom("orders").select("current_revision_id")
+      .where("id", "=", firstOrderId).executeTakeFirstOrThrow()).current_revision_id!;
+    const secondRevisionId = (await db.selectFrom("orders").select("current_revision_id")
+      .where("id", "=", secondOrderId).executeTakeFirstOrThrow()).current_revision_id!;
+
+    await expect(db.updateTable("orders").set({ current_revision_id: "revision_missing_owner_probe" })
+      .where("id", "=", firstOrderId).execute())
+      .rejects.toMatchObject({ constraint: "orders_current_revision_required" });
+    await expect(db.updateTable("orders").set({ current_revision_id: secondRevisionId })
+      .where("id", "=", firstOrderId).execute())
+      .rejects.toMatchObject({ constraint: "orders_current_revision_same_order" });
+    expect((await db.selectFrom("orders").select("current_revision_id")
+      .where("id", "=", firstOrderId).executeTakeFirstOrThrow()).current_revision_id).toBe(firstRevisionId);
+
+    const repriced = await previewAndConfirm({
+      commandType: "REPRICE_ORDER",
+      input: { propertyId: demo.propertyId, orderId: firstOrderId, targetCurrentContractAmountMinor: 11_500 }
+    }, "revision-owner-valid");
+    const current = await db.selectFrom("orders as booking")
+      .innerJoin("pricing_revisions as revision", "revision.id", "booking.current_revision_id")
+      .select(["booking.id as order_id", "revision.id as revision_id", "revision.order_id as revision_order_id"])
+      .where("booking.id", "=", firstOrderId)
+      .executeTakeFirstOrThrow();
+    expect(current).toEqual({
+      order_id: firstOrderId,
+      revision_id: repriced.result!.pricingRevisionId,
+      revision_order_id: firstOrderId
+    });
+  });
+
+  it("freezes member and property ownership of a member contract after creation", async () => {
+    const first = await insertLot("contract-owner-first", 1);
+    const second = await insertLot("contract-owner-second", 1);
+
+    await expect(db.updateTable("member_contracts").set({ member_id: second.memberId })
+      .where("id", "=", first.contractId).execute())
+      .rejects.toMatchObject({ constraint: "member_contracts_owner_immutable" });
+    await expect(db.updateTable("member_contracts").set({ property_id: "prop_invariant_other" })
+      .where("id", "=", first.contractId).execute())
+      .rejects.toMatchObject({ constraint: "member_contracts_owner_immutable" });
+
+    await db.updateTable("member_contracts").set({ status: "EXPIRED", version: 2 })
+      .where("id", "=", first.contractId).execute();
+    expect(await db.selectFrom("member_contracts").select(["member_id", "property_id", "status", "version"])
+      .where("id", "=", first.contractId).executeTakeFirstOrThrow()).toEqual({
+      member_id: first.memberId,
+      property_id: demo.propertyId,
+      status: "EXPIRED",
+      version: 2
+    });
   });
 
   it("requires reciprocal, same-owner Token rotation links and blocks the same-update bypass", async () => {
@@ -446,7 +512,7 @@ describe.sequential("database-owned invariants on PostgreSQL", () => {
     const orderId = await createOrder("zero-reprice", { arrival: "2028-05-01", departure: "2028-05-02" });
     const repriced = await previewAndConfirm({
       commandType: "REPRICE_ORDER",
-      input: { propertyId: demo.propertyId, orderId, manualAdjustmentMinor: 0 }
+      input: { propertyId: demo.propertyId, orderId, targetCurrentContractAmountMinor: 12_000 }
     }, "zero-reprice");
     expect(repriced.businessCommitted).toBe(true);
     const latestRevision = await db.selectFrom("pricing_revisions").select("manual_adjustment_minor")
@@ -455,7 +521,7 @@ describe.sequential("database-owned invariants on PostgreSQL", () => {
 
     const collection = await previewAndConfirm({
       commandType: "RECORD_COLLECTION",
-      input: { propertyId: demo.propertyId, orderId, amountMinor: 5_000, method: "CASH", note: "Original collection" }
+      input: { propertyId: demo.propertyId, orderId, amountMinor: 5_000, method: "CASH", transactionReference: "TEST-INVARIANT-TXN-ORIGINAL", note: "Original collection" }
     }, "reverse-original-collection");
     const reversal = await previewAndConfirm({
       commandType: "REVERSE_FACT",
@@ -484,13 +550,13 @@ describe.sequential("database-owned invariants on PostgreSQL", () => {
       .toEqual({ fact_id: result.factIds[0], coverage_id: coverage.id, entry_type: "RELEASE" });
   });
 
-  it("requires migration 005 for readiness", async () => {
+  it("requires migration 011 for readiness", async () => {
     expect(await databaseReady(db)).toBe(true);
-    await db.deleteFrom("schema_migrations").where("name", "=", "005_core_identity_and_entitlement_guards.sql").execute();
+    await db.deleteFrom("schema_migrations").where("name", "=", "011_core_fact_shape_guards.sql").execute();
     try {
       expect(await databaseReady(db)).toBe(false);
     } finally {
-      await db.insertInto("schema_migrations").values({ name: "005_core_identity_and_entitlement_guards.sql" }).execute();
+      await db.insertInto("schema_migrations").values({ name: "011_core_fact_shape_guards.sql" }).execute();
     }
     expect(await databaseReady(db)).toBe(true);
   });

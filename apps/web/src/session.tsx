@@ -1,9 +1,34 @@
 import { createContext, useContext, useEffect, useMemo, useRef, useState, type Dispatch, type FormEvent, type ReactNode, type SetStateAction } from "react";
-import { BadgeCheck, BedDouble, Building2, ClipboardList, KeyRound, LogOut, Smartphone, UserRound } from "lucide-react";
+import { AlertCircle, BadgeCheck, BedDouble, Building2, ClipboardList, KeyRound, LogOut, RefreshCw, Smartphone, UserRound } from "lucide-react";
 import { NavLink, Outlet } from "react-router-dom";
-import { api } from "./api";
+import { api, ApiError } from "./api";
 import type { MetaDto, PendingTokenCommand, PrincipalDto, RetainedTokenSecret } from "./types";
-import { errorMessage, InlineError, LoadingBlock } from "./ui";
+import { errorMessage, LoadingBlock } from "./ui";
+
+export function ServiceFailureState({ error, title, onRetry, testId }: {
+  error: unknown;
+  title: string;
+  onRetry: () => void;
+  testId: string;
+}) {
+  const errorRef = useRef<HTMLElement>(null);
+
+  useEffect(() => {
+    errorRef.current?.focus();
+  }, [error]);
+
+  return (
+    <main className="startup-state">
+      <section className="service-failure" role="alert" tabIndex={-1} ref={errorRef} data-testid={testId}>
+        <AlertCircle aria-hidden="true" size={20} />
+        <div><h1>{title}</h1><p>{errorMessage(error)}</p></div>
+      </section>
+      <button className="button button-secondary" type="button" onClick={onRetry} data-testid={`${testId}-retry`}>
+        <RefreshCw aria-hidden="true" size={17} />重试
+      </button>
+    </main>
+  );
+}
 
 interface WorkspaceContextValue {
   principal: PrincipalDto;
@@ -79,9 +104,8 @@ export function LoginPage({ onLogin }: { onLogin: (principal: PrincipalDto) => v
   );
 }
 
-export function WorkspaceProvider({ principal, onLogout, children }: {
+export function WorkspaceProvider({ principal, children }: {
   principal: PrincipalDto;
-  onLogout: () => void;
   children: ReactNode;
 }) {
   const [meta, setMeta] = useState<MetaDto>();
@@ -89,9 +113,19 @@ export function WorkspaceProvider({ principal, onLogout, children }: {
   const [error, setError] = useState<unknown>();
   const [retainedTokenSecret, setRetainedTokenSecret] = useState<RetainedTokenSecret>();
   const [pendingTokenCommand, setPendingTokenCommand] = useState<PendingTokenCommand>();
+  const metaRequestId = useRef(0);
 
   async function refreshMeta() {
-    const nextMeta = await api.meta();
+    const requestId = ++metaRequestId.current;
+    let nextMeta: MetaDto;
+    try {
+      nextMeta = await api.meta();
+    } catch (nextError) {
+      if (requestId !== metaRequestId.current) return;
+      throw nextError;
+    }
+    if (requestId !== metaRequestId.current) return;
+    setError(undefined);
     setMeta(nextMeta);
     setPropertyIdState((current) => {
       if (current && nextMeta.properties.some((property) => property.id === current)) return current;
@@ -103,7 +137,13 @@ export function WorkspaceProvider({ principal, onLogout, children }: {
 
   useEffect(() => {
     void refreshMeta().catch(setError);
+    return () => { metaRequestId.current += 1; };
   }, []);
+
+  function retryMeta() {
+    setError(undefined);
+    void refreshMeta().catch(setError);
+  }
 
   function setPropertyId(nextPropertyId: string) {
     localStorage.setItem("qintopia.propertyId", nextPropertyId);
@@ -123,7 +163,7 @@ export function WorkspaceProvider({ principal, onLogout, children }: {
   }) : undefined, [meta, pendingTokenCommand, principal, propertyId, retainedTokenSecret]);
 
   if (error) {
-    return <main className="startup-state"><InlineError error={error} title="无法载入工作区" /><button className="button button-secondary" type="button" onClick={onLogout}>返回登录</button></main>;
+    return <ServiceFailureState error={error} title="无法载入工作区" onRetry={retryMeta} testId="workspace-startup-error" />;
   }
   if (!value) return <main className="startup-state"><LoadingBlock label="正在载入运营数据" /></main>;
 
@@ -157,12 +197,34 @@ function Navigation({ mobile = false }: { mobile?: boolean }) {
 export function AppShell({ onLogout }: { onLogout: () => void }) {
   const { principal, meta, propertyId, setPropertyId } = useWorkspace();
   const property = meta.properties.find((item) => item.id === propertyId);
+  const [logoutFailure, setLogoutFailure] = useState<{ error: unknown; sessionState: "ACTIVE" | "UNKNOWN" }>();
+  const [loggingOut, setLoggingOut] = useState(false);
+  const logoutErrorRef = useRef<HTMLElement>(null);
+
+  useEffect(() => {
+    if (logoutFailure) logoutErrorRef.current?.focus();
+  }, [logoutFailure]);
 
   async function logout() {
+    if (loggingOut) return;
+    setLoggingOut(true);
+    setLogoutFailure(undefined);
     try {
       await api.logout();
-    } finally {
       onLogout();
+    } catch (nextError) {
+      let sessionState: "ACTIVE" | "UNKNOWN" = "UNKNOWN";
+      try {
+        await api.me();
+        sessionState = "ACTIVE";
+      } catch (verificationError) {
+        if (verificationError instanceof ApiError && verificationError.status === 401) {
+          onLogout();
+          return;
+        }
+      }
+      setLogoutFailure({ error: nextError, sessionState });
+      setLoggingOut(false);
     }
   }
 
@@ -178,7 +240,7 @@ export function AppShell({ onLogout }: { onLogout: () => void }) {
         <div className="sidebar-user">
           <UserRound aria-hidden="true" size={18} />
           <div><strong>{principal.displayName}</strong><span>{principal.propertyAccess[propertyId] ?? "READ"}</span></div>
-          <button className="icon-button" type="button" onClick={() => void logout()} aria-label="退出登录" title="退出登录"><LogOut aria-hidden="true" size={18} /></button>
+          <button className="icon-button" type="button" onClick={() => void logout()} disabled={loggingOut} aria-label="退出登录" title="退出登录"><LogOut aria-hidden="true" size={18} /></button>
         </div>
       </aside>
       <div className="workspace">
@@ -191,8 +253,20 @@ export function AppShell({ onLogout }: { onLogout: () => void }) {
             </select>
           </div>
           <div className="property-meta"><span>{property?.timezone}</span><span>{property?.currency}</span></div>
-          <button className="mobile-logout icon-button" type="button" onClick={() => void logout()} aria-label="退出登录" title="退出登录"><LogOut aria-hidden="true" size={19} /></button>
+          <button className="mobile-logout icon-button" type="button" onClick={() => void logout()} disabled={loggingOut} aria-label="退出登录" title="退出登录"><LogOut aria-hidden="true" size={19} /></button>
         </header>
+        {logoutFailure ? (
+          <section className="session-action-error" role="alert" tabIndex={-1} ref={logoutErrorRef} data-testid="logout-error">
+            <AlertCircle aria-hidden="true" size={20} />
+            <div>
+              <strong>{logoutFailure.sessionState === "ACTIVE" ? "退出未完成，会话仍保持登录" : "退出结果暂未确认，本页面保持当前工作区"}</strong>
+              <p>{errorMessage(logoutFailure.error)}</p>
+            </div>
+            <button className="button button-secondary" type="button" onClick={() => void logout()} disabled={loggingOut} data-testid="retry-logout">
+              <RefreshCw aria-hidden="true" size={17} />重试退出
+            </button>
+          </section>
+        ) : null}
         <main id="main-content" className="main-content" tabIndex={-1}><Outlet /></main>
       </div>
       <Navigation mobile />

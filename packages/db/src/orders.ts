@@ -121,7 +121,10 @@ export async function getOrderView(db: DbExecutor, orderId: string) {
     currentSegment: context.currentSegment,
     segments,
     amendments,
-    pricingRevisions: revisions,
+    pricingRevisions: revisions.map((revision) => ({
+      ...revision,
+      policy_base_amount_minor: revision.current_contract_amount_minor - revision.manual_adjustment_minor
+    })),
     coverageSet: coverage,
     collectionFacts: facts,
     amounts: await orderAmountSummary(db, context)
@@ -130,12 +133,20 @@ export async function getOrderView(db: DbExecutor, orderId: string) {
 
 export async function activeCoverageCandidates(db: DbExecutor, orderId: string, dates?: string[]): Promise<CoverageCandidate[]> {
   let query = db.selectFrom("coverage_items")
-    .select(["service_date", "lot_id"])
+    .select(["service_date", "lot_id", "status", "inventory_unit_id", "unit_kind"])
     .where("order_id", "=", orderId)
     .where("status", "in", ["HELD", "CONSUMED"]);
   if (dates && dates.length > 0) query = query.where("service_date", "in", dates);
   const items = await query.orderBy("service_date").execute();
-  return items.map((item) => ({ serviceDate: item.service_date, entitlementLotId: item.lot_id }));
+  return items.map((item) => ({
+    serviceDate: item.service_date,
+    entitlementLotId: item.lot_id,
+    status: item.status as "HELD" | "CONSUMED",
+    ...(item.status === "CONSUMED" ? {
+      inventoryUnitId: item.inventory_unit_id,
+      unitKind: item.unit_kind as "ROOM_NIGHT" | "BED_NIGHT"
+    } : {})
+  }));
 }
 
 export async function appendAmendment(trx: Transaction<Database>, options: {
@@ -274,14 +285,14 @@ export async function reconcileCoverage(trx: Transaction<Database>, options: {
   for (const item of active) {
     const desired = desiredByDate.get(item.service_date);
     if (item.status === "CONSUMED") {
-      if (!desired || !coverageMatches(item, desired, options.contractId)) {
+      if (desired && !coverageMatches(item, desired, options.contractId)) {
         throw new DomainError("ENTITLEMENT_CONFLICT", "A pricing revision cannot rewrite consumed coverage", 409, false, {
           orderId: options.orderId,
           serviceDate: item.service_date,
           coverageId: item.id
         });
       }
-      desiredByDate.delete(item.service_date);
+      if (desired) desiredByDate.delete(item.service_date);
       coverageIds.push(item.id);
       continue;
     }
@@ -400,7 +411,7 @@ export async function consumeCoverage(trx: Transaction<Database>, orderId: strin
     await trx.insertInto("entitlement_ledger").values({
       fact_id: factId, lot_id: item.lot_id, entry_type: "CONSUME", quantity_delta: 0,
       service_date: item.service_date, order_id: orderId, coverage_id: item.id,
-      reason: "STAY_FULFILLED", command_id: commandId
+      reason: "CHECK_IN_ENTITLEMENT_CONSUMED", command_id: commandId
     }).execute();
     factIds.push(factId);
   }

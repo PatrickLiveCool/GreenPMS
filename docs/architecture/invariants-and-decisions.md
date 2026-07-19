@@ -26,7 +26,7 @@
 ## Reversible assumptions awaiting operating facts
 
 - The demo property uses `Asia/Shanghai`, CNY integer minor units, arrival night charged/claimed, and departure date excluded.
-- Member nights are held when an order is confirmed, converted from HELD to CONSUMED at checkout, and released on cancellation, no-show, or removed service dates.
+- Member nights are held when an order is confirmed and converted from HELD to CONSUMED when CHECK_IN succeeds. Pre-check-in cancellation, no-show, or removed service dates release HELD nights; CHECK_OUT does not consume them again, and ordinary commands never restore CONSUMED nights.
 - `expires_on` is the final eligible service date. This boundary will be replaced if real entitlement contracts demonstrate different semantics.
 - Confirming no-show releases its future inventory immediately.
 - A refund cannot exceed the un-reversed amount of its referenced collection; it never references or allocates to another order.

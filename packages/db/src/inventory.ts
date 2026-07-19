@@ -12,6 +12,13 @@ export interface InventoryUnitRecord {
   roomId: string;
   code: string;
   name: string;
+  catalogVersion: string | null;
+  buildingCode: string | null;
+  roomTypeCode: string | null;
+  pricingProductCode: string | null;
+  inventoryBasis: "INDEPENDENT" | "WHOLE_ROOM_COMBINATION" | null;
+  codeProvenance: "SOURCE_EXPLICIT" | "USER_CONFIRMED_RENAMED" | "PMS_GENERATED" | null;
+  physicalBedCount: number | null;
 }
 
 export interface AvailabilityNight {
@@ -27,7 +34,7 @@ export interface UnitAvailability extends InventoryUnitRecord {
 
 export async function loadInventoryUnit(db: DbExecutor, propertyId: string, unitId: string): Promise<InventoryUnitRecord> {
   const row = await db.selectFrom("inventory_units")
-    .select(["id", "property_id", "kind", "parent_room_id", "code", "name"])
+    .select(["id", "property_id", "kind", "parent_room_id", "code", "name", "catalog_version", "building_code", "room_type_code", "pricing_product_code", "inventory_basis", "code_provenance", "physical_bed_count"])
     .where("id", "=", unitId)
     .where("property_id", "=", propertyId)
     .where("active", "=", true)
@@ -39,14 +46,21 @@ export async function loadInventoryUnit(db: DbExecutor, propertyId: string, unit
     kind: row.kind,
     roomId: row.kind === "ROOM" ? row.id : row.parent_room_id!,
     code: row.code,
-    name: row.name
+    name: row.name,
+    catalogVersion: row.catalog_version,
+    buildingCode: row.building_code,
+    roomTypeCode: row.room_type_code,
+    pricingProductCode: row.pricing_product_code,
+    inventoryBasis: row.inventory_basis,
+    codeProvenance: row.code_provenance,
+    physicalBedCount: row.physical_bed_count
   };
 }
 
 export async function listAvailability(db: DbExecutor, propertyId: string, arrivalDate: string, departureDate: string, kind?: InventoryUnitKind): Promise<UnitAvailability[]> {
   const dates = enumerateServiceDates(arrivalDate, departureDate);
   let query = db.selectFrom("inventory_units")
-    .select(["id", "property_id", "kind", "parent_room_id", "code", "name"])
+    .select(["id", "property_id", "kind", "parent_room_id", "code", "name", "catalog_version", "building_code", "room_type_code", "pricing_product_code", "inventory_basis", "code_provenance", "physical_bed_count"])
     .where("property_id", "=", propertyId)
     .where("active", "=", true);
   if (kind) query = query.where("kind", "=", kind);
@@ -74,6 +88,13 @@ export async function listAvailability(db: DbExecutor, propertyId: string, arriv
       roomId,
       code: unit.code,
       name: unit.name,
+      catalogVersion: unit.catalog_version,
+      buildingCode: unit.building_code,
+      roomTypeCode: unit.room_type_code,
+      pricingProductCode: unit.pricing_product_code,
+      inventoryBasis: unit.inventory_basis,
+      codeProvenance: unit.code_provenance,
+      physicalBedCount: unit.physical_bed_count,
       nights,
       available: nights.every((night) => night.available)
     };

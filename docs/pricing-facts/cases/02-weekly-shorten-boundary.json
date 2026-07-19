@@ -1,0 +1,107 @@
+{
+  "caseId": "rev561-weekly-shorten-7-to-6",
+  "anonymizedOrderRef": "OWNER-CONFIRMED-RULE-SHORTEN-7-TO-6",
+  "businessExplanation": "Shortening reselects the band from the complete shortened interval and keeps the original locked policy.",
+  "businessPlan": "WEEKLY",
+  "scenarioTags": ["SHORTEN", "BOUNDARY"],
+  "propertyTimeZone": "Asia/Shanghai",
+  "currency": "CNY",
+  "inventoryUnitKind": "BED",
+  "arrivalDate": "2026-03-01",
+  "departureDate": "2026-03-07",
+  "departureCharged": false,
+  "priceInputs": {
+    "policyVersionReference": "policy_qintopia_public_2026_rev561_v1",
+    "initialProductCode": "shared_bath_double_bed",
+    "initialInventoryUnitReference": "BED-104-A",
+    "initialDepartureDate": "2026-03-08"
+  },
+  "coverageSet": [],
+  "amendments": [{
+    "sequence": 2,
+    "amendmentType": "SHORTEN_STAY",
+    "requestedAt": "2026-03-02T03:00:00.000Z",
+    "input": { "newDepartureDate": "2026-03-07", "reason": "Owner-confirmed shortening boundary fact" }
+  }],
+  "rounding": { "stage": "FINAL_STAY_TOTAL", "unit": "CNY_YUAN", "mode": "HALF_UP_POSITIVE" },
+  "boundaryEvidence": {
+    "boundaryName": "seven-night band reselected after shortening",
+    "comparisonCaseId": "rev561-transient-6-night",
+    "observedBehaviorChange": "The six-night result uses P1 and does not retain the prior seven-night band."
+  },
+  "expected": {
+    "pricingRevisions": [
+      {
+        "revisionNo": 1,
+        "amendmentType": "CREATE_ORDER",
+        "pricingPolicyVersionReference": "policy_qintopia_public_2026_rev561_v1",
+        "arrivalDate": "2026-03-01",
+        "departureDate": "2026-03-08",
+        "coverageSet": [],
+        "cashLines": [{
+          "lineKind": "STAY_TOTAL",
+          "pricingBandAnchorNights": 7,
+          "calculationSegments": [{
+            "inventoryUnitReference": "BED-104-A",
+            "pricingProductCode": "shared_bath_double_bed",
+            "arrivalDate": "2026-03-01",
+            "departureDate": "2026-03-08",
+            "nights": 7,
+            "anchorAmountMinor": 38000,
+            "numeratorMinor": 266000,
+            "denominator": 7
+          }],
+          "amountMinor": 38000
+        }],
+        "manualAdjustmentMinor": 0,
+        "cashRemainderMinor": 38000,
+        "currentContractAmountMinor": 38000,
+        "roundingEvidence": { "rule": "FINAL_STAY_TOTAL_WHOLE_YUAN_HALF_UP", "pricingBandAnchorNights": 7 }
+      },
+      {
+        "revisionNo": 2,
+        "amendmentType": "SHORTEN_STAY",
+        "pricingPolicyVersionReference": "policy_qintopia_public_2026_rev561_v1",
+        "arrivalDate": "2026-03-01",
+        "departureDate": "2026-03-07",
+        "coverageSet": [],
+        "cashLines": [{
+          "lineKind": "STAY_TOTAL",
+          "pricingBandAnchorNights": 1,
+          "calculationSegments": [{
+            "inventoryUnitReference": "BED-104-A",
+            "pricingProductCode": "shared_bath_double_bed",
+            "arrivalDate": "2026-03-01",
+            "departureDate": "2026-03-07",
+            "nights": 6,
+            "anchorAmountMinor": 6800,
+            "numeratorMinor": 40800,
+            "denominator": 1
+          }],
+          "amountMinor": 40800
+        }],
+        "manualAdjustmentMinor": 0,
+        "cashRemainderMinor": 40800,
+        "currentContractAmountMinor": 40800,
+        "roundingEvidence": { "rule": "FINAL_STAY_TOTAL_WHOLE_YUAN_HALF_UP", "pricingBandAnchorNights": 1 }
+      }
+    ],
+    "cashLines": [{
+      "lineKind": "STAY_TOTAL",
+      "pricingBandAnchorNights": 1,
+      "calculationSegments": [{
+        "inventoryUnitReference": "BED-104-A",
+        "pricingProductCode": "shared_bath_double_bed",
+        "arrivalDate": "2026-03-01",
+        "departureDate": "2026-03-07",
+        "nights": 6,
+        "anchorAmountMinor": 6800,
+        "numeratorMinor": 40800,
+        "denominator": 1
+      }],
+      "amountMinor": 40800
+    }],
+    "cashRemainderMinor": 40800,
+    "currentContractAmountMinor": 40800
+  }
+}

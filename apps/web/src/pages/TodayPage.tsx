@@ -6,7 +6,19 @@ import { api } from "../api";
 import { useWorkspace } from "../session";
 import type { CommandRequest, OrderRowDto } from "../types";
 import { localDateInTimeZone } from "../dates";
-import { CommandDialog, EmptyState, formatDate, guestName, InlineError, LoadingBlock, StatusBadge } from "../ui";
+import {
+  CommandDialog,
+  CommandRecoveryBar,
+  EmptyState,
+  formatDate,
+  guestName,
+  InlineError,
+  isTerminalCommandRecovery,
+  LoadingBlock,
+  recoveryCommandRequest,
+  StatusBadge,
+  usePersistentCommandRecovery
+} from "../ui";
 
 type TodayTab = "ARRIVALS" | "IN_HOUSE" | "DEPARTURES" | "EXCEPTIONS";
 
@@ -18,7 +30,8 @@ const tabs: Array<{ id: TodayTab; label: string }> = [
 ];
 
 export function TodayPage() {
-  const { meta, propertyId } = useWorkspace();
+  const { meta, principal, propertyId } = useWorkspace();
+  const commandRecovery = usePersistentCommandRecovery({ subjectId: principal.subjectId, scopeId: `property:${propertyId}` });
   const propertyTimezone = meta.properties.find((property) => property.id === propertyId)?.timezone ?? "UTC";
   const [orders, setOrders] = useState<OrderRowDto[]>([]);
   const [businessDate, setBusinessDate] = useState(() => localDateInTimeZone(propertyTimezone));
@@ -27,12 +40,18 @@ export function TodayPage() {
   const [tab, setTab] = useState<TodayTab>("ARRIVALS");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<unknown>();
+  const [recoveryError, setRecoveryError] = useState<unknown>();
   const [refreshToken, setRefreshToken] = useState(0);
   const [command, setCommand] = useState<CommandRequest>();
+  const [recoveryDialogOpen, setRecoveryDialogOpen] = useState(false);
+  const commandsBlocked = commandRecovery.blocked;
 
   useEffect(() => {
     if (previousPropertyId.current === propertyId) return;
     previousPropertyId.current = propertyId;
+    setCommand(undefined);
+    setRecoveryDialogOpen(false);
+    setRecoveryError(undefined);
     if (!dateEdited.current) setBusinessDate(localDateInTimeZone(propertyTimezone));
   }, [propertyId, propertyTimezone]);
 
@@ -55,12 +74,34 @@ export function TodayPage() {
   }), [businessDate, orders]);
 
   function directCommand(order: OrderRowDto, commandType: CommandType, title: string) {
+    if (commandsBlocked) return;
+    setRecoveryDialogOpen(false);
     setCommand({
       commandType,
       title,
-      description: "移动履约命令使用与桌面端相同的服务端 Preview、授权、事务和 Confirm。",
+      description: commandType === "CHECK_IN"
+        ? "服务端 Preview 将显示本次入住核销的 HELD 会员权益；Confirm 与订单状态变更在同一事务提交。"
+        : "退房只完成履约并释放库存，不重复核销已在入住时转为 CONSUMED 的会员权益。",
       input: { propertyId, orderId: order.id }
     });
+  }
+
+  function openRecoveryDialog() {
+    if (!commandRecovery.pending) return;
+    setRecoveryDialogOpen(true);
+    setCommand(recoveryCommandRequest(commandRecovery.pending));
+  }
+
+  function closeCommandDialog() {
+    let refreshAfterClose = false;
+    if (commandRecovery.pending && isTerminalCommandRecovery(commandRecovery.pending.state)) {
+      refreshAfterClose = commandRecovery.pending.receipt?.businessCommitted === true;
+      if (commandRecovery.clearResolved()) setRecoveryError(undefined);
+      else setRecoveryError(new Error("无法清除已收口的本地恢复记录；为避免重复履约，写命令继续保持暂停"));
+    }
+    setCommand(undefined);
+    setRecoveryDialogOpen(false);
+    if (refreshAfterClose) setRefreshToken((value) => value + 1);
   }
 
   const visible = buckets[tab];
@@ -71,6 +112,9 @@ export function TodayPage() {
         <div><p className="eyebrow">Mobile operations</p><h1>今日履约</h1><p>{formatDate(businessDate)}</p></div>
         <div className="today-date"><CalendarDays aria-hidden="true" size={17} /><label><span className="sr-only">营业日期</span><input type="date" value={businessDate} onChange={(event) => { dateEdited.current = true; setBusinessDate(event.target.value); }} /></label><button className="icon-button" type="button" onClick={() => setRefreshToken((value) => value + 1)} aria-label="刷新今日履约" title="刷新"><RefreshCw className={loading ? "spin" : ""} aria-hidden="true" size={18} /></button></div>
       </header>
+      <InlineError error={recoveryError} title="恢复记录未收口" />
+      <InlineError error={commandRecovery.error} title="本地命令恢复记录不可用" />
+      {commandRecovery.pending ? <CommandRecoveryBar recovery={commandRecovery.pending} onOpen={openRecoveryDialog} testId="today-command-recovery" /> : null}
       <div className="today-tabs" role="tablist" aria-label="今日履约分类">
         {tabs.map((item) => <button key={item.id} type="button" role="tab" aria-selected={tab === item.id} aria-controls="today-tabpanel" id={`tab-${item.id}`} onClick={() => setTab(item.id)}><span>{item.label}</span><strong>{buckets[item.id].length}</strong></button>)}
       </div>
@@ -82,14 +126,23 @@ export function TodayPage() {
             <div className="queue-primary"><strong>{guestName(order.primary_guest_snapshot)}</strong><code>{order.id}</code><span>{formatDate(order.arrival_date)} 至 {formatDate(order.departure_date)}</span></div>
             <StatusBadge value={order.status} />
             <div className="queue-actions">
-              {tab === "ARRIVALS" ? <button className="button button-primary" type="button" onClick={() => directCommand(order, "CHECK_IN", "办理入住")}><LogIn aria-hidden="true" size={17} />入住</button> : null}
-              {tab === "DEPARTURES" || tab === "IN_HOUSE" ? <button className="button button-primary" type="button" onClick={() => directCommand(order, "CHECK_OUT", "办理退房")}><LogOut aria-hidden="true" size={17} />退房</button> : null}
+              {tab === "ARRIVALS" ? <button className="button button-primary" type="button" onClick={() => directCommand(order, "CHECK_IN", "办理入住")} disabled={commandsBlocked}><LogIn aria-hidden="true" size={17} />入住</button> : null}
+              {tab === "DEPARTURES" || tab === "IN_HOUSE" ? <button className="button button-primary" type="button" onClick={() => directCommand(order, "CHECK_OUT", "办理退房")} disabled={commandsBlocked}><LogOut aria-hidden="true" size={17} />退房</button> : null}
               <Link className="icon-button" to={`/orders/${encodeURIComponent(order.id)}`} aria-label={`查看订单 ${order.id}`} title="查看订单"><ChevronRight aria-hidden="true" size={19} /></Link>
             </div>
           </article>
         ))}
       </section>
-      {command ? <CommandDialog request={command} onClose={() => setCommand(undefined)} onCommitted={() => setRefreshToken((value) => value + 1)} /> : null}
+      {command ? <CommandDialog
+        key={recoveryDialogOpen ? `recovery-${commandRecovery.pending?.confirmationKey ?? "missing"}` : "new-today-command"}
+        request={command}
+        onClose={closeCommandDialog}
+        {...(recoveryDialogOpen && commandRecovery.pending ? {
+          initialConfirmationKey: commandRecovery.pending.confirmationKey,
+          ...(commandRecovery.pending.receipt ? { initialReceipt: commandRecovery.pending.receipt } : {})
+        } : {})}
+        onProgress={(progress) => commandRecovery.track(command, progress)}
+      /> : null}
     </div>
   );
 }

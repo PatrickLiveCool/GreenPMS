@@ -38,7 +38,7 @@ type ReceiptBody = {
   businessCommitted: boolean;
   correlationId: string;
   result?: Record<string, unknown>;
-  error?: { code: string; retryable: boolean };
+  error?: { code: string; retryable: boolean; details?: Record<string, unknown> };
   factRefs?: string[];
 };
 
@@ -112,6 +112,7 @@ beforeAll(async () => {
   setTestEnvironment("LOG_LEVEL", "silent");
   setTestEnvironment("LOGIN_RATE_LIMIT_MAX", "2");
   setTestEnvironment("BEARER_AUTH_RATE_LIMIT_MAX", "5000");
+  setTestEnvironment("WEB_ORIGIN", "http://127.0.0.1:4312");
   db = await resetDatabase(securityContractDatabaseUrl);
   await db.insertInto("properties").values({
     id: secondPropertyId,
@@ -199,21 +200,122 @@ beforeAll(async () => {
   ]).execute();
   app = await buildServer(db);
   await app.ready();
-});
+}, 120_000);
 
 afterAll(async () => {
-  await app.close();
-  for (const [name, value] of originalEnvironment) {
-    if (value === undefined) delete process.env[name];
-    else process.env[name] = value;
+  try {
+    if (app) await app.close();
+    else if (db) await db.destroy();
+  } finally {
+    for (const [name, value] of originalEnvironment) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
   }
 });
 
 describe("HTTP security contract", () => {
+  it("allows only the configured Origin for session writes and rejects mismatches with zero artifacts", async () => {
+    const sessionCookie = newOpaqueSecret("qts");
+    await db.insertInto("web_sessions").values({
+      id: "session_security_origin",
+      subject_id: demo.operatorSubjectId,
+      secret_hash: sha256(sessionCookie),
+      expires_at: "2028-01-01T00:00:00.000Z",
+      revoked_at: null
+    }).execute();
+    const input = {
+      propertyId: demo.propertyId,
+      inventoryUnitId: demo.roomId,
+      stayType: "FREE",
+      arrivalDate: "2028-12-10",
+      departureDate: "2028-12-12",
+      pricingPolicyVersionId: demo.freePolicyId
+    };
+    const before = await commandArtifactCounts();
+    const rejected = await app.inject({
+      method: "POST",
+      url: "/api/v1/quotes",
+      cookies: { qintopia_session: sessionCookie },
+      headers: {
+        origin: "http://127.0.0.1:9999",
+        "idempotency-key": "session-origin-rejected",
+        "x-correlation-id": "session-origin-rejected"
+      },
+      payload: input
+    });
+    expect(rejected.statusCode, rejected.body).toBe(403);
+    expect(rejected.json()).toMatchObject({ code: "RESOURCE_SCOPE_DENIED", retryable: false });
+    expect(await commandArtifactCounts()).toEqual(before);
+
+    const accepted = await app.inject({
+      method: "POST",
+      url: "/api/v1/quotes",
+      cookies: { qintopia_session: sessionCookie },
+      headers: {
+        origin: "http://127.0.0.1:4312",
+        "idempotency-key": "session-origin-accepted",
+        "x-correlation-id": "session-origin-accepted"
+      },
+      payload: input
+    });
+    expect(accepted.statusCode, accepted.body).toBe(200);
+    expect(accepted.json()).toMatchObject({ receipt: { executionStatus: "EXECUTED", businessCommitted: true } });
+  });
+
   it("authenticates before resolving a member contract", async () => {
-    const missing = await app.inject({ method: "GET", url: "/api/v1/members/member_missing_probe" });
+    const missing = await app.inject({
+      method: "GET",
+      url: `/api/v1/members/member_missing_probe?propertyId=${demo.propertyId}`
+    });
     expect(missing.statusCode).toBe(401);
     expect(missing.json()).toMatchObject({ code: "AUTHENTICATION_REQUIRED", retryable: false });
+  });
+
+  it("rejects an expired Bearer Token before creating command or business artifacts", async () => {
+    const expiredSecret = newOpaqueSecret("qtp");
+    await db.insertInto("api_tokens").values({
+      id: "token_security_expired_http",
+      subject_id: demo.agentSubjectId,
+      label: "Expired HTTP security contract Token",
+      secret_hash: sha256(expiredSecret),
+      access_ceiling: "WRITE",
+      property_scope: demo.propertyId,
+      expires_at: "2020-01-01T00:00:00.000Z",
+      revoked_at: null,
+      rotated_from_id: null,
+      replaced_by_id: null
+    }).execute();
+    const beforeArtifacts = await commandArtifactCounts();
+    const beforeBusiness = await Promise.all([
+      db.selectFrom("maintenance_locks").select(({ fn }) => fn.countAll<number>().as("count")).executeTakeFirstOrThrow(),
+      db.selectFrom("inventory_claims").select(({ fn }) => fn.countAll<number>().as("count")).executeTakeFirstOrThrow()
+    ]);
+
+    const rejected = await app.inject({
+      method: "POST",
+      url: "/api/v1/command-previews",
+      headers: writeHeaders(expiredSecret, "expired-token-write"),
+      payload: {
+        commandType: "LOCK_MAINTENANCE",
+        input: {
+          propertyId: demo.propertyId,
+          inventoryUnitId: demo.secondRoomId,
+          arrivalDate: "2027-04-01",
+          departureDate: "2027-04-02",
+          reason: "Expired Token must not authorize a write"
+        }
+      }
+    });
+
+    expect(rejected.statusCode).toBe(401);
+    expect(rejected.json()).toMatchObject({ code: "TOKEN_EXPIRED", retryable: false });
+    expect(await commandArtifactCounts()).toEqual(beforeArtifacts);
+    const afterBusiness = await Promise.all([
+      db.selectFrom("maintenance_locks").select(({ fn }) => fn.countAll<number>().as("count")).executeTakeFirstOrThrow(),
+      db.selectFrom("inventory_claims").select(({ fn }) => fn.countAll<number>().as("count")).executeTakeFirstOrThrow()
+    ]);
+    expect(afterBusiness.map((row) => Number(row.count))).toEqual(beforeBusiness.map((row) => Number(row.count)));
   });
 
   it("rejects Bearer logout instead of implying that the Token was revoked", async () => {
@@ -232,6 +334,58 @@ describe("HTTP security contract", () => {
       url: "/api/v1/meta",
       headers: authHeaders(demo.readToken)
     })).statusCode).toBe(200);
+  });
+
+  it("returns only top-level PREVIEW_STALE for an expired Preview and persists independent rejected Receipts", async () => {
+    const before = await Promise.all([
+      db.selectFrom("maintenance_locks").select(({ fn }) => fn.countAll<number>().as("count")).executeTakeFirstOrThrow(),
+      db.selectFrom("inventory_claims").select(({ fn }) => fn.countAll<number>().as("count")).executeTakeFirstOrThrow()
+    ]);
+    const prepared = await previewCommand(demo.writeToken, "LOCK_MAINTENANCE", {
+      propertyId: demo.propertyId,
+      inventoryUnitId: demo.secondRoomId,
+      arrivalDate: "2029-11-01",
+      departureDate: "2029-11-02",
+      reason: "HTTP expired Preview contract"
+    }, "http-expired-preview");
+    expect(prepared.response.statusCode, prepared.response.body).toBe(200);
+    await db.updateTable("command_previews")
+      .set({ expires_at: new Date(Date.now() - 1_000) })
+      .where("id", "=", prepared.body.preview.previewId)
+      .execute();
+
+    const first = await confirmPreview(demo.writeToken, prepared.body.preview, "http-expired-first");
+    const second = await confirmPreview(demo.writeToken, prepared.body.preview, "http-expired-second");
+    expect(first.response.statusCode, first.response.body).toBe(409);
+    expect(second.response.statusCode, second.response.body).toBe(409);
+    for (const result of [first.body, second.body]) {
+      expect(result).toMatchObject({
+        executionStatus: "NOT_EXECUTED",
+        businessCommitted: false,
+        error: { code: "PREVIEW_STALE", details: { causeCode: "PREVIEW_EXPIRED" } }
+      });
+      expect(result.error?.code).not.toBe("PREVIEW_EXPIRED");
+      const durable = await app.inject({
+        method: "GET",
+        url: `/api/v1/receipts/${result.receiptId}`,
+        headers: { authorization: `Bearer ${demo.writeToken}` }
+      });
+      expect(durable.statusCode, durable.body).toBe(200);
+      expect(durable.json()).toEqual(result);
+    }
+    expect(second.body.receiptId).not.toBe(first.body.receiptId);
+    expect(second.body.commandId).not.toBe(first.body.commandId);
+
+    const storedPreview = await db.selectFrom("command_previews")
+      .select(["status", "used_at"])
+      .where("id", "=", prepared.body.preview.previewId)
+      .executeTakeFirstOrThrow();
+    const after = await Promise.all([
+      db.selectFrom("maintenance_locks").select(({ fn }) => fn.countAll<number>().as("count")).executeTakeFirstOrThrow(),
+      db.selectFrom("inventory_claims").select(({ fn }) => fn.countAll<number>().as("count")).executeTakeFirstOrThrow()
+    ]);
+    expect(storedPreview).toEqual({ status: "EXPIRED", used_at: null });
+    expect(after.map((row) => Number(row.count))).toEqual(before.map((row) => Number(row.count)));
   });
 
   it("allows READ queries but rejects writes through the same domain API", async () => {
@@ -272,7 +426,9 @@ describe("HTTP security contract", () => {
     const flow = await executeCommand(demo.writeToken, "CREATE_ORDER", {
       propertyId: demo.propertyId,
       quoteId: quote.json().quote.quoteId,
-      primaryGuest: { fullName: "Security Recovery Guest" }
+      primaryGuest: { fullName: "Security Recovery Guest" },
+      bookingChannelCode: "WECOM",
+      channelOrderReference: null
     }, "recovery-order");
     const firstReceipt = flow.confirmation.body;
     const replay = await app.inject({
@@ -554,7 +710,9 @@ describe("HTTP security contract", () => {
       const created = await executeCommand(options.token, "CREATE_ORDER", {
         propertyId: options.propertyId,
         quoteId: quote.json().quote.quoteId,
-        primaryGuest: { fullName: `Cross-property probe ${options.propertyId}` }
+        primaryGuest: { fullName: `Cross-property probe ${options.propertyId}` },
+        bookingChannelCode: "YOUMUDAO",
+        channelOrderReference: `TEST-SECURITY-ORDER-${options.prefix}`
       }, options.prefix);
       return created.confirmation.body.result?.orderId as string;
     };
@@ -585,6 +743,7 @@ describe("HTTP security contract", () => {
       orderId: propertyBOrderId,
       amountMinor: 5_000,
       method: "CASH",
+      transactionReference: "TEST-SECURITY-TXN-PROPERTY-B",
       note: "Foreign-property collection reference probe"
     }, "cross-fact-property-b-collection");
     const propertyBFactId = propertyBCollection.confirmation.body.factRefs?.[0];
@@ -594,6 +753,7 @@ describe("HTTP security contract", () => {
       orderId: propertyAOtherOrderId,
       amountMinor: 4_000,
       method: "CASH",
+      transactionReference: "TEST-SECURITY-TXN-PROPERTY-A-OTHER",
       note: "Same-property cross-order reference probe"
     }, "cross-fact-property-a-other-collection");
     const propertyAOtherFactId = propertyAOtherCollection.confirmation.body.factRefs?.[0];
@@ -607,9 +767,9 @@ describe("HTTP security contract", () => {
     for (const probe of [
       {
         commandType: "RECORD_REFUND" as const,
-        foreignInput: { amountMinor: 100, method: "CASH", referencesFactId: propertyBFactId },
-        missingInput: { amountMinor: 100, method: "CASH", referencesFactId: "fact_security_missing_refund_probe" },
-        samePropertyInput: { amountMinor: 100, method: "CASH", referencesFactId: propertyAOtherFactId },
+        foreignInput: { amountMinor: 100, method: "CASH", transactionReference: "TEST-SECURITY-TXN-FOREIGN-REFUND", referencesFactId: propertyBFactId },
+        missingInput: { amountMinor: 100, method: "CASH", transactionReference: "TEST-SECURITY-TXN-MISSING-REFUND", referencesFactId: "fact_security_missing_refund_probe" },
+        samePropertyInput: { amountMinor: 100, method: "CASH", transactionReference: "TEST-SECURITY-TXN-CROSS-ORDER-REFUND", referencesFactId: propertyAOtherFactId },
         message: "Referenced collection fact not found"
       },
       {
@@ -947,7 +1107,9 @@ describe("HTTP security contract", () => {
     const created = await executeCommand(demo.writeToken, "CREATE_ORDER", {
       propertyId: demo.propertyId,
       quoteId: quote.json().quote.quoteId,
-      primaryGuest: { fullName: "Timeline Contract Guest" }
+      primaryGuest: { fullName: "Timeline Contract Guest" },
+      bookingChannelCode: "CTRIP",
+      channelOrderReference: "TEST-SECURITY-ORDER-TIMELINE"
     }, "timeline-order");
     const orderId = created.confirmation.body.result?.orderId as string;
     const previews = await Promise.all([
@@ -970,7 +1132,7 @@ describe("HTTP security contract", () => {
       previewCommand(demo.writeToken, "REPRICE_ORDER", {
         propertyId: demo.propertyId,
         orderId,
-        manualAdjustmentMinor: 100
+        targetCurrentContractAmountMinor: 48_100
       }, "timeline-reprice")
     ]);
     for (const candidate of previews) {
@@ -1002,7 +1164,9 @@ describe("HTTP security contract", () => {
     const created = await executeCommand(demo.writeToken, "CREATE_ORDER", {
       propertyId: demo.propertyId,
       quoteId: quote.json().quote.quoteId,
-      primaryGuest: { fullName: "Internal Error Contract Guest" }
+      primaryGuest: { fullName: "Internal Error Contract Guest" },
+      bookingChannelCode: "MEITUAN",
+      channelOrderReference: "TEST-SECURITY-ORDER-INTERNAL-ERROR"
     }, "internal-error-order");
     const orderId = created.confirmation.body.result?.orderId as string;
     await db.updateTable("inventory_claims").set({ active: false, released_at: new Date() })

@@ -1,10 +1,20 @@
 import { sql } from "kysely";
 import { DomainError, type CommandType, type CoverageItemDto, type InventoryUnitKind, type StayType } from "@qintopia/contracts";
-import { calculatePricing, enumerateServiceDates, parseLocalDate, stableHash, type PricingResult } from "@qintopia/domain";
+import {
+  calculatePricing,
+  calculateDurationTimelinePricing,
+  enumerateServiceDates,
+  parseLocalDate,
+  requireTransactionReference,
+  stableHash,
+  validateBookingChannel,
+  type PricingResult
+} from "@qintopia/domain";
 import { adjustedEntitlementAvailableBalance, entitlementAvailableBalance, parsePostgresBigInt } from "../entitlement-balance.ts";
 import { activeCoverageCandidates, loadActiveStayTimeline, loadOrderContext, orderAmountSummary, type StayTimelineItem } from "../orders.ts";
 import { allocateCoverageCandidates, loadPricingPolicy, loadStoredQuote } from "../pricing-service.ts";
 import { inventoryFingerprint, loadInventoryUnit, type DbExecutor } from "../inventory.ts";
+import { propertyLocalToday } from "../members.ts";
 
 export interface BuiltCommandEffect {
   propertyId: string;
@@ -30,6 +40,17 @@ export function optionalString(input: Record<string, unknown>, field: string): s
   if (typeof value !== "string") throw new DomainError("VALIDATION_ERROR", `${field} must be a string`);
   return value.trim();
 }
+
+export function normalizeIdentityCardNumber(value: unknown): string {
+  if (typeof value !== "string" || value.trim() === "") throw new DomainError("VALIDATION_ERROR", "identityCardNumber is required");
+  return value.trim().toUpperCase();
+}
+
+const memberApplicationSource = {
+  provider: "FEISHU_BASE" as const,
+  sourceContainerId: "wiki:FtxUwOE6diwS8wkmaawcDhEPnMc",
+  sourceTableId: "tbl4OryeWd0Td8jN"
+};
 
 const strictDateTime = /^(\d{4}-\d{2}-\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/;
 const sha256Hex = /^[a-f0-9]{64}$/;
@@ -73,9 +94,10 @@ export function requireInteger(input: Record<string, unknown>, field: string, op
   return number;
 }
 
-function optionalInteger(input: Record<string, unknown>, field: string): number {
-  if (input[field] === undefined) return 0;
-  return requireInteger(input, field);
+function requireNonNegativeWholeYuanMinor(input: Record<string, unknown>, field: string): number {
+  const value = requireInteger(input, field, { min: 0 });
+  if (value % 100 !== 0) throw new DomainError("VALIDATION_ERROR", `${field} must be a non-negative whole-yuan CNY amount`);
+  return value;
 }
 
 function assertOrderMutable(status: string): void {
@@ -126,10 +148,12 @@ async function priceSingleUnit(db: DbExecutor, options: {
     propertyId: options.propertyId,
     inventoryUnitId: unit.id,
     inventoryUnitKind: unit.kind,
+    inventoryProductCode: unit.pricingProductCode,
     arrivalDate: options.arrivalDate,
     departureDate: options.departureDate,
     stayType: options.stayType,
     policy,
+    memberCoverage: Boolean(options.memberContractId),
     coverageCandidates: candidates,
     manualAdjustmentMinor: options.manualAdjustmentMinor
   });
@@ -190,16 +214,39 @@ async function priceStayTimeline(db: DbExecutor, options: {
     ...(options.memberContractId ? { memberContractId: options.memberContractId } : {})
   });
   const policy = await loadPricingPolicy(db, options.propertyId, options.policyVersionId);
+  if (policy.calculationKind === "DURATION_BAND_TOTAL") {
+    return calculateDurationTimelinePricing({
+      propertyId: options.propertyId,
+      arrivalDate: options.arrivalDate,
+      departureDate: options.departureDate,
+      stayType: options.stayType,
+      policy,
+      memberCoverage: Boolean(options.memberContractId),
+      timeline: options.timeline.map((item) => {
+        const unit = units.get(item.inventoryUnitId)!;
+        return {
+          serviceDate: item.serviceDate,
+          inventoryUnitId: unit.id,
+          inventoryUnitKind: unit.kind,
+          inventoryProductCode: unit.pricingProductCode
+        };
+      }),
+      coverageCandidates: candidates,
+      manualAdjustmentMinor: options.manualAdjustmentMinor
+    });
+  }
   const pieces = timelineRuns(options.timeline).map((run) => {
     const unit = units.get(run.inventoryUnitId)!;
     return calculatePricing({
       propertyId: options.propertyId,
       inventoryUnitId: unit.id,
       inventoryUnitKind: unit.kind,
+      inventoryProductCode: unit.pricingProductCode,
       arrivalDate: run.arrivalDate,
       departureDate: run.departureDate,
       stayType: options.stayType,
       policy,
+      memberCoverage: Boolean(options.memberContractId),
       coverageCandidates: candidates.filter((candidate) => candidate.serviceDate >= run.arrivalDate && candidate.serviceDate < run.departureDate),
       manualAdjustmentMinor: 0
     });
@@ -238,6 +285,113 @@ export async function buildCommandEffect(db: DbExecutor, commandType: CommandTyp
   const input = requireObject(rawInput);
   const propertyId = requireString(input, "propertyId");
 
+  if (commandType === "CREATE_MEMBER") {
+    const submittedProfile = {
+      fullName: requireString(input, "fullName"),
+      identityCardNumber: normalizeIdentityCardNumber(input.identityCardNumber),
+      phone: requireString(input, "phone"),
+      wechat: requireString(input, "wechat")
+    };
+    const requestedContractId = optionalString(input, "memberContractId");
+    const sourceApplicationRecordId = optionalString(input, "sourceApplicationRecordId");
+    const existingMember = await db.selectFrom("members").selectAll()
+      .where("identity_card_number", "=", submittedProfile.identityCardNumber).executeTakeFirst();
+    const member = existingMember ? {
+      fullName: existingMember.full_name,
+      identityCardNumber: existingMember.identity_card_number,
+      phone: existingMember.phone,
+      wechat: existingMember.wechat
+    } : submittedProfile;
+    const profileMatch = !existingMember || (
+      existingMember.full_name === submittedProfile.fullName
+      && existingMember.phone === submittedProfile.phone
+      && existingMember.wechat === submittedProfile.wechat
+    );
+
+    let memberContractId: string | null = null;
+    let contractValidFrom: string | null = null;
+    let contractValidUntil: string | null = null;
+    let contractOperation: "CREATE_INITIAL_EMPTY_CONTRACT" | "USE_EXISTING_CONTRACT" | "NO_CONTRACT_SELECTED" = "NO_CONTRACT_SELECTED";
+    if (existingMember) {
+      const activeContracts = await db.selectFrom("member_contracts").selectAll()
+        .where("member_id", "=", existingMember.id)
+        .where("property_id", "=", propertyId)
+        .where("status", "=", "ACTIVE")
+        .orderBy("created_at")
+        .orderBy("id")
+        .execute();
+      const selectedContract = requestedContractId
+        ? activeContracts.find((contract) => contract.id === requestedContractId)
+        : activeContracts.length === 1 ? activeContracts[0] : undefined;
+      if (requestedContractId && !selectedContract) throw new DomainError("NOT_FOUND", "Selected active member contract was not found", 404);
+      if (selectedContract) {
+        memberContractId = selectedContract.id;
+        contractValidFrom = selectedContract.valid_from;
+        contractValidUntil = selectedContract.valid_until;
+        contractOperation = "USE_EXISTING_CONTRACT";
+      }
+    } else if (requestedContractId) {
+      throw new DomainError("VALIDATION_ERROR", "memberContractId cannot be supplied when creating a new member");
+    } else {
+      const validFrom = requireString(input, "validFrom");
+      const validUntil = requireString(input, "validUntil");
+      parseLocalDate(validFrom);
+      parseLocalDate(validUntil);
+      if (validUntil < validFrom) throw new DomainError("VALIDATION_ERROR", "validUntil must not be before validFrom");
+      contractValidFrom = validFrom;
+      contractValidUntil = validUntil;
+      contractOperation = "CREATE_INITIAL_EMPTY_CONTRACT";
+    }
+
+    let externalReference: null | {
+      operation: "CREATE_LINK" | "USE_EXISTING_LINK";
+      id: string | null;
+      provider: "FEISHU_BASE";
+      sourceContainerId: string;
+      sourceTableId: string;
+      externalRecordId: string;
+    } = null;
+    let existingReferenceBasis: unknown = null;
+    if (sourceApplicationRecordId) {
+      const reference = await db.selectFrom("member_external_references").selectAll()
+        .where("provider", "=", memberApplicationSource.provider)
+        .where("source_container_id", "=", memberApplicationSource.sourceContainerId)
+        .where("source_table_id", "=", memberApplicationSource.sourceTableId)
+        .where("external_record_id", "=", sourceApplicationRecordId)
+        .executeTakeFirst();
+      if (reference && (!existingMember || reference.member_id !== existingMember.id || reference.property_id !== propertyId)) {
+        throw new DomainError("AGGREGATE_VERSION_CONFLICT", "The Feishu application record is already linked to another member or property", 409);
+      }
+      existingReferenceBasis = reference ?? null;
+      externalReference = {
+        operation: reference ? "USE_EXISTING_LINK" : "CREATE_LINK",
+        id: reference?.id ?? null,
+        ...memberApplicationSource,
+        externalRecordId: sourceApplicationRecordId
+      };
+    }
+
+    const operation = existingMember ? "MATCH_EXISTING_MEMBER" : "CREATE_MEMBER_WITH_INITIAL_CONTRACT";
+    return finalize(propertyId, {
+      operation,
+      memberId: existingMember?.id ?? null,
+      memberContractId,
+      member,
+      submittedProfile,
+      profileMatch,
+      contract: {
+        operation: contractOperation,
+        validFrom: contractValidFrom,
+        validUntil: contractValidUntil
+      },
+      externalReference
+    }, {
+      member: existingMember ?? null,
+      memberContractId,
+      externalReference: existingReferenceBasis
+    });
+  }
+
   if (commandType === "LOCK_MAINTENANCE") {
     const arrivalDate = requireString(input, "arrivalDate");
     const departureDate = requireString(input, "departureDate");
@@ -253,8 +407,16 @@ export async function buildCommandEffect(db: DbExecutor, commandType: CommandTyp
     const quoteId = requireString(input, "quoteId");
     const guest = requireObject(input.primaryGuest, "primaryGuest");
     requireString(guest, "fullName");
+    const { bookingChannelCode, channelOrderReference } = validateBookingChannel(
+      input.bookingChannelCode,
+      input.channelOrderReference
+    );
     const quote = await loadStoredQuote(db, quoteId);
     if (quote.propertyId !== propertyId) throw new DomainError("RESOURCE_SCOPE_DENIED", "Quote belongs to another property", 403);
+    const freeStayReason = quote.stayType === "FREE" ? requireString(input, "freeStayReason") : null;
+    if (quote.stayType !== "FREE" && input.freeStayReason !== undefined && input.freeStayReason !== null) {
+      throw new DomainError("VALIDATION_ERROR", "freeStayReason is only allowed for FREE stays");
+    }
     const unit = await loadInventoryUnit(db, propertyId, quote.inventoryUnitId);
     const fingerprint = await inventoryFingerprint(db, propertyId, unit.id, quote.arrivalDate, quote.departureDate);
     if (fingerprint.length > 0) throw new DomainError("INVENTORY_CONFLICT", "Quoted inventory is no longer available", 409);
@@ -271,6 +433,9 @@ export async function buildCommandEffect(db: DbExecutor, commandType: CommandTyp
     const effect = {
       quoteId,
       primaryGuest: guest,
+      bookingChannelCode,
+      channelOrderReference,
+      freeStayReason,
       inventoryUnit: unit,
       stayType: quote.stayType,
       arrivalDate: quote.arrivalDate,
@@ -301,17 +466,42 @@ export async function buildCommandEffect(db: DbExecutor, commandType: CommandTyp
     return finalize(propertyId, { maintenanceLockId, inventoryUnitId: lock.inventory_unit_id, arrivalDate: lock.arrival_date, departureDate: lock.departure_date }, { maintenanceVersion: lock.version, status: lock.status });
   }
 
+  if (commandType === "ADD_MEMBER_ENTITLEMENT_LOT") {
+    const contractId = requireString(input, "memberContractId");
+    const unitKind = requireString(input, "unitKind");
+    if (unitKind !== "ROOM_NIGHT" && unitKind !== "BED_NIGHT") throw new DomainError("VALIDATION_ERROR", "unitKind must be ROOM_NIGHT or BED_NIGHT");
+    const units = requireInteger(input, "units", { min: 1 });
+    const expiresOn = requireString(input, "expiresOn");
+    parseLocalDate(expiresOn);
+    const propertyToday = await propertyLocalToday(db, propertyId);
+    const contract = await db.selectFrom("member_contracts").selectAll()
+      .where("id", "=", contractId).where("property_id", "=", propertyId).executeTakeFirst();
+    if (!contract) throw new DomainError("NOT_FOUND", "Member contract not found", 404);
+    if (contract.status !== "ACTIVE") throw new DomainError("ENTITLEMENT_CONFLICT", "Member contract is not active", 409);
+    if (expiresOn < propertyToday) {
+      throw new DomainError("ENTITLEMENT_CONFLICT", "Entitlement lot is already naturally expired in the property timezone", 409, false, { expiresOn, propertyToday });
+    }
+    if (expiresOn < contract.valid_from || expiresOn > contract.valid_until) {
+      throw new DomainError("VALIDATION_ERROR", "Entitlement lot expiry must be inside the member contract validity interval");
+    }
+    return finalize(propertyId, { contractId, unitKind, units, expiresOn }, { contractVersion: contract.version, propertyToday });
+  }
+
   if (commandType === "ADJUST_MEMBER_ENTITLEMENT") {
     const lotId = requireString(input, "entitlementLotId");
     const quantityDelta = requireInteger(input, "quantityDelta", { allowZero: false });
     const adjustmentReason = requireString(input, "adjustmentReason");
+    const propertyToday = await propertyLocalToday(db, propertyId);
     const lot = await db.selectFrom("entitlement_lots").innerJoin("member_contracts", "member_contracts.id", "entitlement_lots.contract_id")
-      .select(["entitlement_lots.id", "entitlement_lots.version", "entitlement_lots.contract_id", "entitlement_lots.unit_kind", "entitlement_lots.total_units", "member_contracts.property_id", "member_contracts.version as contract_version"])
+      .select(["entitlement_lots.id", "entitlement_lots.version", "entitlement_lots.contract_id", "entitlement_lots.unit_kind", "entitlement_lots.total_units", "entitlement_lots.expires_on", "member_contracts.property_id", "member_contracts.version as contract_version"])
       .where("entitlement_lots.id", "=", lotId).where("member_contracts.property_id", "=", propertyId).executeTakeFirst();
     if (!lot) throw new DomainError("NOT_FOUND", "Entitlement lot not found", 404);
     const expiration = await db.selectFrom("entitlement_ledger").select("fact_id")
       .where("lot_id", "=", lotId).where("entry_type", "=", "EXPIRE").executeTakeFirst();
     if (expiration) throw new DomainError("ENTITLEMENT_CONFLICT", "An expired entitlement lot cannot be adjusted", 409, false, { expirationFactId: expiration.fact_id });
+    if (lot.expires_on < propertyToday) {
+      throw new DomainError("ENTITLEMENT_CONFLICT", "A naturally expired entitlement lot cannot be adjusted", 409, false, { expiresOn: lot.expires_on, propertyToday });
+    }
     const ledger = await db.selectFrom("entitlement_ledger")
       .select(sql<string>`cast(coalesce(sum(quantity_delta), 0) as text)`.as("delta"))
       .where("lot_id", "=", lotId)
@@ -329,7 +519,8 @@ export async function buildCommandEffect(db: DbExecutor, commandType: CommandTyp
     }, {
       lotVersion: lot.version,
       contractVersion: lot.contract_version,
-      availableBefore
+      availableBefore,
+      propertyToday
     });
   }
 
@@ -337,6 +528,7 @@ export async function buildCommandEffect(db: DbExecutor, commandType: CommandTyp
     const lotId = requireString(input, "entitlementLotId");
     const asOfDate = requireString(input, "asOfDate");
     const asOf = parseLocalDate(asOfDate);
+    const propertyToday = await propertyLocalToday(db, propertyId);
     const lot = await db.selectFrom("entitlement_lots")
       .innerJoin("member_contracts", "member_contracts.id", "entitlement_lots.contract_id")
       .leftJoin("entitlement_ledger", "entitlement_ledger.lot_id", "entitlement_lots.id")
@@ -372,6 +564,9 @@ export async function buildCommandEffect(db: DbExecutor, commandType: CommandTyp
     if (asOf.getTime() <= parseLocalDate(lot.expires_on).getTime()) {
       throw new DomainError("ENTITLEMENT_CONFLICT", "Entitlement lot is still valid on asOfDate", 409, false, { expiresOn: lot.expires_on, asOfDate });
     }
+    if (asOfDate > propertyToday) {
+      throw new DomainError("ENTITLEMENT_CONFLICT", "Entitlement lot cannot be expired using a future property date", 409, false, { asOfDate, propertyToday });
+    }
     const remainingAvailable = entitlementAvailableBalance(lot.total_units, lot.ledger_delta);
     return finalize(propertyId, {
       entitlementLotId: lot.id,
@@ -385,7 +580,8 @@ export async function buildCommandEffect(db: DbExecutor, commandType: CommandTyp
     }, {
       lotVersion: lot.version,
       contractVersion: lot.contract_version,
-      remainingAvailable
+      remainingAvailable,
+      propertyToday
     });
   }
 
@@ -453,7 +649,7 @@ export async function buildCommandEffect(db: DbExecutor, commandType: CommandTyp
       propertyId, orderId, memberContractId: context.order.member_contract_id,
       arrivalDate: context.order.arrival_date, departureDate: newDepartureDate,
       stayType: context.order.stay_type as StayType, policyVersionId: context.order.pricing_policy_version_id,
-      timeline: stayTimeline, manualAdjustmentMinor: optionalInteger(input, "manualAdjustmentMinor")
+      timeline: stayTimeline, manualAdjustmentMinor: 0
     });
     return finalize(propertyId, {
       orderId, inventoryUnitId: stayTimeline.at(-1)!.inventoryUnitId,
@@ -478,7 +674,7 @@ export async function buildCommandEffect(db: DbExecutor, commandType: CommandTyp
       propertyId, orderId, memberContractId: context.order.member_contract_id,
       arrivalDate: context.order.arrival_date, departureDate: newDepartureDate,
       stayType: context.order.stay_type as StayType, policyVersionId: context.order.pricing_policy_version_id,
-      timeline: stayTimeline, manualAdjustmentMinor: optionalInteger(input, "manualAdjustmentMinor")
+      timeline: stayTimeline, manualAdjustmentMinor: 0
     });
     return finalize(propertyId, {
       orderId, inventoryUnitId: extensionUnitId,
@@ -506,38 +702,67 @@ export async function buildCommandEffect(db: DbExecutor, commandType: CommandTyp
       propertyId, orderId, memberContractId: context.order.member_contract_id,
       arrivalDate: context.order.arrival_date, departureDate: context.order.departure_date,
       stayType: context.order.stay_type as StayType, policyVersionId: context.order.pricing_policy_version_id,
-      timeline: stayTimeline, manualAdjustmentMinor: optionalInteger(input, "manualAdjustmentMinor")
+      timeline: stayTimeline, manualAdjustmentMinor: 0
     });
     return finalize(propertyId, { orderId, fromInventoryUnit: currentUnit, toInventoryUnit: newUnit, effectiveDate, stayTimeline, pricing }, { ...baseBasis, stayTimeline: currentTimeline, inventory: fingerprint });
   }
 
   if (commandType === "REPRICE_ORDER") {
     assertOrderMutable(context.order.status);
-    const manualAdjustmentMinor = requireInteger(input, "manualAdjustmentMinor");
+    const targetCurrentContractAmountMinor = requireNonNegativeWholeYuanMinor(input, "targetCurrentContractAmountMinor");
+    if (context.order.stay_type === "FREE" && targetCurrentContractAmountMinor !== 0) {
+      throw new DomainError("VALIDATION_ERROR", "Free stays must keep a zero current contract amount");
+    }
+    const stayTimeline = await loadActiveStayTimeline(db, context);
+    const policyPricing = await priceStayTimeline(db, {
+      propertyId, orderId, memberContractId: context.order.member_contract_id,
+      arrivalDate: context.order.arrival_date, departureDate: context.order.departure_date,
+      stayType: context.order.stay_type as StayType, policyVersionId: context.order.pricing_policy_version_id,
+      timeline: stayTimeline, manualAdjustmentMinor: 0
+    });
+    const manualAdjustmentMinor = targetCurrentContractAmountMinor - policyPricing.currentContractAmount.minorUnits;
+    const pricing: PricingResult = {
+      ...policyPricing,
+      currentContractAmount: { currency: policyPricing.currentContractAmount.currency, minorUnits: targetCurrentContractAmountMinor }
+    };
+    return finalize(propertyId, {
+      orderId, inventoryUnitId: stayTimeline.at(-1)!.inventoryUnitId, stayTimeline,
+      before: { currentContractAmount: (await orderAmountSummary(db, context)).currentContractAmount },
+      policyBaseAmount: policyPricing.currentContractAmount,
+      targetCurrentContractAmount: pricing.currentContractAmount,
+      pricing, manualAdjustmentMinor
+    }, { ...baseBasis, stayTimeline });
+  }
+
+  if (commandType === "REFRESH_MEMBER_COVERAGE") {
+    assertOrderMutable(context.order.status);
+    if (!context.order.member_contract_id) throw new DomainError("ENTITLEMENT_CONFLICT", "Order has no member contract to refresh", 409);
     const stayTimeline = await loadActiveStayTimeline(db, context);
     const pricing = await priceStayTimeline(db, {
       propertyId, orderId, memberContractId: context.order.member_contract_id,
       arrivalDate: context.order.arrival_date, departureDate: context.order.departure_date,
       stayType: context.order.stay_type as StayType, policyVersionId: context.order.pricing_policy_version_id,
-      timeline: stayTimeline, manualAdjustmentMinor
+      timeline: stayTimeline, manualAdjustmentMinor: 0
     });
     return finalize(propertyId, {
       orderId, inventoryUnitId: stayTimeline.at(-1)!.inventoryUnitId, stayTimeline,
       before: { currentContractAmount: (await orderAmountSummary(db, context)).currentContractAmount },
-      pricing, manualAdjustmentMinor
+      pricing
     }, { ...baseBasis, stayTimeline });
   }
 
   if (commandType === "RECORD_COLLECTION") {
     const amountMinor = requireInteger(input, "amountMinor", { min: 1 });
     const method = requireString(input, "method");
+    const transactionReference = requireTransactionReference(input.transactionReference);
     if (!["RESERVED", "CHECKED_IN", "CHECKED_OUT"].includes(context.order.status)) throw new DomainError("INVALID_ORDER_STATE", "Cannot record a collection for this order", 409);
-    return finalize(propertyId, { orderId, amountMinor, currency: context.revision.currency, method, note: optionalString(input, "note") ?? "" }, baseBasis);
+    return finalize(propertyId, { orderId, amountMinor, currency: context.revision.currency, method, transactionReference, note: optionalString(input, "note") ?? "" }, baseBasis);
   }
 
   if (commandType === "RECORD_REFUND") {
     const amountMinor = requireInteger(input, "amountMinor", { min: 1 });
     const referencesFactId = requireString(input, "referencesFactId");
+    const transactionReference = requireTransactionReference(input.transactionReference);
     const original = await db.selectFrom("collection_facts")
       .innerJoin("orders", "orders.id", "collection_facts.order_id")
       .selectAll("collection_facts")
@@ -551,7 +776,7 @@ export async function buildCommandEffect(db: DbExecutor, commandType: CommandTyp
     if (originalReversal) throw new DomainError("FACT_ALREADY_REVERSED", "Cannot refund a reversed collection", 409, false, { reversalFactId: originalReversal.fact_id });
     const activeRefunded = await activeRefundedAmount(db, referencesFactId);
     if (activeRefunded + amountMinor > original.amount_minor) throw new DomainError("REFUND_LIMIT_EXCEEDED", "Refund exceeds the remaining referenced collection", 409);
-    return finalize(propertyId, { orderId, amountMinor, currency: original.currency, referencesFactId, method: requireString(input, "method"), note: optionalString(input, "note") ?? "" }, { ...baseBasis, originalFact: original, activeRefunded });
+    return finalize(propertyId, { orderId, amountMinor, currency: original.currency, referencesFactId, method: requireString(input, "method"), transactionReference, note: optionalString(input, "note") ?? "" }, { ...baseBasis, originalFact: original, activeRefunded });
   }
 
   if (commandType === "REVERSE_FACT") {
@@ -576,17 +801,38 @@ export async function buildCommandEffect(db: DbExecutor, commandType: CommandTyp
 
   if (commandType === "CHECK_IN") {
     if (context.order.status !== "RESERVED") throw new DomainError("INVALID_ORDER_STATE", "Only a reserved order can check in", 409);
-    return finalize(propertyId, { orderId, fromStatus: context.order.status, toStatus: "CHECKED_IN", inventoryUnitId: context.currentSegment.inventoryUnitId }, baseBasis);
+    const heldCoverage = await db.selectFrom("coverage_items").select("id")
+      .where("order_id", "=", orderId).where("status", "=", "HELD").orderBy("id").execute();
+    return finalize(propertyId, {
+      orderId,
+      fromStatus: context.order.status,
+      toStatus: "CHECKED_IN",
+      inventoryUnitId: context.currentSegment.inventoryUnitId,
+      entitlementTransition: { from: "HELD", to: "CONSUMED", coverageCount: heldCoverage.length }
+    }, { ...baseBasis, heldCoverageIds: heldCoverage.map((coverage) => coverage.id) });
   }
 
   if (commandType === "CHECK_OUT") {
     if (context.order.status !== "CHECKED_IN") throw new DomainError("INVALID_ORDER_STATE", "Only an in-house order can check out", 409);
-    return finalize(propertyId, { orderId, fromStatus: context.order.status, toStatus: "CHECKED_OUT", inventoryUnitId: context.currentSegment.inventoryUnitId, amounts: await orderAmountSummary(db, context) }, baseBasis);
+    const heldCoverage = await db.selectFrom("coverage_items").select("id")
+      .where("order_id", "=", orderId).where("status", "=", "HELD").orderBy("id").execute();
+    if (heldCoverage.length > 0) throw new DomainError("ENTITLEMENT_CONFLICT", "In-house member coverage must be consumed before check-out", 409);
+    return finalize(propertyId, { orderId, fromStatus: context.order.status, toStatus: "CHECKED_OUT", inventoryUnitId: context.currentSegment.inventoryUnitId, amounts: await orderAmountSummary(db, context) }, { ...baseBasis, heldCoverageIds: [] });
   }
 
   if (commandType === "CANCEL_ORDER" || commandType === "MARK_NO_SHOW") {
     if (context.order.status !== "RESERVED") throw new DomainError("INVALID_ORDER_STATE", `${commandType} requires a reserved order`, 409);
-    return finalize(propertyId, { orderId, fromStatus: context.order.status, toStatus: commandType === "CANCEL_ORDER" ? "CANCELLED" : "NO_SHOW", inventoryUnitId: context.currentSegment.inventoryUnitId }, baseBasis);
+    const heldCoverage = await db.selectFrom("coverage_items").select("id")
+      .where("order_id", "=", orderId).where("status", "=", "HELD").orderBy("id").execute();
+    return finalize(propertyId, {
+      orderId,
+      fromStatus: context.order.status,
+      toStatus: commandType === "CANCEL_ORDER" ? "CANCELLED" : "NO_SHOW",
+      inventoryUnitId: context.currentSegment.inventoryUnitId,
+      freeStayReason: context.order.free_stay_reason,
+      currentContractAmount: { currency: context.revision.currency, minorUnits: context.revision.currentContractAmountMinor },
+      entitlementTransition: { from: "HELD", to: "RELEASED", coverageCount: heldCoverage.length }
+    }, { ...baseBasis, heldCoverageIds: heldCoverage.map((coverage) => coverage.id) });
   }
 
   throw new DomainError("VALIDATION_ERROR", `Unsupported command type: ${commandType}`);
@@ -604,4 +850,22 @@ export function inventoryKindFromEffect(effect: Record<string, unknown>): Invent
   if (!unit || typeof unit !== "object") return undefined;
   const kind = (unit as Record<string, unknown>).kind;
   return kind === "ROOM" || kind === "BED" ? kind : undefined;
+}
+
+export function projectCommandEffectForRead(commandType: string, effect: Record<string, unknown>): Record<string, unknown> {
+  if (commandType === "CREATE_ORDER") {
+    return {
+      ...effect,
+      bookingChannelCode: Object.hasOwn(effect, "bookingChannelCode") ? effect.bookingChannelCode : null,
+      channelOrderReference: Object.hasOwn(effect, "channelOrderReference") ? effect.channelOrderReference : null,
+      freeStayReason: Object.hasOwn(effect, "freeStayReason") ? effect.freeStayReason : null
+    };
+  }
+  if (commandType === "RECORD_COLLECTION" || commandType === "RECORD_REFUND") {
+    return {
+      ...effect,
+      transactionReference: Object.hasOwn(effect, "transactionReference") ? effect.transactionReference : null
+    };
+  }
+  return effect;
 }

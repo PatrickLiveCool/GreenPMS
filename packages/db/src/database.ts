@@ -25,7 +25,12 @@ export async function databaseReady(db: Kysely<Database>): Promise<boolean> {
       && applied.has("003_active_coverage_uniqueness.sql")
       && applied.has("004_security_identity_guards.sql")
       && applied.has("005_core_identity_and_entitlement_guards.sql")
-      && applied.has("006_property_scoped_idempotency.sql");
+      && applied.has("006_property_scoped_idempotency.sql")
+      && applied.has("007_reference_catalog.sql")
+      && applied.has("008_reference_catalog_sealing.sql")
+      && applied.has("009_booking_channels_and_transaction_references.sql")
+      && applied.has("010_qintopia_2026_catalog_pricing_and_free_stays.sql")
+      && applied.has("011_core_fact_shape_guards.sql");
   } catch {
     return false;
   }

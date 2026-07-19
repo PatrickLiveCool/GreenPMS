@@ -1,42 +1,43 @@
 import { describe, expect, it } from "vitest";
-import type { EntitlementLedgerDto, EntitlementLotDto } from "../types";
-import { availableUnits } from "./MembersPage";
-
-const lot: EntitlementLotDto = {
-  id: "lot_room_member_test",
-  contract_id: "member_contract_test",
-  unit_kind: "ROOM_NIGHT",
-  total_units: 5,
-  expires_on: "2027-12-31",
-  version: 1,
-  created_at: "2026-01-01T00:00:00.000Z"
-};
-
-function ledgerEntry(factId: string, quantityDelta: number, entryType: EntitlementLedgerDto["entry_type"], lotId = lot.id): EntitlementLedgerDto {
-  return {
-    fact_id: factId,
-    lot_id: lotId,
-    entry_type: entryType,
-    quantity_delta: quantityDelta,
-    service_date: null,
-    order_id: null,
-    coverage_id: null,
-    reason: "test",
-    command_id: null,
-    created_at: "2026-01-01T00:00:00.000Z"
-  };
-}
+import type { EntitlementLotDto, MemberViewDto } from "../types";
+import { entitlementLotUiState, serverAvailableUnits } from "./MembersPage";
 
 describe("member entitlement availability", () => {
-  it("adds only the selected lot ledger deltas to its initial units", () => {
-    const ledger = [
-      ledgerEntry("fact_hold", -1, "HOLD"),
-      ledgerEntry("fact_release", 1, "RELEASE"),
-      ledgerEntry("fact_adjust", 3, "ADJUST"),
-      ledgerEntry("fact_consume", 0, "CONSUME"),
-      ledgerEntry("fact_other_lot", -50, "HOLD", "lot_bed_other")
-    ];
+  it("uses the server-derived lot balance instead of recalculating ledger facts in Web", () => {
+    const member = {
+      lotBalances: [
+        { lotId: "lot_room_member_test", unitKind: "ROOM_NIGHT", availableUnits: 8 },
+        { lotId: "lot_bed_member_test", unitKind: "BED_NIGHT", availableUnits: 3 }
+      ]
+    } as MemberViewDto;
 
-    expect(availableUnits(lot, ledger)).toBe(8);
+    expect(serverAvailableUnits(member, "lot_room_member_test")).toBe(8);
+    expect(serverAvailableUnits(member, "lot_missing")).toBe(0);
+  });
+
+  it("uses the property balance date for natural expiry and never offers premature expiry", () => {
+    const member = {
+      balanceAsOfDate: "2026-07-19"
+    } as MemberViewDto;
+    const expiredYesterday = { id: "lot_expired", expires_on: "2026-07-18" } as EntitlementLotDto;
+    const validToday = { id: "lot_valid_today", expires_on: "2026-07-19" } as EntitlementLotDto;
+    const validFuture = { id: "lot_valid_future", expires_on: "2026-07-20" } as EntitlementLotDto;
+
+    expect(entitlementLotUiState(member, expiredYesterday, false)).toEqual({
+      expired: true,
+      canAdjust: false,
+      canRecordExpiration: true
+    });
+    expect(entitlementLotUiState(member, validToday, false)).toEqual({
+      expired: false,
+      canAdjust: true,
+      canRecordExpiration: false
+    });
+    expect(entitlementLotUiState(member, validFuture, false).canRecordExpiration).toBe(false);
+    expect(entitlementLotUiState(member, expiredYesterday, true)).toEqual({
+      expired: true,
+      canAdjust: false,
+      canRecordExpiration: false
+    });
   });
 });

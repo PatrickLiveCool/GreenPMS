@@ -22,9 +22,13 @@ import {
   executeQuoteCommand,
   findCommandResult,
   getCommand,
+  getMemberView,
   getOrderView,
   getReceipt,
   listAvailability,
+  listMemberSummaries,
+  loadReferenceCatalog,
+  projectCommandEffectForRead,
   confirmCommandPreview,
   type ConfirmRequest,
   type Database
@@ -47,6 +51,8 @@ import {
   MaintenanceLocksResponseSchema,
   MeResponseSchema,
   MemberResponseSchema,
+  MembersListResponseSchema,
+  MembersQuerySchema,
   MetaResponseSchema,
   OrderDetailResponseSchema,
   OrderStatusSchema,
@@ -55,6 +61,7 @@ import {
   PreviewSchema,
   QuoteRequestSchema,
   QuoteCommandResponseSchema,
+  ReferenceCatalogResponseSchema,
   ReceiptSchema,
   RecoverableCommandTypeSchema,
   StoredPreviewResponseSchema,
@@ -123,7 +130,7 @@ export async function buildServer(db: Kysely<Database>) {
     if (["POST", "PUT", "PATCH", "DELETE"].includes(request.method) && request.cookies.qintopia_session) {
       const origin = request.headers.origin;
       const allowed = process.env.WEB_ORIGIN ?? "http://127.0.0.1:4173";
-      if (origin && origin !== allowed && origin !== "http://127.0.0.1:4100" && origin !== "http://localhost:4100") {
+      if (origin && origin !== allowed) {
         throw new DomainError("RESOURCE_SCOPE_DENIED", "Cross-origin session write is not allowed", 403);
       }
     }
@@ -182,13 +189,20 @@ export async function buildServer(db: Kysely<Database>) {
   app.get("/api/v1/meta", { schema: { tags: ["queries"], response: { 200: MetaResponseSchema, 401: ErrorResponse, 403: ErrorResponse, 429: ErrorResponse, ...InternalErrorResponses } } }, async (request) => {
     const principal = await requirePrincipal(db, request);
     const propertyIds = [...principal.propertyAccess.keys()];
-    const [properties, units, policies, members] = await Promise.all([
+    const [properties, units, policies, members, memberContracts] = await Promise.all([
       propertyIds.length ? db.selectFrom("properties").selectAll().where("id", "in", propertyIds).orderBy("code").execute() : [],
       propertyIds.length ? db.selectFrom("inventory_units").selectAll().where("property_id", "in", propertyIds).where("active", "=", true).orderBy("code").execute() : [],
       propertyIds.length ? db.selectFrom("pricing_policy_versions").selectAll().where("property_id", "in", propertyIds).orderBy("code").execute() : [],
+      propertyIds.length ? db.selectFrom("members")
+        .innerJoin("member_contracts", "member_contracts.member_id", "members.id")
+        .selectAll("members")
+        .distinct()
+        .where("member_contracts.property_id", "in", propertyIds)
+        .orderBy("members.full_name")
+        .execute() : [],
       propertyIds.length ? db.selectFrom("member_contracts").selectAll().where("property_id", "in", propertyIds).orderBy("member_name").execute() : []
     ]);
-    return { properties, inventoryUnits: units, pricingPolicyVersions: policies, memberContracts: members };
+    return { properties, inventoryUnits: units, pricingPolicyVersions: policies, members, memberContracts };
   });
 
   app.get("/api/v1/properties/:id/availability", {
@@ -203,6 +217,29 @@ export async function buildServer(db: Kysely<Database>) {
     const principal = await requirePrincipal(db, request);
     requirePropertyAccess(principal, id, "READ");
     return { propertyId: id, units: await listAvailability(db, id, query.arrivalDate, query.departureDate, query.unitKind) };
+  });
+
+  app.get("/api/v1/properties/:id/reference-catalog", {
+    schema: {
+      tags: ["queries"],
+      params: IdParams,
+      response: {
+        200: ReferenceCatalogResponseSchema,
+        400: ErrorResponse,
+        401: ErrorResponse,
+        403: ErrorResponse,
+        404: ErrorResponse,
+        429: ErrorResponse,
+        ...InternalErrorResponses
+      }
+    }
+  }, async (request) => {
+    const { id } = request.params as { id: string };
+    const principal = await requirePrincipal(db, request);
+    requirePropertyAccess(principal, id, "READ");
+    const catalog = await loadReferenceCatalog(db, id);
+    if (!catalog) throw new DomainError("NOT_FOUND", "Reference catalog not found", 404);
+    return catalog;
   });
 
   app.post("/api/v1/quotes", {
@@ -243,16 +280,19 @@ export async function buildServer(db: Kysely<Database>) {
     return view;
   });
 
-  app.get("/api/v1/members/:id", { schema: { tags: ["queries"], params: IdParams, response: { 200: MemberResponseSchema, 400: ErrorResponse, 401: ErrorResponse, 403: ErrorResponse, 404: ErrorResponse, 429: ErrorResponse, ...InternalErrorResponses } } }, async (request) => {
-    const id = (request.params as { id: string }).id;
+  app.get("/api/v1/members", { schema: { tags: ["queries"], querystring: MembersQuerySchema, response: { 200: MembersListResponseSchema, 400: ErrorResponse, 401: ErrorResponse, 403: ErrorResponse, 429: ErrorResponse, ...InternalErrorResponses } } }, async (request) => {
+    const query = request.query as { propertyId: string; identityCardNumber?: string };
     const principal = await requirePrincipal(db, request);
-    const contract = await db.selectFrom("member_contracts").selectAll().where("id", "=", id).executeTakeFirst();
-    if (!contract) throw new DomainError("NOT_FOUND", "Member contract not found", 404);
-    requireScopedResourceAccess(principal, contract.property_id);
-    const lots = await db.selectFrom("entitlement_lots").selectAll().where("contract_id", "=", id).orderBy("expires_on").execute();
-    const lotIds = lots.map((lot) => lot.id);
-    const ledger = lotIds.length ? await db.selectFrom("entitlement_ledger").selectAll().where("lot_id", "in", lotIds).orderBy("created_at").execute() : [];
-    return { contract, lots, ledger };
+    requirePropertyAccess(principal, query.propertyId, "READ");
+    return { members: await listMemberSummaries(db, query.propertyId, query.identityCardNumber) };
+  });
+
+  app.get("/api/v1/members/:id", { schema: { tags: ["queries"], params: IdParams, querystring: Type.Object({ propertyId: Id }, { additionalProperties: false }), response: { 200: MemberResponseSchema, 400: ErrorResponse, 401: ErrorResponse, 403: ErrorResponse, 404: ErrorResponse, 429: ErrorResponse, ...InternalErrorResponses } } }, async (request) => {
+    const id = (request.params as { id: string }).id;
+    const propertyId = (request.query as { propertyId: string }).propertyId;
+    const principal = await requirePrincipal(db, request);
+    requirePropertyAccess(principal, propertyId, "READ");
+    return getMemberView(db, propertyId, id);
   });
 
   app.get("/api/v1/tokens", {
@@ -292,7 +332,7 @@ export async function buildServer(db: Kysely<Database>) {
     const factId = (request.params as { id: string }).id;
     const principal = await requirePrincipal(db, request);
     const collection = await db.selectFrom("collection_facts").innerJoin("orders", "orders.id", "collection_facts.order_id")
-      .select(["collection_facts.fact_id", "collection_facts.order_id", "collection_facts.fact_type", "collection_facts.amount_minor", "collection_facts.net_effect_minor", "collection_facts.currency", "collection_facts.references_fact_id", "collection_facts.reverses_fact_id", "collection_facts.method", "collection_facts.note", "collection_facts.created_at", "orders.property_id"])
+      .select(["collection_facts.fact_id", "collection_facts.order_id", "collection_facts.fact_type", "collection_facts.amount_minor", "collection_facts.net_effect_minor", "collection_facts.currency", "collection_facts.references_fact_id", "collection_facts.reverses_fact_id", "collection_facts.method", "collection_facts.note", "collection_facts.transaction_reference", "collection_facts.created_at", "orders.property_id"])
       .where("collection_facts.fact_id", "=", factId).executeTakeFirst();
     if (collection) {
       requireScopedResourceAccess(principal, collection.property_id);
@@ -327,7 +367,7 @@ export async function buildServer(db: Kysely<Database>) {
       .where("subject_id", "=", principal.subjectId).executeTakeFirst();
     if (!preview) throw new DomainError("PREVIEW_NOT_FOUND", "Preview not found", 404);
     requireScopedResourceAccess(principal, preview.property_id);
-    return preview;
+    return { ...preview, effect: projectCommandEffectForRead(preview.command_type, preview.effect as Record<string, unknown>) };
   });
 
   app.post("/api/v1/command-previews/:previewId/confirm", {

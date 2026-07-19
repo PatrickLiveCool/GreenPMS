@@ -16,4 +16,4 @@ WORKDIR /app
 ENV NODE_ENV=production
 COPY --from=build /app /app
 EXPOSE 4100
-CMD ["sh", "-c", "npm run db:migrate && if [ \"${SEED_DEMO_DATA:-false}\" = \"true\" ]; then npm run db:seed; fi && npm start"]
+CMD ["sh", "-c", "npm run db:migrate && if [ \"${SEED_DEMO_DATA:-false}\" = \"true\" ]; then npm run db:seed; fi && if [ \"${IMPORT_2026_REFERENCE_CATALOG:-false}\" = \"true\" ]; then npm run db:import:2026; fi && npm start"]

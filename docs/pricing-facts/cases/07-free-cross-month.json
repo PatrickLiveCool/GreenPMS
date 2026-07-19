@@ -1,0 +1,57 @@
+{
+  "caseId": "confirmed-free-cross-month-zero",
+  "anonymizedOrderRef": "OWNER-CONFIRMED-RULE-FREE-ZERO",
+  "businessExplanation": "A free stay is distinct from membership, stays at zero across month end, and creates no entitlement coverage.",
+  "businessPlan": "FREE",
+  "scenarioTags": ["BASELINE"],
+  "propertyTimeZone": "Asia/Shanghai",
+  "currency": "CNY",
+  "inventoryUnitKind": "ROOM",
+  "arrivalDate": "2026-03-30",
+  "departureDate": "2026-04-03",
+  "departureCharged": false,
+  "priceInputs": {
+    "policyVersionReference": "policy_free_v1",
+    "initialProductCode": "shared_bath_single_room",
+    "initialInventoryUnitReference": "ROOM-201"
+  },
+  "coverageSet": [],
+  "amendments": [],
+  "rounding": { "rule": "ZERO_FREE_STAY" },
+  "expected": {
+    "pricingRevisions": [{
+      "revisionNo": 1,
+      "amendmentType": "CREATE_ORDER",
+      "pricingPolicyVersionReference": "policy_free_v1",
+      "arrivalDate": "2026-03-30",
+      "departureDate": "2026-04-03",
+      "coverageSet": [],
+      "cashLines": [{
+        "lineKind": "NIGHT_SET",
+        "lines": [
+          { "serviceDate": "2026-03-30", "inventoryUnitReference": "ROOM-201", "amountMinor": 0 },
+          { "serviceDate": "2026-03-31", "inventoryUnitReference": "ROOM-201", "amountMinor": 0 },
+          { "serviceDate": "2026-04-01", "inventoryUnitReference": "ROOM-201", "amountMinor": 0 },
+          { "serviceDate": "2026-04-02", "inventoryUnitReference": "ROOM-201", "amountMinor": 0 }
+        ],
+        "totalMinor": 0
+      }],
+      "manualAdjustmentMinor": 0,
+      "cashRemainderMinor": 0,
+      "currentContractAmountMinor": 0,
+      "roundingEvidence": { "rule": "ZERO_FREE_STAY" }
+    }],
+    "cashLines": [{
+      "lineKind": "NIGHT_SET",
+      "lines": [
+        { "serviceDate": "2026-03-30", "inventoryUnitReference": "ROOM-201", "amountMinor": 0 },
+        { "serviceDate": "2026-03-31", "inventoryUnitReference": "ROOM-201", "amountMinor": 0 },
+        { "serviceDate": "2026-04-01", "inventoryUnitReference": "ROOM-201", "amountMinor": 0 },
+        { "serviceDate": "2026-04-02", "inventoryUnitReference": "ROOM-201", "amountMinor": 0 }
+      ],
+      "totalMinor": 0
+    }],
+    "cashRemainderMinor": 0,
+    "currentContractAmountMinor": 0
+  }
+}

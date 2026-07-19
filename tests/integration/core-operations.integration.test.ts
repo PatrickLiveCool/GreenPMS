@@ -50,7 +50,14 @@ async function createOrder(unitId: string, prefix: string, options: { member?: b
   const priced = await quote(unitId, options);
   return previewAndConfirm({
     commandType: "CREATE_ORDER",
-    input: { propertyId: demo.propertyId, quoteId: priced.quoteId, primaryGuest: { fullName: `Guest ${prefix}` } }
+    input: {
+      propertyId: demo.propertyId,
+      quoteId: priced.quoteId,
+      primaryGuest: { fullName: `Guest ${prefix}` },
+      bookingChannelCode: "YOUMUDAO",
+      channelOrderReference: `TEST-ORDER-${prefix}`,
+      ...(options.stayType === "FREE" ? { freeStayReason: `Automated FREE stay fixture: ${prefix}` } : {})
+    }
   }, prefix);
 }
 
@@ -84,7 +91,7 @@ describe("PostgreSQL core operations", () => {
     expect(priced.cashRemainder.minorUnits).toBe(12_000);
     const receipt = await previewAndConfirm({
       commandType: "CREATE_ORDER",
-      input: { propertyId: demo.propertyId, quoteId: priced.quoteId, primaryGuest: { fullName: "Member Guest" } }
+      input: { propertyId: demo.propertyId, quoteId: priced.quoteId, primaryGuest: { fullName: "Member Guest" }, bookingChannelCode: "CTRIP", channelOrderReference: "TEST-ORDER-MEMBER" }
     }, "member-order");
     expect(receipt.businessCommitted).toBe(true);
     const view = await getOrderView(db, receipt.result!.orderId as string);
@@ -108,8 +115,8 @@ describe("PostgreSQL core operations", () => {
       }
     }, "reprice-coverage-adjust");
     await previewAndConfirm({
-      commandType: "REPRICE_ORDER",
-      input: { propertyId: demo.propertyId, orderId, manualAdjustmentMinor: 1 }
+      commandType: "REFRESH_MEMBER_COVERAGE",
+      input: { propertyId: demo.propertyId, orderId }
     }, "reprice-coverage-first");
 
     let activeCoverage = (await getOrderView(db, orderId)).coverageSet.filter((item) => item.status === "HELD");
@@ -129,8 +136,8 @@ describe("PostgreSQL core operations", () => {
     expect(balance.total_units + Number(balance.ledger_delta)).toBe(0);
 
     await previewAndConfirm({
-      commandType: "REPRICE_ORDER",
-      input: { propertyId: demo.propertyId, orderId, manualAdjustmentMinor: 2 }
+      commandType: "REFRESH_MEMBER_COVERAGE",
+      input: { propertyId: demo.propertyId, orderId }
     }, "reprice-coverage-second");
     activeCoverage = (await getOrderView(db, orderId)).coverageSet.filter((item) => item.status === "HELD");
     expect(activeCoverage).toHaveLength(3);
@@ -196,7 +203,7 @@ describe("PostgreSQL core operations", () => {
     await db.updateTable("quotes").set({ member_contract_id: demo.memberContractId }).where("id", "=", forged.quoteId).execute();
     await expect(createCommandPreview(db, principal, {
       commandType: "CREATE_ORDER",
-      input: { propertyId: demo.propertyId, quoteId: forged.quoteId, primaryGuest: { fullName: "No entitlement debit" } }
+      input: { propertyId: demo.propertyId, quoteId: forged.quoteId, primaryGuest: { fullName: "No entitlement debit" }, bookingChannelCode: "MEITUAN", channelOrderReference: "TEST-ORDER-FORGED-FREE", freeStayReason: "Defensive FREE membership rejection fixture" }
     }, metadata("free-member-command-denied"))).rejects.toMatchObject({ code: "PRICING_POLICY_UNCONFIGURED" });
     expect(await db.selectFrom("orders").select("id").execute()).toHaveLength(0);
     expect(await db.selectFrom("entitlement_ledger").select("fact_id").execute()).toHaveLength(0);
@@ -240,8 +247,8 @@ describe("PostgreSQL core operations", () => {
     const roomQuote = await quote(demo.roomId, { stayType: "FREE" });
     const bedQuote = await quote(demo.bedAId, { stayType: "FREE" });
     const [roomPreview, bedPreview] = await Promise.all([
-      createCommandPreview(db, principal, { commandType: "CREATE_ORDER", input: { propertyId: demo.propertyId, quoteId: roomQuote.quoteId, primaryGuest: { fullName: "Room Guest" } } }, metadata("room-preview")),
-      createCommandPreview(db, principal, { commandType: "CREATE_ORDER", input: { propertyId: demo.propertyId, quoteId: bedQuote.quoteId, primaryGuest: { fullName: "Bed Guest" } } }, metadata("bed-preview"))
+      createCommandPreview(db, principal, { commandType: "CREATE_ORDER", input: { propertyId: demo.propertyId, quoteId: roomQuote.quoteId, primaryGuest: { fullName: "Room Guest" }, bookingChannelCode: "WECOM", channelOrderReference: null, freeStayReason: "Whole-room mutex fixture" } }, metadata("room-preview")),
+      createCommandPreview(db, principal, { commandType: "CREATE_ORDER", input: { propertyId: demo.propertyId, quoteId: bedQuote.quoteId, primaryGuest: { fullName: "Bed Guest" }, bookingChannelCode: "WECOM", channelOrderReference: null, freeStayReason: "Bed mutex fixture" } }, metadata("bed-preview"))
     ]);
     const [roomResult, bedResult] = await Promise.all([
       confirmCommandPreview(db, principal, roomPreview.preview.previewId, { propertyId: demo.propertyId, commandType: "CREATE_ORDER", confirmation: true, expectedEffectHash: roomPreview.preview.effectHash, reason: { code: "TEST", note: "race" } }, metadata("room-confirm")),
@@ -262,7 +269,7 @@ describe("PostgreSQL core operations", () => {
     const priced = await quote(demo.secondRoomId, { member: true, arrival: "2026-08-01", departure: "2026-08-02" });
     const createPreview = await createCommandPreview(db, principal, {
       commandType: "CREATE_ORDER",
-      input: { propertyId: demo.propertyId, quoteId: priced.quoteId, primaryGuest: { fullName: "Lock Order Guest" } }
+      input: { propertyId: demo.propertyId, quoteId: priced.quoteId, primaryGuest: { fullName: "Lock Order Guest" }, bookingChannelCode: "CTRIP", channelOrderReference: "TEST-ORDER-LOCK" }
     }, metadata("lock-order-create-preview"));
     const adjustPreview = await createCommandPreview(db, principal, {
       commandType: "ADJUST_MEMBER_ENTITLEMENT",
@@ -288,7 +295,7 @@ describe("PostgreSQL core operations", () => {
 
   it("rejects a stale preview with zero domain writes and preserves a durable rejection receipt", async () => {
     const firstQuote = await quote(demo.secondRoomId, { stayType: "FREE" });
-    const stale = await createCommandPreview(db, principal, { commandType: "CREATE_ORDER", input: { propertyId: demo.propertyId, quoteId: firstQuote.quoteId, primaryGuest: { fullName: "Stale Guest" } } }, metadata("stale-preview"));
+    const stale = await createCommandPreview(db, principal, { commandType: "CREATE_ORDER", input: { propertyId: demo.propertyId, quoteId: firstQuote.quoteId, primaryGuest: { fullName: "Stale Guest" }, bookingChannelCode: "MEITUAN", channelOrderReference: "TEST-ORDER-STALE", freeStayReason: "Stale Preview fixture" } }, metadata("stale-preview"));
     await createOrder(demo.secondRoomId, "winner", { stayType: "FREE" });
     const countBefore = await db.selectFrom("orders").select(({ fn }) => fn.countAll<number>().as("count")).executeTakeFirstOrThrow();
     const rejected = await confirmCommandPreview(db, principal, stale.preview.previewId, { propertyId: demo.propertyId, commandType: "CREATE_ORDER", confirmation: true, expectedEffectHash: stale.preview.effectHash, reason: { code: "TEST", note: "stale" } }, metadata("stale-confirm"));
@@ -298,9 +305,40 @@ describe("PostgreSQL core operations", () => {
     expect(Number(countAfter.count)).toBe(Number(countBefore.count));
   });
 
+  it("returns PREVIEW_STALE when an order state changes after Preview", async () => {
+    const created = await createOrder(demo.roomId, "state-stale", { stayType: "FREE" });
+    const orderId = created.result!.orderId as string;
+    const stale = await createCommandPreview(db, principal, {
+      commandType: "CHECK_IN",
+      input: { propertyId: demo.propertyId, orderId }
+    }, metadata("state-stale-preview"));
+
+    await previewAndConfirm({
+      commandType: "CHECK_IN",
+      input: { propertyId: demo.propertyId, orderId }
+    }, "state-stale-winner");
+    const amendmentsBefore = await db.selectFrom("amendments").select("id").where("order_id", "=", orderId).execute();
+
+    const rejected = await confirmCommandPreview(db, principal, stale.preview.previewId, {
+      propertyId: demo.propertyId,
+      commandType: "CHECK_IN",
+      confirmation: true,
+      expectedEffectHash: stale.preview.effectHash,
+      reason: { code: "STATE_STALE", note: "Order state changed after Preview" }
+    }, metadata("state-stale-confirm"));
+
+    expect(rejected).toMatchObject({
+      executionStatus: "NOT_EXECUTED",
+      businessCommitted: false,
+      error: { code: "PREVIEW_STALE", details: { causeCode: "INVALID_ORDER_STATE" } }
+    });
+    expect(await db.selectFrom("amendments").select("id").where("order_id", "=", orderId).execute())
+      .toHaveLength(amendmentsBefore.length);
+  });
+
   it("rolls back domain facts when receipt persistence fails", async () => {
     const priced = await quote(demo.roomId, { stayType: "FREE" });
-    const preview = await createCommandPreview(db, principal, { commandType: "CREATE_ORDER", input: { propertyId: demo.propertyId, quoteId: priced.quoteId, primaryGuest: { fullName: "Rollback Guest" } } }, metadata("rollback-preview"));
+    const preview = await createCommandPreview(db, principal, { commandType: "CREATE_ORDER", input: { propertyId: demo.propertyId, quoteId: priced.quoteId, primaryGuest: { fullName: "Rollback Guest" }, bookingChannelCode: "YOUMUDAO", channelOrderReference: "TEST-ORDER-ROLLBACK", freeStayReason: "Transaction rollback fixture" } }, metadata("rollback-preview"));
     await sql.raw("CREATE OR REPLACE FUNCTION fail_receipt() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'forced receipt failure'; END $$; CREATE TRIGGER force_receipt_failure BEFORE INSERT ON command_receipts FOR EACH ROW EXECUTE FUNCTION fail_receipt()").execute(db);
     await expect(confirmCommandPreview(db, principal, preview.preview.previewId, { propertyId: demo.propertyId, commandType: "CREATE_ORDER", confirmation: true, expectedEffectHash: preview.preview.effectHash, reason: { code: "TEST", note: "rollback" } }, metadata("rollback-confirm"))).rejects.toThrow(/forced receipt failure/);
     const orders = await db.selectFrom("orders").select("id").execute();
@@ -314,11 +352,11 @@ describe("PostgreSQL core operations", () => {
     const orderId = created.result!.orderId as string;
     const firstCollection = await previewAndConfirm({
       commandType: "RECORD_COLLECTION",
-      input: { propertyId: demo.propertyId, orderId, amountMinor: 6_000, method: "CASH", note: "first installment" }
+      input: { propertyId: demo.propertyId, orderId, amountMinor: 6_000, method: "CASH", transactionReference: "TEST-TXN-COLLECTION-ONE", note: "first installment" }
     }, "collection-one");
     await previewAndConfirm({
       commandType: "RECORD_COLLECTION",
-      input: { propertyId: demo.propertyId, orderId, amountMinor: 6_000, method: "BANK_TRANSFER", note: "second installment" }
+      input: { propertyId: demo.propertyId, orderId, amountMinor: 6_000, method: "BANK_TRANSFER", transactionReference: "TEST-TXN-COLLECTION-TWO", note: "second installment" }
     }, "collection-two");
     const shortened = await previewAndConfirm({
       commandType: "SHORTEN_STAY",
@@ -327,7 +365,7 @@ describe("PostgreSQL core operations", () => {
     expect(shortened.businessCommitted).toBe(true);
     const refund = await previewAndConfirm({
       commandType: "RECORD_REFUND",
-      input: { propertyId: demo.propertyId, orderId, amountMinor: 3_000, referencesFactId: firstCollection.factRefs[0], method: "CASH", note: "referenced partial refund" }
+      input: { propertyId: demo.propertyId, orderId, amountMinor: 3_000, referencesFactId: firstCollection.factRefs[0], method: "CASH", transactionReference: "TEST-TXN-REFUND-ONE", note: "referenced partial refund" }
     }, "refund");
     expect(refund.factRefs).toHaveLength(1);
     await previewAndConfirm({ commandType: "CHECK_IN", input: { propertyId: demo.propertyId, orderId } }, "check-in");
@@ -396,11 +434,11 @@ describe("PostgreSQL core operations", () => {
     }, "timeline-extend");
     await previewAndConfirm({
       commandType: "REPRICE_ORDER",
-      input: { propertyId: demo.propertyId, orderId, manualAdjustmentMinor: -500 }
+      input: { propertyId: demo.propertyId, orderId, targetCurrentContractAmountMinor: 500 }
     }, "timeline-reprice");
     view = await getOrderView(db, orderId);
-    expect(view.pricingRevisions.at(-1)?.manual_adjustment_minor).toBe(-500);
-    expect(view.amounts.currentContractAmount.minorUnits).toBe(-500);
+    expect(view.pricingRevisions.at(-1)?.manual_adjustment_minor).toBe(500);
+    expect(view.amounts.currentContractAmount.minorUnits).toBe(500);
 
     await previewAndConfirm({
       commandType: "MOVE_UNIT",
@@ -528,44 +566,51 @@ describe("PostgreSQL core operations", () => {
   });
 
   it("expires only the available entitlement balance after the inclusive expiry date", async () => {
-    await previewAndConfirm({
-      commandType: "ADJUST_MEMBER_ENTITLEMENT",
-      input: {
-        propertyId: demo.propertyId,
-        entitlementLotId: demo.roomLotId,
-        quantityDelta: 3,
-        adjustmentReason: "Expiration acceptance setup"
-      }
-    }, "expire-setup-adjustment");
+    const expirationLotId = "lot_core_expiration_acceptance";
+    await db.insertInto("entitlement_lots").values({
+      id: expirationLotId,
+      contract_id: demo.memberContractId,
+      unit_kind: "ROOM_NIGHT",
+      total_units: 5,
+      expires_on: "2026-01-01",
+      version: 1
+    }).execute();
 
     await expect(createCommandPreview(db, principal, {
       commandType: "EXPIRE_MEMBER_ENTITLEMENT",
-      input: { propertyId: demo.propertyId, entitlementLotId: demo.roomLotId, asOfDate: "2029-12-31" }
+      input: { propertyId: demo.propertyId, entitlementLotId: expirationLotId, asOfDate: "2026-01-01" }
     }, metadata("expire-on-inclusive-date"))).rejects.toMatchObject({ code: "ENTITLEMENT_CONFLICT" });
 
     const stalePreview = await createCommandPreview(db, principal, {
       commandType: "EXPIRE_MEMBER_ENTITLEMENT",
-      input: { propertyId: demo.propertyId, entitlementLotId: demo.roomLotId, asOfDate: "2030-01-01" }
+      input: { propertyId: demo.propertyId, entitlementLotId: expirationLotId, asOfDate: "2026-01-02" }
     }, metadata("expire-stale-preview"));
     expect(stalePreview.preview.effect).toMatchObject({
-      entitlementLotId: demo.roomLotId,
+      entitlementLotId: expirationLotId,
       remainingAvailable: 5,
       quantityDelta: -5,
-      asOfDate: "2030-01-01",
+      asOfDate: "2026-01-02",
       entryType: "EXPIRE"
     });
     const storedStalePreview = await db.selectFrom("command_previews").select("basis_versions").where("id", "=", stalePreview.preview.previewId).executeTakeFirstOrThrow();
-    expect(storedStalePreview.basis_versions).toMatchObject({ lotVersion: 2, contractVersion: 2, remainingAvailable: 5 });
+    expect(storedStalePreview.basis_versions).toMatchObject({ lotVersion: 1, contractVersion: 1, remainingAvailable: 5 });
 
-    await previewAndConfirm({
-      commandType: "ADJUST_MEMBER_ENTITLEMENT",
-      input: {
-        propertyId: demo.propertyId,
-        entitlementLotId: demo.roomLotId,
-        quantityDelta: 1,
-        adjustmentReason: "Make expiration preview stale"
-      }
-    }, "expire-stale-adjustment");
+    const winnerPreview = await createCommandPreview(db, principal, {
+      commandType: "EXPIRE_MEMBER_ENTITLEMENT",
+      input: { propertyId: demo.propertyId, entitlementLotId: expirationLotId, asOfDate: "2026-01-02" }
+    }, metadata("expire-winner-preview"));
+    const confirmation = {
+      propertyId: demo.propertyId,
+      commandType: "EXPIRE_MEMBER_ENTITLEMENT" as const,
+      confirmation: true as const,
+      expectedEffectHash: winnerPreview.preview.effectHash,
+      reason: { code: "ENTITLEMENT_EXPIRY", note: "Expire the available balance after lot expiry" }
+    };
+    const confirmMetadata = { idempotencyKey: "expire-success-confirm", correlationId: "expire-success-confirm" };
+    const expired = await confirmCommandPreview(db, principal, winnerPreview.preview.previewId, confirmation, confirmMetadata);
+    const replay = await confirmCommandPreview(db, principal, winnerPreview.preview.previewId, confirmation, confirmMetadata);
+    expect(replay.receiptId).toBe(expired.receiptId);
+
     const staleResult = await confirmCommandPreview(db, principal, stalePreview.preview.previewId, {
       propertyId: demo.propertyId,
       commandType: "EXPIRE_MEMBER_ENTITLEMENT",
@@ -574,45 +619,29 @@ describe("PostgreSQL core operations", () => {
       reason: { code: "ENTITLEMENT_EXPIRY", note: "Confirm stale expiration preview" }
     }, metadata("expire-stale-confirm"));
     expect(staleResult).toMatchObject({ businessCommitted: false, error: { code: "PREVIEW_STALE" } });
-    expect(await db.selectFrom("entitlement_ledger").select("fact_id").where("lot_id", "=", demo.roomLotId).where("entry_type", "=", "EXPIRE").execute()).toHaveLength(0);
+    expect(await db.selectFrom("entitlement_ledger").select("fact_id").where("lot_id", "=", expirationLotId).where("entry_type", "=", "EXPIRE").execute()).toHaveLength(1);
 
-    const freshPreview = await createCommandPreview(db, principal, {
-      commandType: "EXPIRE_MEMBER_ENTITLEMENT",
-      input: { propertyId: demo.propertyId, entitlementLotId: demo.roomLotId, asOfDate: "2030-01-01" }
-    }, metadata("expire-fresh-preview"));
-    expect(freshPreview.preview.effect).toMatchObject({ remainingAvailable: 6, quantityDelta: -6 });
-    const confirmation = {
-      propertyId: demo.propertyId,
-      commandType: "EXPIRE_MEMBER_ENTITLEMENT" as const,
-      confirmation: true as const,
-      expectedEffectHash: freshPreview.preview.effectHash,
-      reason: { code: "ENTITLEMENT_EXPIRY", note: "Expire the available balance after lot expiry" }
-    };
-    const confirmMetadata = { idempotencyKey: "expire-success-confirm", correlationId: "expire-success-confirm" };
-    const expired = await confirmCommandPreview(db, principal, freshPreview.preview.previewId, confirmation, confirmMetadata);
-    const replay = await confirmCommandPreview(db, principal, freshPreview.preview.previewId, confirmation, confirmMetadata);
-    expect(replay.receiptId).toBe(expired.receiptId);
     expect(expired.result).toMatchObject({
-      entitlementLotId: demo.roomLotId,
+      entitlementLotId: expirationLotId,
       contractId: demo.memberContractId,
       factId: expired.factRefs[0],
       entryType: "EXPIRE",
-      expiredUnits: 6,
+      expiredUnits: 5,
       remainingAvailable: 0,
-      asOfDate: "2030-01-01"
+      asOfDate: "2026-01-02"
     });
-    expect(expired.resourceRefs).toEqual([demo.memberContractId, demo.roomLotId]);
+    expect(expired.resourceRefs).toEqual([demo.memberContractId, expirationLotId]);
     expect(expired.factRefs).toHaveLength(1);
 
     const fact = await db.selectFrom("entitlement_ledger").selectAll().where("fact_id", "=", expired.factRefs[0]!).executeTakeFirstOrThrow();
     expect(fact).toMatchObject({
-      lot_id: demo.roomLotId,
+      lot_id: expirationLotId,
       entry_type: "EXPIRE",
-      quantity_delta: -6,
+      quantity_delta: -5,
       service_date: null,
       order_id: null,
       coverage_id: null,
-      reason: "ENTITLEMENT_EXPIRED asOfDate=2030-01-01"
+      reason: "ENTITLEMENT_EXPIRED asOfDate=2026-01-02"
     });
     const balance = await db.selectFrom("entitlement_lots")
       .leftJoin("entitlement_ledger", "entitlement_ledger.lot_id", "entitlement_lots.id")
@@ -620,14 +649,14 @@ describe("PostgreSQL core operations", () => {
         "entitlement_lots.total_units",
         sql<number>`cast(coalesce(sum(entitlement_ledger.quantity_delta), 0) as integer)`.as("ledger_delta")
       ])
-      .where("entitlement_lots.id", "=", demo.roomLotId)
+      .where("entitlement_lots.id", "=", expirationLotId)
       .groupBy("entitlement_lots.total_units")
       .executeTakeFirstOrThrow();
     expect(balance.total_units + Number(balance.ledger_delta)).toBe(0);
-    const lot = await db.selectFrom("entitlement_lots").select("version").where("id", "=", demo.roomLotId).executeTakeFirstOrThrow();
+    const lot = await db.selectFrom("entitlement_lots").select("version").where("id", "=", expirationLotId).executeTakeFirstOrThrow();
     const contract = await db.selectFrom("member_contracts").select("version").where("id", "=", demo.memberContractId).executeTakeFirstOrThrow();
-    expect(lot.version).toBe(4);
-    expect(contract.version).toBe(4);
+    expect(lot.version).toBe(2);
+    expect(contract.version).toBe(2);
   });
 
   it("rejects integer command inputs outside PostgreSQL's safe integer range", async () => {
@@ -643,11 +672,15 @@ describe("PostgreSQL core operations", () => {
   });
 
   it("records a zero-quantity expiration marker and prevents release or adjustment from reviving the lot", async () => {
-    const created = await createOrder(demo.roomId, "expire-held", { member: true, arrival: "2026-07-21", departure: "2026-07-23" });
+    await db.updateTable("entitlement_lots")
+      .set({ expires_on: "2026-01-02" })
+      .where("id", "=", demo.roomLotId)
+      .execute();
+    const created = await createOrder(demo.roomId, "expire-held", { member: true, arrival: "2026-01-01", departure: "2026-01-03" });
     const orderId = created.result!.orderId as string;
     const expired = await previewAndConfirm({
       commandType: "EXPIRE_MEMBER_ENTITLEMENT",
-      input: { propertyId: demo.propertyId, entitlementLotId: demo.roomLotId, asOfDate: "2030-01-01" }
+      input: { propertyId: demo.propertyId, entitlementLotId: demo.roomLotId, asOfDate: "2026-01-03" }
     }, "expire-held-marker");
     expect(expired.result).toMatchObject({ expiredUnits: 0, remainingAvailable: 0 });
     const marker = await db.selectFrom("entitlement_ledger").selectAll().where("fact_id", "=", expired.factRefs[0]!).executeTakeFirstOrThrow();
@@ -657,7 +690,7 @@ describe("PostgreSQL core operations", () => {
       commandType: "ADJUST_MEMBER_ENTITLEMENT",
       input: { propertyId: demo.propertyId, entitlementLotId: demo.roomLotId, quantityDelta: 1, adjustmentReason: "Must not revive expired lot" }
     }, metadata("expired-adjust-denied"))).rejects.toMatchObject({ code: "ENTITLEMENT_CONFLICT" });
-    const laterQuote = await quote(demo.secondRoomId, { member: true, arrival: "2026-07-24", departure: "2026-07-25" });
+    const laterQuote = await quote(demo.secondRoomId, { member: true, arrival: "2026-01-04", departure: "2026-01-05" });
     expect(laterQuote.coverageSet).toHaveLength(0);
     expect(laterQuote.cashRemainder.minorUnits).toBe(12_000);
 
@@ -683,7 +716,7 @@ describe("PostgreSQL core operations", () => {
     const orderId = created.result!.orderId as string;
     await previewAndConfirm({
       commandType: "REPRICE_ORDER",
-      input: { propertyId: demo.propertyId, orderId, manualAdjustmentMinor: -1_000 }
+      input: { propertyId: demo.propertyId, orderId, targetCurrentContractAmountMinor: 35_000 }
     }, "manual-reprice");
     let view = await getOrderView(db, orderId);
     expect(view.amounts.currentContractAmount.minorUnits).toBe(35_000);
@@ -730,7 +763,7 @@ describe("PostgreSQL core operations", () => {
     const orderId = created.result!.orderId as string;
     const collection = await previewAndConfirm({
       commandType: "RECORD_COLLECTION",
-      input: { propertyId: demo.propertyId, orderId, amountMinor: 5_000, method: "CASH", note: "recorded manually" }
+      input: { propertyId: demo.propertyId, orderId, amountMinor: 5_000, method: "CASH", transactionReference: "TEST-TXN-REVERSAL-SOURCE", note: "recorded manually" }
     }, "reversal-collection");
     await previewAndConfirm({
       commandType: "REVERSE_FACT",
@@ -748,7 +781,7 @@ describe("PostgreSQL core operations", () => {
     const reversedOrderId = reversedOrder.result!.orderId as string;
     const reversedCollection = await previewAndConfirm({
       commandType: "RECORD_COLLECTION",
-      input: { propertyId: demo.propertyId, orderId: reversedOrderId, amountMinor: 5_000, method: "CASH", note: "to reverse" }
+      input: { propertyId: demo.propertyId, orderId: reversedOrderId, amountMinor: 5_000, method: "CASH", transactionReference: "TEST-TXN-REFUND-AFTER-REVERSAL-SOURCE", note: "to reverse" }
     }, "refund-after-reversal-collection");
     await previewAndConfirm({
       commandType: "REVERSE_FACT",
@@ -756,18 +789,18 @@ describe("PostgreSQL core operations", () => {
     }, "refund-after-reversal-reverse");
     await expect(createCommandPreview(db, principal, {
       commandType: "RECORD_REFUND",
-      input: { propertyId: demo.propertyId, orderId: reversedOrderId, referencesFactId: reversedCollection.factRefs[0], amountMinor: 1_000, method: "CASH" }
+      input: { propertyId: demo.propertyId, orderId: reversedOrderId, referencesFactId: reversedCollection.factRefs[0], amountMinor: 1_000, method: "CASH", transactionReference: "TEST-TXN-REFUND-AFTER-REVERSAL" }
     }, metadata("refund-after-reversal-denied"))).rejects.toMatchObject({ code: "FACT_ALREADY_REVERSED" });
 
     const refundedOrder = await createOrder(demo.secondRoomId, "reversal-after-refund", { stayType: "FREE" });
     const refundedOrderId = refundedOrder.result!.orderId as string;
     const refundedCollection = await previewAndConfirm({
       commandType: "RECORD_COLLECTION",
-      input: { propertyId: demo.propertyId, orderId: refundedOrderId, amountMinor: 5_000, method: "CASH", note: "partially refunded" }
+      input: { propertyId: demo.propertyId, orderId: refundedOrderId, amountMinor: 5_000, method: "CASH", transactionReference: "TEST-TXN-REFUNDED-COLLECTION", note: "partially refunded" }
     }, "reversal-after-refund-collection");
     await previewAndConfirm({
       commandType: "RECORD_REFUND",
-      input: { propertyId: demo.propertyId, orderId: refundedOrderId, referencesFactId: refundedCollection.factRefs[0], amountMinor: 1_000, method: "CASH" }
+      input: { propertyId: demo.propertyId, orderId: refundedOrderId, referencesFactId: refundedCollection.factRefs[0], amountMinor: 1_000, method: "CASH", transactionReference: "TEST-TXN-REFUNDED-REFUND" }
     }, "reversal-after-refund-refund");
     await expect(createCommandPreview(db, principal, {
       commandType: "REVERSE_FACT",
@@ -782,13 +815,13 @@ describe("PostgreSQL core operations", () => {
     const orderId = created.result!.orderId as string;
     const collection = await previewAndConfirm({
       commandType: "RECORD_COLLECTION",
-      input: { propertyId: demo.propertyId, orderId, amountMinor: 5_000, method: "CASH", note: "race source" }
+      input: { propertyId: demo.propertyId, orderId, amountMinor: 5_000, method: "CASH", transactionReference: "TEST-TXN-REFUND-REVERSAL-RACE-SOURCE", note: "race source" }
     }, "refund-reversal-race-collection");
     const factId = collection.factRefs[0]!;
     const [refundPreview, reversalPreview] = await Promise.all([
       createCommandPreview(db, principal, {
         commandType: "RECORD_REFUND",
-        input: { propertyId: demo.propertyId, orderId, referencesFactId: factId, amountMinor: 1_000, method: "CASH" }
+        input: { propertyId: demo.propertyId, orderId, referencesFactId: factId, amountMinor: 1_000, method: "CASH", transactionReference: "TEST-TXN-REFUND-REVERSAL-RACE" }
       }, metadata("refund-reversal-race-refund-preview")),
       createCommandPreview(db, principal, {
         commandType: "REVERSE_FACT",
@@ -828,7 +861,7 @@ describe("PostgreSQL core operations", () => {
     const orderId = created.result!.orderId as string;
     const collection = await previewAndConfirm({
       commandType: "RECORD_COLLECTION",
-      input: { propertyId: demo.propertyId, orderId, amountMinor: 100, method: "CASH", note: "immutable fact" }
+      input: { propertyId: demo.propertyId, orderId, amountMinor: 100, method: "CASH", transactionReference: "TEST-TXN-IMMUTABLE", note: "immutable fact" }
     }, "immutable-collection");
     await expect(db.updateTable("pricing_policy_versions").set({ nightly_rate_minor: 1 }).where("id", "=", demo.freePolicyId).execute()).rejects.toThrow(/append-only/);
     await expect(db.updateTable("orders").set({ primary_guest_snapshot: { fullName: "Changed" } }).where("id", "=", orderId).execute()).rejects.toThrow(/immutable/);
@@ -841,7 +874,7 @@ describe("PostgreSQL core operations", () => {
     const priced = await quote(demo.roomId, { stayType: "FREE" });
     const preview = await createCommandPreview(db, principal, {
       commandType: "CREATE_ORDER",
-      input: { propertyId: demo.propertyId, quoteId: priced.quoteId, primaryGuest: { fullName: "Recovery Guest" } }
+      input: { propertyId: demo.propertyId, quoteId: priced.quoteId, primaryGuest: { fullName: "Recovery Guest" }, bookingChannelCode: "WECOM", channelOrderReference: null, freeStayReason: "Command recovery fixture" }
     }, { idempotencyKey: "recovery-preview", correlationId: "recovery" });
     const confirmation = {
       propertyId: demo.propertyId,

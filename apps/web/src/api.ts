@@ -5,6 +5,7 @@ import type {
   CommandPreviewResponse,
   CreateQuoteCommandResponseDto,
   MaintenanceLockDto,
+  MemberSummaryDto,
   MemberViewDto,
   MetaDto,
   OrderRowDto,
@@ -129,7 +130,15 @@ export const api = {
     return request<{ orders: OrderRowDto[] }>(`/api/v1/orders?${query.toString()}`);
   },
   order: (orderId: string) => request<OrderViewDto>(`/api/v1/orders/${encodeURIComponent(orderId)}`),
-  member: (memberContractId: string) => request<MemberViewDto>(`/api/v1/members/${encodeURIComponent(memberContractId)}`),
+  members: (propertyId: string, identityCardNumber?: string) => {
+    const query = new URLSearchParams({ propertyId });
+    if (identityCardNumber?.trim()) query.set("identityCardNumber", identityCardNumber.trim());
+    return request<{ members: MemberSummaryDto[] }>(`/api/v1/members?${query.toString()}`);
+  },
+  member: (memberId: string, propertyId: string) => {
+    const query = new URLSearchParams({ propertyId });
+    return request<MemberViewDto>(`/api/v1/members/${encodeURIComponent(memberId)}?${query.toString()}`);
+  },
   tokens: (propertyId: string) => {
     const query = new URLSearchParams({ propertyId });
     return request<{ tokens: TokenDto[] }>(`/api/v1/tokens?${query.toString()}`);

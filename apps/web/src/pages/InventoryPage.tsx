@@ -1,9 +1,10 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { CalendarDays, FilePlus2, Filter, LockOpen, RefreshCw, Search, ShieldCheck, Wrench } from "lucide-react";
-import { api, ApiError, type ClientCommandMetadata } from "../api";
+import { api, type ClientCommandMetadata } from "../api";
 import { addLocalDateDays, defaultInventoryDates } from "../dates";
 import { useWorkspace } from "../session";
 import type {
+  BookingChannelCode,
   CommandRequest,
   InventoryUnitDto,
   MaintenanceLockDto,
@@ -13,7 +14,21 @@ import type {
   StayType,
   UnitAvailabilityDto
 } from "../types";
-import { CommandDialog, EmptyState, formatDateTime, formatMoney, InlineError, LoadingBlock, Modal, StatusBadge } from "../ui";
+import {
+  CommandDialog,
+  type CommandRecoveryStorage,
+  CommandRecoveryBar,
+  EmptyState,
+  formatDateTime,
+  formatMoney,
+  InlineError,
+  isTerminalCommandRecovery,
+  LoadingBlock,
+  Modal,
+  recoveryCommandRequest,
+  StatusBadge,
+  usePersistentCommandRecovery
+} from "../ui";
 
 const stayLabels: Record<StayType, string> = {
   TRANSIENT: "临住",
@@ -23,6 +38,14 @@ const stayLabels: Record<StayType, string> = {
   FIXED_TERM: "固定期限",
   ROLLING: "滚动续期",
   FREE: "免费住宿"
+};
+const paidStayTypes: StayType[] = ["TRANSIENT", "WEEKLY", "MONTHLY", "CUSTOM", "FIXED_TERM", "ROLLING"];
+
+const bookingChannelLabels: Record<BookingChannelCode, string> = {
+  YOUMUDAO: "游牧岛",
+  CTRIP: "携程",
+  MEITUAN: "美团",
+  WECOM: "企业微信"
 };
 
 interface QuoteCommandInput {
@@ -36,10 +59,142 @@ interface QuoteCommandInput {
 }
 
 interface PendingQuoteCommand {
+  version: 1;
+  subjectId: string;
+  propertyId: string;
   input: QuoteCommandInput;
   inputSignature: string;
   metadata: ClientCommandMetadata;
   state: "SENDING" | "UNKNOWN";
+}
+
+type QuoteRecoveryReadResult =
+  | { kind: "ABSENT" }
+  | { kind: "VALID"; pending: PendingQuoteCommand }
+  | { kind: "CORRUPT"; error: Error }
+  | { kind: "READ_ERROR"; error: Error };
+
+const QUOTE_RECOVERY_STORAGE_PREFIX = "qintopia.quote-command-recovery.v1";
+
+export interface QuoteRequestLease {
+  scope: string;
+  generation: number;
+}
+
+export class QuoteRequestGuard {
+  private mounted = false;
+  private scope: string;
+  private generation = 0;
+
+  constructor(initialScope: string) {
+    this.scope = initialScope;
+  }
+
+  mount() {
+    this.mounted = true;
+  }
+
+  unmount() {
+    this.mounted = false;
+    this.generation += 1;
+  }
+
+  enterScope(scope: string) {
+    if (scope === this.scope) return;
+    this.scope = scope;
+    this.generation += 1;
+  }
+
+  begin(scope: string): QuoteRequestLease {
+    this.enterScope(scope);
+    this.generation += 1;
+    return { scope, generation: this.generation };
+  }
+
+  isActive(lease: QuoteRequestLease): boolean {
+    return this.mounted && lease.scope === this.scope && lease.generation === this.generation;
+  }
+}
+
+export function quoteRecoveryStorageKey(subjectId: string, propertyId: string): string {
+  return `${QUOTE_RECOVERY_STORAGE_PREFIX}:${encodeURIComponent(subjectId)}:${encodeURIComponent(propertyId)}`;
+}
+
+function validQuoteInput(value: unknown): value is QuoteCommandInput {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const input = value as Record<string, unknown>;
+  return typeof input.propertyId === "string"
+    && typeof input.inventoryUnitId === "string"
+    && typeof input.stayType === "string"
+    && typeof input.arrivalDate === "string"
+    && typeof input.departureDate === "string"
+    && typeof input.pricingPolicyVersionId === "string"
+    && (input.memberContractId === undefined || typeof input.memberContractId === "string");
+}
+
+export function readQuoteCommandRecovery(storage: CommandRecoveryStorage, subjectId: string, propertyId: string): QuoteRecoveryReadResult {
+  let serialized: string | null;
+  try {
+    serialized = storage.getItem(quoteRecoveryStorageKey(subjectId, propertyId));
+  } catch {
+    return { kind: "READ_ERROR", error: new Error("无法读取本地报价恢复记录；已暂停新报价和订单写入") };
+  }
+  if (serialized === null) return { kind: "ABSENT" };
+  let value: unknown;
+  try {
+    value = JSON.parse(serialized);
+  } catch {
+    return { kind: "CORRUPT", error: new Error("本地报价恢复记录已损坏；无法确认原报价命令是否执行") };
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return { kind: "CORRUPT", error: new Error("本地报价恢复记录结构无效") };
+  }
+  const record = value as Record<string, unknown>;
+  const metadata = record.metadata;
+  if (record.version !== 1
+    || record.subjectId !== subjectId
+    || record.propertyId !== propertyId
+    || !validQuoteInput(record.input)
+    || record.input.propertyId !== propertyId
+    || typeof record.inputSignature !== "string"
+    || record.inputSignature !== quoteInputSignature(record.input)
+    || !metadata
+    || typeof metadata !== "object"
+    || Array.isArray(metadata)
+    || typeof (metadata as Record<string, unknown>).idempotencyKey !== "string"
+    || !(metadata as Record<string, unknown>).idempotencyKey
+    || typeof (metadata as Record<string, unknown>).correlationId !== "string"
+    || (record.state !== "SENDING" && record.state !== "UNKNOWN")) {
+    return { kind: "CORRUPT", error: new Error("本地报价恢复记录版本或字段无效；已暂停新报价和订单写入") };
+  }
+  return { kind: "VALID", pending: record as unknown as PendingQuoteCommand };
+}
+
+export function saveQuoteCommandRecovery(storage: CommandRecoveryStorage, pending: PendingQuoteCommand): boolean {
+  try {
+    storage.setItem(quoteRecoveryStorageKey(pending.subjectId, pending.propertyId), JSON.stringify(pending));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function clearQuoteCommandRecovery(storage: CommandRecoveryStorage, subjectId: string, propertyId: string): boolean {
+  try {
+    storage.removeItem(quoteRecoveryStorageKey(subjectId, propertyId));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function browserQuoteRecovery(subjectId: string, propertyId: string, storageFactory: () => Storage = () => window.sessionStorage): { storage?: CommandRecoveryStorage; read: QuoteRecoveryReadResult } {
+  try {
+    const storage = storageFactory();
+    return { storage, read: readQuoteCommandRecovery(storage, subjectId, propertyId) };
+  } catch {
+    return { read: { kind: "READ_ERROR", error: new Error("无法访问浏览器 sessionStorage；已暂停新报价和订单写入") } };
+  }
 }
 
 function quoteInputSignature(input: QuoteCommandInput): string {
@@ -103,29 +258,85 @@ function QuoteWorkbench({
   arrivalDate,
   departureDate,
   policies,
+  commandsBlocked,
+  resetToken,
   onCommand
 }: {
   unit: UnitAvailabilityDto | undefined;
   arrivalDate: string;
   departureDate: string;
   policies: PricingPolicyVersionDto[];
+  commandsBlocked: boolean;
+  resetToken: number;
   onCommand: (request: CommandRequest) => void;
 }) {
-  const { meta, propertyId } = useWorkspace();
-  const stayTypes = useMemo(() => [...new Set(policies.map((policy) => policy.stay_type))], [policies]);
+  const { meta, principal, propertyId } = useWorkspace();
+  const quoteRecoveryScope = quoteRecoveryStorageKey(principal.subjectId, propertyId);
+  const productPolicies = policies;
+  const stayTypes = useMemo(() => {
+    const supported = new Set(productPolicies.flatMap((policy) => policy.stay_type ? [policy.stay_type] : []));
+    if (productPolicies.some((policy) => policy.stay_type === null)) paidStayTypes.forEach((stayType) => supported.add(stayType));
+    const ordered = paidStayTypes.filter((stayType) => supported.has(stayType));
+    if (supported.has("FREE")) ordered.push("FREE");
+    return ordered;
+  }, [productPolicies]);
   const [stayType, setStayType] = useState<StayType>(stayTypes[0] ?? "TRANSIENT");
-  const matchingPolicies = policies.filter((policy) => policy.stay_type === stayType);
+  const matchingPolicies = productPolicies.filter((policy) => policy.stay_type === stayType || (policy.stay_type === null && stayType !== "FREE"));
   const [policyId, setPolicyId] = useState(matchingPolicies[0]?.id ?? "");
   const [memberContractId, setMemberContractId] = useState("");
+  const [memberSearch, setMemberSearch] = useState("");
   const [quote, setQuote] = useState<QuoteDto>();
   const [quoteReceipt, setQuoteReceipt] = useState<ReceiptDto>();
-  const [pendingQuote, setPendingQuote] = useState<PendingQuoteCommand>();
+  const [quoteRecoverySnapshot, setQuoteRecoverySnapshot] = useState<{ scope: string; read: QuoteRecoveryReadResult }>(() => ({
+    scope: quoteRecoveryScope,
+    read: browserQuoteRecovery(principal.subjectId, propertyId).read
+  }));
   const [guestName, setGuestName] = useState("");
   const [guestPhone, setGuestPhone] = useState("");
   const [guestDocument, setGuestDocument] = useState("");
+  const [bookingChannelCode, setBookingChannelCode] = useState<BookingChannelCode | "">("");
+  const [channelOrderReference, setChannelOrderReference] = useState("");
+  const [freeStayReason, setFreeStayReason] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<unknown>();
   const latestQuoteSignature = useRef("");
+  const quoteRequestGuardRef = useRef<QuoteRequestGuard | null>(null);
+  if (!quoteRequestGuardRef.current) quoteRequestGuardRef.current = new QuoteRequestGuard(quoteRecoveryScope);
+  const quoteRequestGuard = quoteRequestGuardRef.current;
+  quoteRequestGuard.enterScope(quoteRecoveryScope);
+  const quoteRecoveryReady = quoteRecoverySnapshot.scope === quoteRecoveryScope;
+  const quoteRecoveryRead = quoteRecoveryReady
+    ? quoteRecoverySnapshot.read
+    : { kind: "READ_ERROR", error: new Error("正在核对本地报价恢复记录") } as const;
+  const pendingQuote = quoteRecoveryRead.kind === "VALID" ? quoteRecoveryRead.pending : undefined;
+  const quoteRecoveryError = quoteRecoveryRead.kind === "CORRUPT" || quoteRecoveryRead.kind === "READ_ERROR" ? quoteRecoveryRead.error : undefined;
+  const quoteCommandsBlocked = commandsBlocked || !quoteRecoveryReady || quoteRecoveryRead.kind !== "ABSENT";
+
+  useEffect(() => {
+    quoteRequestGuard.mount();
+    return () => quoteRequestGuard.unmount();
+  }, [quoteRequestGuard]);
+
+  useEffect(() => {
+    setBusy(false);
+    setQuoteRecoverySnapshot({
+      scope: quoteRecoveryScope,
+      read: browserQuoteRecovery(principal.subjectId, propertyId).read
+    });
+  }, [principal.subjectId, propertyId, quoteRecoveryScope]);
+
+  useEffect(() => {
+    if (resetToken === 0) return;
+    setQuote(undefined);
+    setQuoteReceipt(undefined);
+    setGuestName("");
+    setGuestPhone("");
+    setGuestDocument("");
+    setBookingChannelCode("");
+    setChannelOrderReference("");
+    setFreeStayReason("");
+    setError(undefined);
+  }, [resetToken]);
 
   useEffect(() => {
     const firstStay = stayTypes[0];
@@ -133,9 +344,13 @@ function QuoteWorkbench({
   }, [stayType, stayTypes]);
 
   useEffect(() => {
-    const firstPolicy = policies.find((policy) => policy.stay_type === stayType);
-    if (!policies.some((policy) => policy.id === policyId && policy.stay_type === stayType)) setPolicyId(firstPolicy?.id ?? "");
-  }, [policies, policyId, stayType]);
+    const firstPolicy = matchingPolicies[0];
+    if (!matchingPolicies.some((policy) => policy.id === policyId)) setPolicyId(firstPolicy?.id ?? "");
+  }, [matchingPolicies, policyId]);
+
+  useEffect(() => {
+    if (stayType === "FREE") setMemberContractId("");
+  }, [stayType]);
 
   useEffect(() => {
     setQuote(undefined);
@@ -144,7 +359,16 @@ function QuoteWorkbench({
   }, [unit?.id, arrivalDate, departureDate, stayType, policyId, memberContractId]);
 
   const selectedPolicy = policies.find((policy) => policy.id === policyId);
-  const members = meta.memberContracts.filter((member) => member.property_id === propertyId && member.status === "ACTIVE");
+  const memberProfiles = new Map(meta.members.map((member) => [member.id, member]));
+  const normalizedMemberSearch = memberSearch.trim().toUpperCase();
+  const memberContracts = meta.memberContracts.filter((contract) => {
+    if (contract.property_id !== propertyId || contract.status !== "ACTIVE") return false;
+    if (!normalizedMemberSearch) return true;
+    const member = contract.member_id ? memberProfiles.get(contract.member_id) : undefined;
+    return contract.id.toUpperCase().includes(normalizedMemberSearch)
+      || contract.member_name.toUpperCase().includes(normalizedMemberSearch)
+      || Boolean(member?.identity_card_number.toUpperCase().includes(normalizedMemberSearch));
+  });
   const currentQuoteInput: QuoteCommandInput | undefined = unit && policyId ? {
     propertyId,
     inventoryUnitId: unit.id,
@@ -157,37 +381,80 @@ function QuoteWorkbench({
   latestQuoteSignature.current = currentQuoteInput ? quoteInputSignature(currentQuoteInput) : "";
 
   async function createQuote() {
-    if (!currentQuoteInput || pendingQuote) return;
+    if (!currentQuoteInput || quoteCommandsBlocked) return;
     const input = currentQuoteInput;
     const inputSignature = quoteInputSignature(input);
     const metadata = api.commandMetadata("create-quote");
-    setPendingQuote({ input, inputSignature, metadata, state: "SENDING" });
+    const pending: PendingQuoteCommand = {
+      version: 1,
+      subjectId: principal.subjectId,
+      propertyId,
+      input,
+      inputSignature,
+      metadata,
+      state: "SENDING"
+    };
+    const beforeSend = browserQuoteRecovery(principal.subjectId, propertyId);
+    if (!beforeSend.storage || beforeSend.read.kind !== "ABSENT") {
+      setQuoteRecoverySnapshot({ scope: quoteRecoveryScope, read: beforeSend.read });
+      setError(beforeSend.read.kind === "ABSENT" ? new Error("无法访问本地报价恢复存储，报价命令尚未发送") : undefined);
+      return;
+    }
+    if (!saveQuoteCommandRecovery(beforeSend.storage, pending)) {
+      const read = { kind: "READ_ERROR", error: new Error("无法保存本地报价恢复记录，报价命令尚未发送") } as const;
+      setQuoteRecoverySnapshot({ scope: quoteRecoveryScope, read });
+      setError(read.error);
+      return;
+    }
+    setQuoteRecoverySnapshot({ scope: quoteRecoveryScope, read: { kind: "VALID", pending } });
+    const requestLease = quoteRequestGuard.begin(quoteRecoveryScope);
     setBusy(true);
     setError(undefined);
     try {
       const response = await api.quote(input, metadata);
+      if (!quoteRequestGuard.isActive(requestLease)) return;
+      const completed = browserQuoteRecovery(principal.subjectId, propertyId);
+      if (completed.storage && completed.read.kind === "VALID" && completed.read.pending.metadata.idempotencyKey === metadata.idempotencyKey) {
+        if (clearQuoteCommandRecovery(completed.storage, principal.subjectId, propertyId)) {
+          setQuoteRecoverySnapshot({ scope: quoteRecoveryScope, read: { kind: "ABSENT" } });
+        } else {
+          setQuoteRecoverySnapshot({ scope: quoteRecoveryScope, read: { kind: "READ_ERROR", error: new Error("报价已返回，但无法清除本地恢复记录；新报价和订单写入继续暂停") } });
+        }
+      } else if (completed.read.kind !== "ABSENT") {
+        setQuoteRecoverySnapshot({ scope: quoteRecoveryScope, read: completed.read });
+      } else {
+        setQuoteRecoverySnapshot({ scope: quoteRecoveryScope, read: { kind: "ABSENT" } });
+      }
       if (latestQuoteSignature.current === inputSignature) {
         setQuote(response.quote);
         setQuoteReceipt(response.receipt);
       } else {
         setError(new Error("报价已完成，但筛选条件在请求期间发生变化；旧结果未应用，请重新报价。"));
       }
-      setPendingQuote(undefined);
     } catch (nextError) {
+      if (!quoteRequestGuard.isActive(requestLease)) return;
       setError(nextError);
-      const uncertain = !(nextError instanceof ApiError)
-        || nextError.status >= 500
-        || nextError.code === "COMMAND_STATUS_UNKNOWN";
-      setPendingQuote((current) => current?.metadata.idempotencyKey === metadata.idempotencyKey
-        ? uncertain ? { ...current, state: "UNKNOWN" } : undefined
-        : current);
+      const current = browserQuoteRecovery(principal.subjectId, propertyId);
+      if (current.storage && current.read.kind === "VALID" && current.read.pending.metadata.idempotencyKey === metadata.idempotencyKey) {
+        const unknown = { ...current.read.pending, state: "UNKNOWN" as const };
+        if (saveQuoteCommandRecovery(current.storage, unknown)) {
+          setQuoteRecoverySnapshot({ scope: quoteRecoveryScope, read: { kind: "VALID", pending: unknown } });
+        } else {
+          setQuoteRecoverySnapshot({ scope: quoteRecoveryScope, read: { kind: "READ_ERROR", error: new Error("报价响应未知且无法更新本地恢复记录；写入口继续暂停") } });
+        }
+      } else if (current.read.kind !== "ABSENT") {
+        setQuoteRecoverySnapshot({ scope: quoteRecoveryScope, read: current.read });
+      } else {
+        setQuoteRecoverySnapshot({ scope: quoteRecoveryScope, read: { kind: "ABSENT" } });
+      }
     } finally {
-      setBusy(false);
+      if (quoteRequestGuard.isActive(requestLease)) setBusy(false);
     }
   }
 
   async function recoverQuote() {
     if (!pendingQuote) return;
+    const requestLease = quoteRequestGuard.begin(quoteRecoveryScope);
     setBusy(true);
     setError(undefined);
     try {
@@ -196,12 +463,28 @@ function QuoteWorkbench({
         "CREATE_QUOTE",
         pendingQuote.metadata.idempotencyKey
       );
+      if (!quoteRequestGuard.isActive(requestLease)) return;
       if (receipt.executionStatus === "UNKNOWN") {
-        setPendingQuote((current) => current ? { ...current, state: "UNKNOWN" } : current);
+        const current = browserQuoteRecovery(principal.subjectId, propertyId);
+        if (current.storage && current.read.kind === "VALID" && current.read.pending.metadata.idempotencyKey === pendingQuote.metadata.idempotencyKey) {
+          const unknown = { ...current.read.pending, state: "UNKNOWN" as const };
+          if (saveQuoteCommandRecovery(current.storage, unknown)) setQuoteRecoverySnapshot({ scope: quoteRecoveryScope, read: { kind: "VALID", pending: unknown } });
+          else setQuoteRecoverySnapshot({ scope: quoteRecoveryScope, read: { kind: "READ_ERROR", error: new Error("无法更新本地报价恢复记录；写入口继续暂停") } });
+        }
         setError(new Error("报价命令仍在执行或状态未知，请保留原幂等键后再次查询。"));
         return;
       }
-      setPendingQuote(undefined);
+      const completed = browserQuoteRecovery(principal.subjectId, propertyId);
+      if (!completed.storage || completed.read.kind !== "VALID" || completed.read.pending.metadata.idempotencyKey !== pendingQuote.metadata.idempotencyKey) {
+        setQuoteRecoverySnapshot({ scope: quoteRecoveryScope, read: completed.read });
+        setError(new Error("命令结果已返回，但本地报价恢复记录无法安全收口"));
+        return;
+      }
+      if (!clearQuoteCommandRecovery(completed.storage, principal.subjectId, propertyId)) {
+        setQuoteRecoverySnapshot({ scope: quoteRecoveryScope, read: { kind: "READ_ERROR", error: new Error("无法清除已收口的本地报价恢复记录；写入口继续暂停") } });
+        return;
+      }
+      setQuoteRecoverySnapshot({ scope: quoteRecoveryScope, read: { kind: "ABSENT" } });
       if (!receipt.businessCommitted) {
         setError(new Error("服务端确认该报价命令未执行，可以重新报价。"));
         return;
@@ -214,15 +497,17 @@ function QuoteWorkbench({
       setQuote(recoveredQuote);
       setQuoteReceipt(receipt);
     } catch (nextError) {
+      if (!quoteRequestGuard.isActive(requestLease)) return;
       setError(nextError);
-      setPendingQuote((current) => current ? { ...current, state: "UNKNOWN" } : current);
+      const current = browserQuoteRecovery(principal.subjectId, propertyId);
+      setQuoteRecoverySnapshot({ scope: quoteRecoveryScope, read: current.read });
     } finally {
-      setBusy(false);
+      if (quoteRequestGuard.isActive(requestLease)) setBusy(false);
     }
   }
 
   function createOrder() {
-    if (!quote || !guestName.trim()) return;
+    if (quoteCommandsBlocked || !quote || !guestName.trim() || !bookingChannelCode || (quote.stayType === "FREE" && !freeStayReason.trim())) return;
     const primaryGuest: Record<string, unknown> = { fullName: guestName.trim() };
     if (guestPhone.trim()) primaryGuest.phone = guestPhone.trim();
     if (guestDocument.trim()) primaryGuest.documentNumber = guestDocument.trim();
@@ -230,7 +515,14 @@ function QuoteWorkbench({
       commandType: "CREATE_ORDER",
       title: "创建订单",
       description: "确认主要居住人快照、锁定计价政策版本、库存及会员覆盖差异。",
-      input: { propertyId, quoteId: quote.quoteId, primaryGuest }
+      input: {
+        propertyId,
+        quoteId: quote.quoteId,
+        primaryGuest,
+        bookingChannelCode,
+        channelOrderReference: bookingChannelCode === "WECOM" ? null : channelOrderReference.trim() || null,
+        ...(quote.stayType === "FREE" ? { freeStayReason: freeStayReason.trim() } : {})
+      }
     });
   }
 
@@ -240,39 +532,46 @@ function QuoteWorkbench({
         <div><p className="eyebrow">Quote</p><h2 id="quote-heading">报价工作区</h2></div>
         {unit ? <span className={`unit-kind kind-${unit.kind.toLowerCase()}`}>{unit.kind === "ROOM" ? "整房" : "床位"}</span> : null}
       </header>
+      <InlineError error={error} title="报价失败" />
+      <InlineError error={quoteRecoveryError} title="本地报价恢复记录不可用" />
+      {pendingQuote ? (
+        <div className="recovery-bar" data-testid="quote-recovery">
+          <div><strong>{pendingQuote.state === "SENDING" ? "报价命令处理中或响应待确认" : "报价命令结果待恢复"}</strong><p>保留原幂等键，只查询执行结果，不创建第二个 Quote。</p><code>{pendingQuote.metadata.idempotencyKey}</code></div>
+          <button className="button button-secondary" type="button" onClick={() => void recoverQuote()} disabled={busy}>
+            <RefreshCw aria-hidden="true" size={17} />查询命令结果
+          </button>
+        </div>
+      ) : null}
       {!unit ? <EmptyState title="选择可售库存" detail="在房态表中选择整房或床位后开始报价。" /> : (
         <>
           <div className="selected-unit"><strong>{unitName(unit)}</strong><span>{arrivalDate} 至 {departureDate}</span></div>
           <div className="form-grid quote-form">
             <label>住宿类型
-              <select value={stayType} onChange={(event) => setStayType(event.target.value as StayType)} disabled={busy || Boolean(pendingQuote)}>
+              <select value={stayType} onChange={(event) => setStayType(event.target.value as StayType)} disabled={busy || quoteRecoveryRead.kind !== "ABSENT"}>
                 {stayTypes.map((type) => <option key={type} value={type}>{stayLabels[type]}</option>)}
               </select>
             </label>
             <label>计价政策版本
-              <select value={policyId} onChange={(event) => setPolicyId(event.target.value)} required disabled={busy || Boolean(pendingQuote)}>
+              <select value={policyId} onChange={(event) => setPolicyId(event.target.value)} required disabled={busy || quoteRecoveryRead.kind !== "ABSENT"}>
                 {matchingPolicies.map((policy) => <option key={policy.id} value={policy.id}>{policy.code} · v{policy.version}</option>)}
               </select>
             </label>
+            <label>搜索会员
+              <input value={memberSearch} onChange={(event) => setMemberSearch(event.target.value)} placeholder="身份证号 / 姓名" disabled={stayType === "FREE" || busy || quoteRecoveryRead.kind !== "ABSENT"} data-testid="member-search" />
+            </label>
             <label>会员合同
-              <select value={memberContractId} onChange={(event) => setMemberContractId(event.target.value)} disabled={busy || Boolean(pendingQuote)}>
+              <select value={memberContractId} onChange={(event) => setMemberContractId(event.target.value)} disabled={stayType === "FREE" || busy || quoteRecoveryRead.kind !== "ABSENT"}>
                 <option value="">不使用会员权益</option>
-                {members.map((member) => <option key={member.id} value={member.id}>{member.member_name} · {member.id}</option>)}
+                {memberContracts.map((contract) => {
+                  const member = contract.member_id ? memberProfiles.get(contract.member_id) : undefined;
+                  return <option key={contract.id} value={contract.id}>{member ? `${member.full_name} · ${member.identity_card_number}` : `${contract.member_name} · 历史未关联档案`} · ${contract.id}</option>;
+                })}
               </select>
             </label>
-            <button className="button button-primary" type="button" onClick={() => void createQuote()} disabled={busy || Boolean(pendingQuote) || !policyId || !unit.available} data-testid="request-quote">
+            <button className="button button-primary" type="button" onClick={() => void createQuote()} disabled={busy || quoteCommandsBlocked || !policyId || !unit.available} data-testid="request-quote">
               <Search aria-hidden="true" size={17} />{busy ? "正在报价" : "获取服务端报价"}
             </button>
           </div>
-          <InlineError error={error} title="报价失败" />
-          {pendingQuote ? (
-            <div className="recovery-bar" data-testid="quote-recovery">
-              <div><strong>{pendingQuote.state === "SENDING" ? "报价命令处理中" : "报价命令结果待恢复"}</strong><p>保留原幂等键，只查询执行结果，不创建第二个 Quote。</p></div>
-              <button className="button button-secondary" type="button" onClick={() => void recoverQuote()} disabled={busy || pendingQuote.state === "SENDING"}>
-                <RefreshCw aria-hidden="true" size={17} />查询命令结果
-              </button>
-            </div>
-          ) : null}
           {quote ? (
             <div className="quote-result" data-testid="quote-result">
               <section className="locked-policy" aria-label="锁定计价政策">
@@ -293,7 +592,10 @@ function QuoteWorkbench({
               </section>
               <section className="quote-lines" aria-labelledby="cash-lines-heading">
                 <div className="section-title-row"><h3 id="cash-lines-heading">现金计价行</h3><span>{quote.cashLines.length}</span></div>
-                {quote.cashLines.map((line) => <div className="cash-line" key={`${line.serviceDate}-${line.inventoryUnitId}`}><span>{line.serviceDate}</span><span>{line.description}</span><strong>{formatMoney(line.amount)}</strong></div>)}
+                {quote.cashLines.map((line) => {
+                  const period = "serviceDate" in line ? line.serviceDate : `${line.arrivalDate} 至 ${line.departureDate}`;
+                  return <div className="cash-line" key={`${period}-${line.inventoryUnitId}`}><span>{period}</span><span>{line.description}</span><strong>{formatMoney(line.amount)}</strong></div>;
+                })}
               </section>
               <div className="quote-expiry">Quote ID <code>{quote.quoteId}</code><span>有效至 {formatDateTime(quote.expiresAt)}</span>{quoteReceipt ? <><span>Receipt</span><code>{quoteReceipt.receiptId}</code></> : null}</div>
               <section className="guest-section" aria-labelledby="guest-heading">
@@ -302,8 +604,24 @@ function QuoteWorkbench({
                   <label>姓名<input value={guestName} onChange={(event) => setGuestName(event.target.value)} required maxLength={160} data-testid="primary-guest-name" /></label>
                   <label>联系电话<input value={guestPhone} onChange={(event) => setGuestPhone(event.target.value)} inputMode="tel" maxLength={80} /></label>
                   <label>证件号码<input value={guestDocument} onChange={(event) => setGuestDocument(event.target.value)} maxLength={120} /></label>
+                  <label>订单来源渠道
+                    <select
+                      value={bookingChannelCode}
+                      onChange={(event) => {
+                        const code = event.target.value as BookingChannelCode | "";
+                        setBookingChannelCode(code);
+                        if (code === "WECOM") setChannelOrderReference("");
+                      }}
+                      data-testid="booking-channel-code"
+                    >
+                      <option value="">请选择渠道</option>
+                      {Object.entries(bookingChannelLabels).map(([code, label]) => <option key={code} value={code}>{label}</option>)}
+                    </select>
+                  </label>
+                  {bookingChannelCode && bookingChannelCode !== "WECOM" ? <label>渠道订单号（可选）<input value={channelOrderReference} onChange={(event) => setChannelOrderReference(event.target.value)} maxLength={200} data-testid="channel-order-reference" /></label> : null}
+                  {quote.stayType === "FREE" ? <label className="span-two">免费入住原因<textarea rows={3} value={freeStayReason} onChange={(event) => setFreeStayReason(event.target.value)} required maxLength={1000} data-testid="free-stay-reason" /></label> : null}
                 </div>
-                <button className="button button-primary full-width" type="button" onClick={createOrder} disabled={!guestName.trim()} data-testid="create-order">
+                <button className="button button-primary full-width" type="button" onClick={createOrder} disabled={quoteCommandsBlocked || !guestName.trim() || !bookingChannelCode || (quote.stayType === "FREE" && !freeStayReason.trim())} data-testid="create-order">
                   <FilePlus2 aria-hidden="true" size={17} />Preview 创建订单
                 </button>
               </section>
@@ -316,7 +634,8 @@ function QuoteWorkbench({
 }
 
 export function InventoryPage() {
-  const { meta, propertyId } = useWorkspace();
+  const { meta, principal, propertyId } = useWorkspace();
+  const commandRecovery = usePersistentCommandRecovery({ subjectId: principal.subjectId, scopeId: `property:${propertyId}` });
   const propertyTimezone = meta.properties.find((property) => property.id === propertyId)?.timezone ?? "UTC";
   const [searchDates, setSearchDates] = useState(() => defaultInventoryDates(propertyTimezone));
   const { arrivalDate, departureDate } = searchDates;
@@ -327,16 +646,24 @@ export function InventoryPage() {
   const [selectedUnitId, setSelectedUnitId] = useState<string>();
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<unknown>();
+  const [recoveryError, setRecoveryError] = useState<unknown>();
   const [command, setCommand] = useState<CommandRequest>();
+  const [recoveryDialogOpen, setRecoveryDialogOpen] = useState(false);
   const [maintenanceUnit, setMaintenanceUnit] = useState<UnitAvailabilityDto>();
   const [maintenanceLocks, setMaintenanceLocks] = useState<MaintenanceLockDto[]>([]);
   const [maintenanceLoading, setMaintenanceLoading] = useState(true);
   const [maintenanceError, setMaintenanceError] = useState<unknown>();
   const [refreshToken, setRefreshToken] = useState(0);
+  const [quoteResetToken, setQuoteResetToken] = useState(0);
+  const commandsBlocked = commandRecovery.blocked;
 
   useEffect(() => {
     if (previousPropertyId.current === propertyId) return;
     previousPropertyId.current = propertyId;
+    setCommand(undefined);
+    setRecoveryDialogOpen(false);
+    setRecoveryError(undefined);
+    setMaintenanceUnit(undefined);
     if (!datesEdited.current) setSearchDates(defaultInventoryDates(propertyTimezone));
   }, [propertyId, propertyTimezone]);
 
@@ -382,13 +709,43 @@ export function InventoryPage() {
   }
 
   function releaseMaintenance(lock: MaintenanceLockDto) {
+    if (commandsBlocked) return;
     const unit = inventoryUnitMap.get(lock.inventory_unit_id);
+    setRecoveryDialogOpen(false);
     setCommand({
       commandType: "RELEASE_MAINTENANCE",
       title: `释放维修锁 · ${unit?.code ?? lock.inventory_unit_id}`,
       description: "服务端将重新校验维修锁版本，确认后释放对应日期范围的库存 claim。",
       input: { propertyId, maintenanceLockId: lock.id }
     });
+  }
+
+  function startCommand(request: CommandRequest) {
+    if (commandsBlocked) return;
+    setRecoveryDialogOpen(false);
+    setCommand(request);
+  }
+
+  function openRecoveryDialog() {
+    if (!commandRecovery.pending) return;
+    setRecoveryDialogOpen(true);
+    setCommand(recoveryCommandRequest(commandRecovery.pending));
+  }
+
+  function closeCommandDialog() {
+    let refreshAfterClose = false;
+    if (commandRecovery.pending && isTerminalCommandRecovery(commandRecovery.pending.state)) {
+      const receipt = commandRecovery.pending.receipt;
+      refreshAfterClose = receipt?.businessCommitted === true;
+      if (refreshAfterClose && commandRecovery.pending.commandType === "CREATE_ORDER") {
+        setQuoteResetToken((value) => value + 1);
+      }
+      if (commandRecovery.clearResolved()) setRecoveryError(undefined);
+      else setRecoveryError(new Error("无法清除已收口的本地恢复记录；为避免重复库存写入，命令继续保持暂停"));
+    }
+    setCommand(undefined);
+    setRecoveryDialogOpen(false);
+    if (refreshAfterClose) setRefreshToken((value) => value + 1);
   }
 
   return (
@@ -399,6 +756,9 @@ export function InventoryPage() {
           <RefreshCw className={loading ? "spin" : ""} aria-hidden="true" size={17} />刷新
         </button>
       </header>
+      <InlineError error={recoveryError} title="恢复记录未收口" />
+      <InlineError error={commandRecovery.error} title="本地命令恢复记录不可用" />
+      {commandRecovery.pending ? <CommandRecoveryBar recovery={commandRecovery.pending} onOpen={openRecoveryDialog} testId="inventory-command-recovery" /> : null}
 
       <section className="inventory-filters" aria-label="房态筛选">
         <div className="date-control"><CalendarDays aria-hidden="true" size={17} /><label>到店<input type="date" value={arrivalDate} onChange={(event) => updateArrival(event.target.value)} data-testid="arrival-date" /></label></div>
@@ -421,7 +781,7 @@ export function InventoryPage() {
                     <tr key={unit.id} className={selectedUnitId === unit.id ? "selected-row" : undefined}>
                       <th scope="row" className={`sticky-column unit-cell ${unit.kind === "BED" ? "child-unit" : ""}`}><span className="unit-code">{unit.code}</span><span>{unit.name}</span><small>{unit.kind === "ROOM" ? "整房" : "床位"}</small></th>
                       {unit.nights.map((night) => <td key={night.serviceDate}><span className={`availability-cell ${night.available ? "available" : "blocked"}`} aria-label={`${night.serviceDate} ${night.available ? "可售" : "占用"}`}>{night.available ? "可售" : "占用"}</span></td>)}
-                      <td className="row-actions"><button className="icon-button" type="button" onClick={() => setMaintenanceUnit(unit)} aria-label={`维修锁房 ${unit.code}`} title="维修锁房"><Wrench aria-hidden="true" size={17} /></button><button className="button button-compact button-secondary" type="button" onClick={() => setSelectedUnitId(unit.id)} disabled={!unit.available} data-testid={`quote-unit-${unit.code}`}>报价</button></td>
+                      <td className="row-actions"><button className="icon-button" type="button" onClick={() => setMaintenanceUnit(unit)} disabled={commandsBlocked} aria-label={`维修锁房 ${unit.code}`} title="维修锁房"><Wrench aria-hidden="true" size={17} /></button><button className="button button-compact button-secondary" type="button" onClick={() => setSelectedUnitId(unit.id)} disabled={!unit.available} data-testid={`quote-unit-${unit.code}`}>报价</button></td>
                     </tr>
                   ))}
                 </tbody>
@@ -429,7 +789,7 @@ export function InventoryPage() {
             </div>
           )}
         </section>
-        <QuoteWorkbench unit={selectedUnit} arrivalDate={arrivalDate} departureDate={departureDate} policies={policies} onCommand={setCommand} />
+        <QuoteWorkbench unit={selectedUnit} arrivalDate={arrivalDate} departureDate={departureDate} policies={policies} commandsBlocked={commandsBlocked} resetToken={quoteResetToken} onCommand={startCommand} />
       </div>
 
       <section className="maintenance-locks-panel" aria-labelledby="maintenance-locks-heading" data-testid="maintenance-locks">
@@ -444,15 +804,24 @@ export function InventoryPage() {
               <thead><tr><th scope="col">维修锁</th><th scope="col">库存单元</th><th scope="col">锁房周期</th><th scope="col">原因</th><th scope="col">状态</th><th scope="col">操作</th></tr></thead>
               <tbody>{maintenanceLocks.map((lock) => {
                 const unit = inventoryUnitMap.get(lock.inventory_unit_id);
-                return <tr key={lock.id}><th scope="row"><code>{lock.id}</code><small>{formatDateTime(lock.created_at)}</small></th><td><strong>{unit ? `${unit.code} · ${unit.name}` : lock.inventory_unit_id}</strong></td><td>{lock.arrival_date} 至 {lock.departure_date}</td><td className="maintenance-reason">{lock.reason}</td><td><StatusBadge value={lock.status} /></td><td><button className="button button-compact button-secondary" type="button" onClick={() => releaseMaintenance(lock)} aria-label={`释放维修锁 ${unit?.code ?? lock.id}`}><LockOpen aria-hidden="true" size={16} />释放</button></td></tr>;
+                return <tr key={lock.id}><th scope="row"><code>{lock.id}</code><small>{formatDateTime(lock.created_at)}</small></th><td><strong>{unit ? `${unit.code} · ${unit.name}` : lock.inventory_unit_id}</strong></td><td>{lock.arrival_date} 至 {lock.departure_date}</td><td className="maintenance-reason">{lock.reason}</td><td><StatusBadge value={lock.status} /></td><td><button className="button button-compact button-secondary" type="button" onClick={() => releaseMaintenance(lock)} disabled={commandsBlocked} aria-label={`释放维修锁 ${unit?.code ?? lock.id}`}><LockOpen aria-hidden="true" size={16} />释放</button></td></tr>;
               })}</tbody>
             </table>
           </div>
         )}
       </section>
 
-      {maintenanceUnit ? <MaintenanceDialog unit={maintenanceUnit} arrivalDate={arrivalDate} departureDate={departureDate} onClose={() => setMaintenanceUnit(undefined)} onSubmit={(request) => { setMaintenanceUnit(undefined); setCommand(request); }} /> : null}
-      {command ? <CommandDialog request={command} onClose={() => setCommand(undefined)} onCommitted={() => setRefreshToken((value) => value + 1)} /> : null}
+      {maintenanceUnit ? <MaintenanceDialog unit={maintenanceUnit} arrivalDate={arrivalDate} departureDate={departureDate} onClose={() => setMaintenanceUnit(undefined)} onSubmit={(request) => { if (commandsBlocked) return; setMaintenanceUnit(undefined); startCommand(request); }} /> : null}
+      {command ? <CommandDialog
+        key={recoveryDialogOpen ? `recovery-${commandRecovery.pending?.confirmationKey ?? "missing"}` : "new-inventory-command"}
+        request={command}
+        onClose={closeCommandDialog}
+        {...(recoveryDialogOpen && commandRecovery.pending ? {
+          initialConfirmationKey: commandRecovery.pending.confirmationKey,
+          ...(commandRecovery.pending.receipt ? { initialReceipt: commandRecovery.pending.receipt } : {})
+        } : {})}
+        onProgress={(progress) => commandRecovery.track(command, progress)}
+      /> : null}
     </div>
   );
 }

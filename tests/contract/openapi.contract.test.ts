@@ -3,28 +3,39 @@ import type { FastifyInstance } from "fastify";
 import { commandTypes, recoverableCommandTypes } from "@qintopia/contracts";
 import { newOpaqueSecret } from "@qintopia/domain";
 import { buildServer } from "../../apps/api/src/server.ts";
+import { importQintopia2026ReferenceCatalog } from "@qintopia/db";
 import { demo } from "../../packages/db/src/seed.ts";
 import { resetTestDatabase } from "../helpers/database.ts";
 
 let app: FastifyInstance;
+const catalogWithoutImportPropertyId = "prop_contract_catalog_without_import";
 
 type JsonSchema = Record<string, unknown>;
 
 const commandInputContract: Record<(typeof commandTypes)[number], { required: string[]; properties: string[] }> = {
-  CREATE_ORDER: { required: ["propertyId", "quoteId", "primaryGuest"], properties: ["propertyId", "quoteId", "primaryGuest"] },
-  EXTEND_STAY: { required: ["propertyId", "orderId", "newDepartureDate"], properties: ["propertyId", "orderId", "newDepartureDate", "manualAdjustmentMinor"] },
-  SHORTEN_STAY: { required: ["propertyId", "orderId", "newDepartureDate"], properties: ["propertyId", "orderId", "newDepartureDate", "manualAdjustmentMinor"] },
-  MOVE_UNIT: { required: ["propertyId", "orderId", "newInventoryUnitId", "effectiveDate"], properties: ["propertyId", "orderId", "newInventoryUnitId", "effectiveDate", "manualAdjustmentMinor"] },
-  REPRICE_ORDER: { required: ["propertyId", "orderId", "manualAdjustmentMinor"], properties: ["propertyId", "orderId", "manualAdjustmentMinor"] },
+  CREATE_MEMBER: {
+    required: ["propertyId", "fullName", "identityCardNumber", "phone", "wechat"],
+    properties: ["propertyId", "fullName", "identityCardNumber", "phone", "wechat", "validFrom", "validUntil", "memberContractId", "sourceApplicationRecordId"]
+  },
+  CREATE_ORDER: { required: ["propertyId", "quoteId", "primaryGuest", "bookingChannelCode"], properties: ["propertyId", "quoteId", "primaryGuest", "bookingChannelCode", "channelOrderReference", "freeStayReason"] },
+  EXTEND_STAY: { required: ["propertyId", "orderId", "newDepartureDate"], properties: ["propertyId", "orderId", "newDepartureDate"] },
+  SHORTEN_STAY: { required: ["propertyId", "orderId", "newDepartureDate"], properties: ["propertyId", "orderId", "newDepartureDate"] },
+  MOVE_UNIT: { required: ["propertyId", "orderId", "newInventoryUnitId", "effectiveDate"], properties: ["propertyId", "orderId", "newInventoryUnitId", "effectiveDate"] },
+  REPRICE_ORDER: { required: ["propertyId", "orderId", "targetCurrentContractAmountMinor"], properties: ["propertyId", "orderId", "targetCurrentContractAmountMinor"] },
   CANCEL_ORDER: { required: ["propertyId", "orderId"], properties: ["propertyId", "orderId"] },
   MARK_NO_SHOW: { required: ["propertyId", "orderId"], properties: ["propertyId", "orderId"] },
   LOCK_MAINTENANCE: { required: ["propertyId", "inventoryUnitId", "arrivalDate", "departureDate", "reason"], properties: ["propertyId", "inventoryUnitId", "arrivalDate", "departureDate", "reason"] },
   RELEASE_MAINTENANCE: { required: ["propertyId", "maintenanceLockId"], properties: ["propertyId", "maintenanceLockId"] },
-  RECORD_COLLECTION: { required: ["propertyId", "orderId", "amountMinor", "method"], properties: ["propertyId", "orderId", "amountMinor", "method", "note"] },
-  RECORD_REFUND: { required: ["propertyId", "orderId", "amountMinor", "referencesFactId", "method"], properties: ["propertyId", "orderId", "amountMinor", "referencesFactId", "method", "note"] },
+  RECORD_COLLECTION: { required: ["propertyId", "orderId", "amountMinor", "method", "transactionReference"], properties: ["propertyId", "orderId", "amountMinor", "method", "transactionReference", "note"] },
+  RECORD_REFUND: { required: ["propertyId", "orderId", "amountMinor", "referencesFactId", "method", "transactionReference"], properties: ["propertyId", "orderId", "amountMinor", "referencesFactId", "method", "transactionReference", "note"] },
   REVERSE_FACT: { required: ["propertyId", "orderId", "reversesFactId", "note"], properties: ["propertyId", "orderId", "reversesFactId", "note"] },
   CHECK_IN: { required: ["propertyId", "orderId"], properties: ["propertyId", "orderId"] },
   CHECK_OUT: { required: ["propertyId", "orderId"], properties: ["propertyId", "orderId"] },
+  REFRESH_MEMBER_COVERAGE: { required: ["propertyId", "orderId"], properties: ["propertyId", "orderId"] },
+  ADD_MEMBER_ENTITLEMENT_LOT: {
+    required: ["propertyId", "memberContractId", "unitKind", "units", "expiresOn"],
+    properties: ["propertyId", "memberContractId", "unitKind", "units", "expiresOn"]
+  },
   ADJUST_MEMBER_ENTITLEMENT: { required: ["propertyId", "entitlementLotId", "quantityDelta", "adjustmentReason"], properties: ["propertyId", "entitlementLotId", "quantityDelta", "adjustmentReason"] },
   EXPIRE_MEMBER_ENTITLEMENT: { required: ["propertyId", "entitlementLotId", "asOfDate"], properties: ["propertyId", "entitlementLotId", "asOfDate"] },
   ISSUE_TOKEN: { required: ["propertyId", "subjectId", "label", "accessCeiling", "expiresAt", "tokenSecret"], properties: ["propertyId", "subjectId", "label", "accessCeiling", "expiresAt", "tokenSecret"] },
@@ -50,12 +61,25 @@ function arbitraryRecordLocations(schema: unknown, path = "schema"): string[] {
 
 beforeAll(async () => {
   const db = await resetTestDatabase();
+  await db.insertInto("properties").values({
+    id: catalogWithoutImportPropertyId,
+    code: "QTP-NO-CATALOG",
+    name: "Property without reference import",
+    timezone: "Asia/Shanghai",
+    currency: "CNY"
+  }).execute();
+  await db.insertInto("subject_property_grants").values({
+    subject_id: demo.operatorSubjectId,
+    property_id: catalogWithoutImportPropertyId,
+    access_level: "READ"
+  }).execute();
+  await importQintopia2026ReferenceCatalog(db);
   app = await buildServer(db);
   await app.ready();
 });
 
 afterAll(async () => {
-  await app.close();
+  if (app) await app.close();
 });
 
 describe("OpenAPI 3.1 command contract", () => {
@@ -110,6 +134,8 @@ describe("OpenAPI 3.1 command contract", () => {
       "/api/v1/command-results",
       "/api/v1/receipts/{id}",
       "/api/v1/facts/{id}",
+      "/api/v1/members",
+      "/api/v1/members/{id}",
       "/api/v1/maintenance-locks"
     ]) expect(document.paths[path]).toBeDefined();
     const headerParameters = document.paths["/api/v1/command-previews"].post.parameters;
@@ -148,6 +174,14 @@ describe("OpenAPI 3.1 command contract", () => {
     const createInput = (variants.get("CREATE_ORDER")!.properties as Record<string, JsonSchema>).input!;
     const createGuest = ((createInput.properties as Record<string, JsonSchema>).primaryGuest)!;
     expect(createGuest).toMatchObject({ additionalProperties: false, required: ["fullName"] });
+    const createChannel = ((createInput.properties as Record<string, JsonSchema>).bookingChannelCode)!;
+    const createChannelVariants = createChannel.anyOf as Array<{ enum: string[] }>;
+    expect(createChannelVariants.map((variant) => variant.enum[0])).toEqual(["YOUMUDAO", "CTRIP", "MEITUAN", "WECOM"]);
+    expect(JSON.stringify((createInput.properties as Record<string, JsonSchema>).channelOrderReference)).toContain('"type":"null"');
+    expect((createInput.properties as Record<string, JsonSchema>).freeStayReason).toMatchObject({ minLength: 1, maxLength: 1000 });
+    const createMemberInput = (variants.get("CREATE_MEMBER")!.properties as Record<string, JsonSchema>).input!;
+    expect((createMemberInput.properties as Record<string, JsonSchema>).identityCardNumber).toMatchObject({ minLength: 1, maxLength: 200 });
+    expect((createMemberInput.properties as Record<string, JsonSchema>).validFrom).toMatchObject({ pattern: "^\\d{4}-\\d{2}-\\d{2}$" });
     const expiryInput = (variants.get("EXPIRE_MEMBER_ENTITLEMENT")!.properties as Record<string, JsonSchema>).input!;
     expect((expiryInput.properties as Record<string, JsonSchema>).asOfDate!).toMatchObject({ pattern: "^\\d{4}-\\d{2}-\\d{2}$" });
     for (const commandType of ["ISSUE_TOKEN", "ROTATE_TOKEN"] as const) {
@@ -159,11 +193,14 @@ describe("OpenAPI 3.1 command contract", () => {
       });
       expect(tokenInput.properties).not.toHaveProperty("tokenSecretHash");
     }
+    const topLevelErrorCode = document.paths["/api/v1/command-previews"].post.responses["400"].content["application/json"].schema.properties.code;
+    expect(topLevelErrorCode.anyOf.map((variant: { enum: string[] }) => variant.enum[0])).not.toContain("PREVIEW_EXPIRED");
     const repriceInput = (variants.get("REPRICE_ORDER")!.properties as Record<string, JsonSchema>).input!;
-    expect((repriceInput.properties as Record<string, JsonSchema>).manualAdjustmentMinor).toMatchObject({
+    expect((repriceInput.properties as Record<string, JsonSchema>).targetCurrentContractAmountMinor).toMatchObject({
       type: "integer",
-      minimum: Number.MIN_SAFE_INTEGER,
-      maximum: Number.MAX_SAFE_INTEGER
+      minimum: 0,
+      maximum: Number.MAX_SAFE_INTEGER,
+      multipleOf: 100
     });
   });
 
@@ -189,6 +226,9 @@ describe("OpenAPI 3.1 command contract", () => {
     expect(errorSchema.properties.details.anyOf).toHaveLength(12);
     const receiptSchema = document.paths["/api/v1/receipts/{id}"].get.responses["200"].content["application/json"].schema;
     expect(JSON.stringify(receiptSchema)).not.toContain("tokenSecret");
+    expect(JSON.stringify(receiptSchema)).toContain("bookingChannelCode");
+    expect(JSON.stringify(receiptSchema)).toContain("channelOrderReference");
+    expect(JSON.stringify(receiptSchema)).toContain("transactionReference");
 
     for (const [path, pathItem] of Object.entries(document.paths) as Array<[string, Record<string, unknown>]>) {
       if (!path.startsWith("/api/v1/")) continue;
@@ -204,8 +244,10 @@ describe("OpenAPI 3.1 command contract", () => {
     const document = response.json();
     const coreResponses: Array<[string, string]> = [
       ["/api/v1/meta", "get"],
+      ["/api/v1/properties/{id}/reference-catalog", "get"],
       ["/api/v1/orders", "get"],
       ["/api/v1/orders/{id}", "get"],
+      ["/api/v1/members", "get"],
       ["/api/v1/members/{id}", "get"],
       ["/api/v1/facts/{id}", "get"],
       ["/api/v1/maintenance-locks", "get"],
@@ -223,6 +265,74 @@ describe("OpenAPI 3.1 command contract", () => {
     const confirmConflictSchema = document.paths["/api/v1/command-previews/{previewId}/confirm"].post.responses["409"].content["application/json"].schema;
     expect(confirmConflictSchema.anyOf).toHaveLength(2);
     expect(arbitraryRecordLocations(confirmConflictSchema)).toEqual([]);
+  });
+
+  it("serves the imported catalog as reference-only data", async () => {
+    const response = await app.inject({
+      method: "GET",
+      url: `/api/v1/properties/${demo.propertyId}/reference-catalog`,
+      headers: { authorization: `Bearer ${demo.readToken}` }
+    });
+    expect(response.statusCode).toBe(200);
+    const catalog = response.json();
+    expect(catalog.batch).toMatchObject({ sourceRevision: 561, executionState: "REFERENCE_ONLY" });
+    expect(catalog.batch).not.toHaveProperty("sourceDocumentToken");
+    expect(catalog.inventoryEntries).toHaveLength(8);
+    expect(catalog.rates).toHaveLength(32);
+    expect(catalog.membershipProducts).toHaveLength(3);
+    expect(catalog.unresolvedIssues.length).toBeGreaterThan(0);
+    expect(catalog.rates.every((rate: { executionState: string }) => rate.executionState === "REFERENCE_ONLY")).toBe(true);
+
+    const openapi = (await app.inject({ method: "GET", url: "/api/v1/openapi.json" })).json();
+    const batchSchema = openapi.paths["/api/v1/properties/{id}/reference-catalog"].get
+      .responses["200"].content["application/json"].schema.properties.batch;
+    expect(batchSchema.properties).not.toHaveProperty("sourceDocumentToken");
+  });
+
+  it("enforces authentication, property scope, and an in-scope missing-catalog 404", async () => {
+    const unauthenticated = await app.inject({
+      method: "GET",
+      url: `/api/v1/properties/${demo.propertyId}/reference-catalog`
+    });
+    expect(unauthenticated.statusCode).toBe(401);
+    expect(unauthenticated.json()).toMatchObject({
+      code: "AUTHENTICATION_REQUIRED",
+      correlationId: expect.any(String),
+      retryable: false
+    });
+
+    const outsideTokenScope = await app.inject({
+      method: "GET",
+      url: `/api/v1/properties/${catalogWithoutImportPropertyId}/reference-catalog`,
+      headers: { authorization: `Bearer ${demo.readToken}` }
+    });
+    expect(outsideTokenScope.statusCode).toBe(403);
+    expect(outsideTokenScope.json()).toMatchObject({
+      code: "RESOURCE_SCOPE_DENIED",
+      correlationId: expect.any(String),
+      retryable: false
+    });
+
+    const login = await app.inject({
+      method: "POST",
+      url: "/api/v1/auth/login",
+      payload: { username: "operator", password: "demo-pass-2026" }
+    });
+    expect(login.statusCode).toBe(200);
+    const session = login.cookies.find((entry) => entry.name === "qintopia_session");
+    expect(session).toBeDefined();
+    const missingCatalog = await app.inject({
+      method: "GET",
+      url: `/api/v1/properties/${catalogWithoutImportPropertyId}/reference-catalog`,
+      cookies: { qintopia_session: session!.value }
+    });
+    expect(missingCatalog.statusCode).toBe(404);
+    expect(missingCatalog.json()).toMatchObject({
+      code: "NOT_FOUND",
+      message: "Reference catalog not found",
+      correlationId: expect.any(String),
+      retryable: false
+    });
   });
 
   it("publishes and enforces the scoped maintenance-lock query contract", async () => {
@@ -446,7 +556,9 @@ describe("OpenAPI 3.1 command contract", () => {
     const created = await command(demo.writeToken, "CREATE_ORDER", {
       propertyId: demo.propertyId,
       quoteId: quoteResponse.json().quote.quoteId,
-      primaryGuest: { fullName: "Contract View Guest", phone: "13800000000", documentNumber: "DOC-CONTRACT-1" }
+      primaryGuest: { fullName: "Contract View Guest", phone: "13800000000", documentNumber: "DOC-CONTRACT-1" },
+      bookingChannelCode: "CTRIP",
+      channelOrderReference: "TEST-CONTRACT-ORDER-1"
     });
     const orderId = created.result.orderId as string;
     const listed = await app.inject({
@@ -461,12 +573,12 @@ describe("OpenAPI 3.1 command contract", () => {
     });
     expect(detail.statusCode).toBe(200);
     expect(detail.json()).toMatchObject({
-      order: { id: orderId, primary_guest_snapshot: { fullName: "Contract View Guest" } },
+      order: { id: orderId, primary_guest_snapshot: { fullName: "Contract View Guest" }, booking_channel_code: "CTRIP", channel_order_reference: "TEST-CONTRACT-ORDER-1" },
       stay: { status: "PLANNED" },
       pricingRevisions: [{ revision_no: 1 }]
     });
     const collection = await command(demo.writeToken, "RECORD_COLLECTION", {
-      propertyId: demo.propertyId, orderId, amountMinor: 6_000, method: "CASH", note: "Contract fact"
+      propertyId: demo.propertyId, orderId, amountMinor: 6_000, method: "CASH", transactionReference: "TEST-CONTRACT-TXN-COLLECTION-1", note: "Contract fact"
     });
     const factId = collection.result.factId as string;
     const fact = await app.inject({
@@ -474,13 +586,55 @@ describe("OpenAPI 3.1 command contract", () => {
       headers: { authorization: `Bearer ${demo.writeToken}` }
     });
     expect(fact.statusCode).toBe(200);
-    expect(fact.json()).toMatchObject({ fact_id: factId, order_id: orderId, fact_type: "COLLECTION", property_id: demo.propertyId });
+    expect(fact.json()).toMatchObject({ fact_id: factId, order_id: orderId, fact_type: "COLLECTION", transaction_reference: "TEST-CONTRACT-TXN-COLLECTION-1", property_id: demo.propertyId });
+    const registeredMember = await command(demo.writeToken, "CREATE_MEMBER", {
+      propertyId: demo.propertyId,
+      fullName: "Contract API Member",
+      identityCardNumber: "test-contract-api-member-id",
+      phone: "13800000333",
+      wechat: "contract-api-member",
+      validFrom: "2026-11-01",
+      validUntil: "2027-10-31",
+      sourceApplicationRecordId: "rec_contract_api_member"
+    });
+    expect(registeredMember.result).toMatchObject({
+      memberCreated: true,
+      memberContractCreated: true,
+      externalReferenceCreated: true
+    });
+    const memberId = registeredMember.result.memberId as string;
+    const memberContractId = registeredMember.result.memberContractId as string;
+    expect(registeredMember.resourceRefs).toEqual([
+      memberId,
+      memberContractId,
+      registeredMember.result.memberExternalReferenceId
+    ]);
+    const memberSearch = await app.inject({
+      method: "GET",
+      url: `/api/v1/members?propertyId=${demo.propertyId}&identityCardNumber=TEST-CONTRACT-API-MEMBER-ID`,
+      headers: { authorization: `Bearer ${demo.writeToken}` }
+    });
+    expect(memberSearch.statusCode).toBe(200);
+    expect(memberSearch.json()).toMatchObject({
+      members: [{
+        member: { id: memberId, identity_card_number: "TEST-CONTRACT-API-MEMBER-ID", full_name: "Contract API Member" },
+        contracts: [{ id: memberContractId, member_id: memberId }],
+        availableBalance: { ROOM_NIGHT: 0, BED_NIGHT: 0 }
+      }]
+    });
     const member = await app.inject({
-      method: "GET", url: `/api/v1/members/${demo.memberContractId}`,
+      method: "GET", url: `/api/v1/members/${memberId}?propertyId=${demo.propertyId}`,
       headers: { authorization: `Bearer ${demo.writeToken}` }
     });
     expect(member.statusCode).toBe(200);
-    expect(member.json()).toMatchObject({ contract: { id: demo.memberContractId }, lots: expect.any(Array), ledger: expect.any(Array) });
+    expect(member.json()).toMatchObject({
+      member: { id: memberId, identity_card_number: "TEST-CONTRACT-API-MEMBER-ID" },
+      contracts: [{ id: memberContractId, member_id: memberId }],
+      lots: [],
+      ledger: [],
+      externalReferences: [{ provider: "FEISHU_BASE", external_record_id: "rec_contract_api_member", property_id: demo.propertyId }],
+      availableBalance: { ROOM_NIGHT: 0, BED_NIGHT: 0 }
+    });
     const audit = await app.inject({
       method: "GET", url: `/api/v1/audit?propertyId=${demo.propertyId}`,
       headers: { authorization: `Bearer ${demo.writeToken}` }

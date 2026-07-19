@@ -1,0 +1,130 @@
+{
+  "caseId": "rev561-custom-cross-month-product-move",
+  "anonymizedOrderRef": "OWNER-CONFIRMED-RULE-CROSS-MONTH-MOVE",
+  "businessExplanation": "A continuous cross-month move uses one 14-night band and each segment's product anchor before one final rounding.",
+  "businessPlan": "CUSTOM",
+  "scenarioTags": ["MOVE", "CROSS_MONTH"],
+  "propertyTimeZone": "Asia/Shanghai",
+  "currency": "CNY",
+  "inventoryUnitKind": "BED",
+  "arrivalDate": "2026-03-25",
+  "departureDate": "2026-04-08",
+  "departureCharged": false,
+  "priceInputs": {
+    "policyVersionReference": "policy_qintopia_public_2026_rev561_v1",
+    "initialProductCode": "shared_bath_double_bed",
+    "initialInventoryUnitReference": "BED-104-A"
+  },
+  "coverageSet": [],
+  "amendments": [{
+    "sequence": 2,
+    "amendmentType": "MOVE_UNIT",
+    "requestedAt": "2026-03-31T08:00:00.000Z",
+    "input": {
+      "effectiveDate": "2026-04-01",
+      "newProductCode": "shared_bath_single_room",
+      "newInventoryUnitReference": "ROOM-201",
+      "reason": "Owner-confirmed cross-product move fact"
+    }
+  }],
+  "rounding": { "stage": "FINAL_STAY_TOTAL", "unit": "CNY_YUAN", "mode": "HALF_UP_POSITIVE" },
+  "expected": {
+    "pricingRevisions": [
+      {
+        "revisionNo": 1,
+        "amendmentType": "CREATE_ORDER",
+        "pricingPolicyVersionReference": "policy_qintopia_public_2026_rev561_v1",
+        "arrivalDate": "2026-03-25",
+        "departureDate": "2026-04-08",
+        "coverageSet": [],
+        "cashLines": [{
+          "lineKind": "STAY_TOTAL",
+          "pricingBandAnchorNights": 14,
+          "calculationSegments": [{
+            "inventoryUnitReference": "BED-104-A",
+            "pricingProductCode": "shared_bath_double_bed",
+            "arrivalDate": "2026-03-25",
+            "departureDate": "2026-04-08",
+            "nights": 14,
+            "anchorAmountMinor": 55000,
+            "numeratorMinor": 770000,
+            "denominator": 14
+          }],
+          "amountMinor": 55000
+        }],
+        "manualAdjustmentMinor": 0,
+        "cashRemainderMinor": 55000,
+        "currentContractAmountMinor": 55000,
+        "roundingEvidence": { "rule": "FINAL_STAY_TOTAL_WHOLE_YUAN_HALF_UP", "pricingBandAnchorNights": 14 }
+      },
+      {
+        "revisionNo": 2,
+        "amendmentType": "MOVE_UNIT",
+        "pricingPolicyVersionReference": "policy_qintopia_public_2026_rev561_v1",
+        "arrivalDate": "2026-03-25",
+        "departureDate": "2026-04-08",
+        "coverageSet": [],
+        "cashLines": [{
+          "lineKind": "STAY_TOTAL",
+          "pricingBandAnchorNights": 14,
+          "calculationSegments": [
+            {
+              "inventoryUnitReference": "BED-104-A",
+              "pricingProductCode": "shared_bath_double_bed",
+              "arrivalDate": "2026-03-25",
+              "departureDate": "2026-04-01",
+              "nights": 7,
+              "anchorAmountMinor": 55000,
+              "numeratorMinor": 385000,
+              "denominator": 14
+            },
+            {
+              "inventoryUnitReference": "ROOM-201",
+              "pricingProductCode": "shared_bath_single_room",
+              "arrivalDate": "2026-04-01",
+              "departureDate": "2026-04-08",
+              "nights": 7,
+              "anchorAmountMinor": 82000,
+              "numeratorMinor": 574000,
+              "denominator": 14
+            }
+          ],
+          "amountMinor": 68500
+        }],
+        "manualAdjustmentMinor": 0,
+        "cashRemainderMinor": 68500,
+        "currentContractAmountMinor": 68500,
+        "roundingEvidence": { "rule": "FINAL_STAY_TOTAL_WHOLE_YUAN_HALF_UP", "pricingBandAnchorNights": 14 }
+      }
+    ],
+    "cashLines": [{
+      "lineKind": "STAY_TOTAL",
+      "pricingBandAnchorNights": 14,
+      "calculationSegments": [
+        {
+          "inventoryUnitReference": "BED-104-A",
+          "pricingProductCode": "shared_bath_double_bed",
+          "arrivalDate": "2026-03-25",
+          "departureDate": "2026-04-01",
+          "nights": 7,
+          "anchorAmountMinor": 55000,
+          "numeratorMinor": 385000,
+          "denominator": 14
+        },
+        {
+          "inventoryUnitReference": "ROOM-201",
+          "pricingProductCode": "shared_bath_single_room",
+          "arrivalDate": "2026-04-01",
+          "departureDate": "2026-04-08",
+          "nights": 7,
+          "anchorAmountMinor": 82000,
+          "numeratorMinor": 574000,
+          "denominator": 14
+        }
+      ],
+      "amountMinor": 68500
+    }],
+    "cashRemainderMinor": 68500,
+    "currentContractAmountMinor": 68500
+  }
+}

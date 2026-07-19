@@ -1,0 +1,102 @@
+{
+  "caseId": "rev561-monthly-extend-29-to-30",
+  "anonymizedOrderRef": "OWNER-CONFIRMED-RULE-EXTEND-29-TO-30",
+  "businessExplanation": "Extension counts all nights from original arrival, reselects the 30-night band, and accepts the resulting price inversion.",
+  "businessPlan": "MONTHLY",
+  "scenarioTags": ["EXTEND"],
+  "propertyTimeZone": "Asia/Shanghai",
+  "currency": "CNY",
+  "inventoryUnitKind": "ROOM",
+  "arrivalDate": "2026-03-01",
+  "departureDate": "2026-03-31",
+  "departureCharged": false,
+  "priceInputs": {
+    "policyVersionReference": "policy_qintopia_public_2026_rev561_v1",
+    "initialProductCode": "private_bath_suite_room",
+    "initialInventoryUnitReference": "ROOM-E-GEN-03",
+    "initialDepartureDate": "2026-03-30"
+  },
+  "coverageSet": [],
+  "amendments": [{
+    "sequence": 2,
+    "amendmentType": "EXTEND_STAY",
+    "requestedAt": "2026-03-20T06:00:00.000Z",
+    "input": { "newDepartureDate": "2026-03-31", "reason": "Owner-confirmed cumulative extension fact" }
+  }],
+  "rounding": { "stage": "FINAL_STAY_TOTAL", "unit": "CNY_YUAN", "mode": "HALF_UP_POSITIVE" },
+  "expected": {
+    "pricingRevisions": [
+      {
+        "revisionNo": 1,
+        "amendmentType": "CREATE_ORDER",
+        "pricingPolicyVersionReference": "policy_qintopia_public_2026_rev561_v1",
+        "arrivalDate": "2026-03-01",
+        "departureDate": "2026-03-30",
+        "coverageSet": [],
+        "cashLines": [{
+          "lineKind": "STAY_TOTAL",
+          "pricingBandAnchorNights": 14,
+          "calculationSegments": [{
+            "inventoryUnitReference": "ROOM-E-GEN-03",
+            "pricingProductCode": "private_bath_suite_room",
+            "arrivalDate": "2026-03-01",
+            "departureDate": "2026-03-30",
+            "nights": 29,
+            "anchorAmountMinor": 188000,
+            "numeratorMinor": 5452000,
+            "denominator": 14
+          }],
+          "amountMinor": 389400
+        }],
+        "manualAdjustmentMinor": 0,
+        "cashRemainderMinor": 389400,
+        "currentContractAmountMinor": 389400,
+        "roundingEvidence": { "rule": "FINAL_STAY_TOTAL_WHOLE_YUAN_HALF_UP", "pricingBandAnchorNights": 14 }
+      },
+      {
+        "revisionNo": 2,
+        "amendmentType": "EXTEND_STAY",
+        "pricingPolicyVersionReference": "policy_qintopia_public_2026_rev561_v1",
+        "arrivalDate": "2026-03-01",
+        "departureDate": "2026-03-31",
+        "coverageSet": [],
+        "cashLines": [{
+          "lineKind": "STAY_TOTAL",
+          "pricingBandAnchorNights": 30,
+          "calculationSegments": [{
+            "inventoryUnitReference": "ROOM-E-GEN-03",
+            "pricingProductCode": "private_bath_suite_room",
+            "arrivalDate": "2026-03-01",
+            "departureDate": "2026-03-31",
+            "nights": 30,
+            "anchorAmountMinor": 320000,
+            "numeratorMinor": 9600000,
+            "denominator": 30
+          }],
+          "amountMinor": 320000
+        }],
+        "manualAdjustmentMinor": 0,
+        "cashRemainderMinor": 320000,
+        "currentContractAmountMinor": 320000,
+        "roundingEvidence": { "rule": "FINAL_STAY_TOTAL_WHOLE_YUAN_HALF_UP", "pricingBandAnchorNights": 30 }
+      }
+    ],
+    "cashLines": [{
+      "lineKind": "STAY_TOTAL",
+      "pricingBandAnchorNights": 30,
+      "calculationSegments": [{
+        "inventoryUnitReference": "ROOM-E-GEN-03",
+        "pricingProductCode": "private_bath_suite_room",
+        "arrivalDate": "2026-03-01",
+        "departureDate": "2026-03-31",
+        "nights": 30,
+        "anchorAmountMinor": 320000,
+        "numeratorMinor": 9600000,
+        "denominator": 30
+      }],
+      "amountMinor": 320000
+    }],
+    "cashRemainderMinor": 320000,
+    "currentContractAmountMinor": 320000
+  }
+}

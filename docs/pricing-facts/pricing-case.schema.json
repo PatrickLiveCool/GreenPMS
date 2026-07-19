@@ -25,20 +25,84 @@
     "priceInputs": { "type": "object", "additionalProperties": true },
     "coverageSet": {
       "type": "array",
+      "uniqueItems": true,
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["serviceDate", "unitKind"],
-        "properties": { "serviceDate": { "type": "string", "format": "date" }, "unitKind": { "enum": ["ROOM_NIGHT", "BED_NIGHT"] } }
+        "required": ["serviceDate", "inventoryUnitReference", "unitKind"],
+        "properties": {
+          "serviceDate": { "type": "string", "format": "date" },
+          "inventoryUnitReference": { "type": "string", "minLength": 1 },
+          "unitKind": { "enum": ["ROOM_NIGHT", "BED_NIGHT"] }
+        }
       }
     },
-    "amendments": { "type": "array", "items": { "type": "object", "additionalProperties": true } },
+    "amendments": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["sequence", "amendmentType", "requestedAt", "input"],
+        "properties": {
+          "sequence": { "type": "integer", "minimum": 2 },
+          "amendmentType": { "enum": ["SHORTEN_STAY", "EXTEND_STAY", "MOVE_UNIT", "REPRICE_ORDER"] },
+          "requestedAt": { "type": "string", "format": "date-time" },
+          "input": { "type": "object", "minProperties": 1, "additionalProperties": true }
+        }
+      }
+    },
     "rounding": { "type": "object", "additionalProperties": true },
+    "boundaryEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["boundaryName", "comparisonCaseId", "observedBehaviorChange"],
+      "properties": {
+        "boundaryName": { "type": "string", "minLength": 1 },
+        "comparisonCaseId": { "type": "string", "minLength": 1 },
+        "observedBehaviorChange": { "type": "string", "minLength": 1 }
+      }
+    },
     "expected": {
       "type": "object",
-      "required": ["cashLines", "cashRemainderMinor", "currentContractAmountMinor"],
+      "additionalProperties": false,
+      "required": ["pricingRevisions", "cashLines", "cashRemainderMinor", "currentContractAmountMinor"],
       "properties": {
-        "cashLines": { "type": "array", "items": { "type": "object", "additionalProperties": true } },
+        "pricingRevisions": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["revisionNo", "amendmentType", "pricingPolicyVersionReference", "arrivalDate", "departureDate", "coverageSet", "cashLines", "manualAdjustmentMinor", "cashRemainderMinor", "currentContractAmountMinor", "roundingEvidence"],
+            "properties": {
+              "revisionNo": { "type": "integer", "minimum": 1 },
+              "amendmentType": { "enum": ["CREATE_ORDER", "SHORTEN_STAY", "EXTEND_STAY", "MOVE_UNIT", "REPRICE_ORDER"] },
+              "pricingPolicyVersionReference": { "type": "string", "minLength": 1 },
+              "arrivalDate": { "type": "string", "format": "date" },
+              "departureDate": { "type": "string", "format": "date" },
+              "coverageSet": {
+                "type": "array",
+                "uniqueItems": true,
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["serviceDate", "inventoryUnitReference", "unitKind"],
+                  "properties": {
+                    "serviceDate": { "type": "string", "format": "date" },
+                    "inventoryUnitReference": { "type": "string", "minLength": 1 },
+                    "unitKind": { "enum": ["ROOM_NIGHT", "BED_NIGHT"] }
+                  }
+                }
+              },
+              "cashLines": { "type": "array", "items": { "type": "object", "minProperties": 1, "additionalProperties": true } },
+              "manualAdjustmentMinor": { "type": "integer" },
+              "cashRemainderMinor": { "type": "integer" },
+              "currentContractAmountMinor": { "type": "integer" },
+              "roundingEvidence": { "type": "object", "minProperties": 1, "additionalProperties": true }
+            }
+          }
+        },
+        "cashLines": { "type": "array", "items": { "type": "object", "minProperties": 1, "additionalProperties": true } },
         "cashRemainderMinor": { "type": "integer" },
         "currentContractAmountMinor": { "type": "integer" }
       }

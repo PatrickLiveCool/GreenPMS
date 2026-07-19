@@ -3,7 +3,7 @@ import type { FastifyInstance } from "fastify";
 import { FormatRegistry } from "@sinclair/typebox";
 import { Value } from "@sinclair/typebox/value";
 import { commandTypes, type CommandType } from "@qintopia/contracts";
-import { newOpaqueSecret } from "@qintopia/domain";
+import { newOpaqueSecret, parseLocalDate, todayInTimeZone } from "@qintopia/domain";
 import type { Database } from "@qintopia/db";
 import type { Kysely } from "kysely";
 import { CommandEffectSchema } from "../../apps/api/src/schemas.ts";
@@ -15,20 +15,23 @@ const effectContractDatabaseUrl = process.env.EFFECT_CONTRACT_DATABASE_URL
   ?? "postgres://qintopia:qintopia@127.0.0.1:55432/qintopia_effect_contract";
 
 const expectedEffectKeys: Record<CommandType, string[]> = {
-  CREATE_ORDER: ["arrivalDate", "departureDate", "inventoryUnit", "memberContractId", "pricing", "pricingPolicyVersionId", "primaryGuest", "quoteId", "stayType"],
+  CREATE_MEMBER: ["contract", "externalReference", "member", "memberContractId", "memberId", "operation", "profileMatch", "submittedProfile"],
+  CREATE_ORDER: ["arrivalDate", "bookingChannelCode", "channelOrderReference", "departureDate", "freeStayReason", "inventoryUnit", "memberContractId", "pricing", "pricingPolicyVersionId", "primaryGuest", "quoteId", "stayType"],
   EXTEND_STAY: ["after", "before", "inventoryUnitId", "orderId"],
   SHORTEN_STAY: ["after", "before", "inventoryUnitId", "orderId"],
   MOVE_UNIT: ["effectiveDate", "fromInventoryUnit", "orderId", "pricing", "stayTimeline", "toInventoryUnit"],
-  REPRICE_ORDER: ["before", "inventoryUnitId", "manualAdjustmentMinor", "orderId", "pricing", "stayTimeline"],
-  CANCEL_ORDER: ["fromStatus", "inventoryUnitId", "orderId", "toStatus"],
-  MARK_NO_SHOW: ["fromStatus", "inventoryUnitId", "orderId", "toStatus"],
+  REPRICE_ORDER: ["before", "inventoryUnitId", "manualAdjustmentMinor", "orderId", "policyBaseAmount", "pricing", "stayTimeline", "targetCurrentContractAmount"],
+  CANCEL_ORDER: ["currentContractAmount", "entitlementTransition", "freeStayReason", "fromStatus", "inventoryUnitId", "orderId", "toStatus"],
+  MARK_NO_SHOW: ["currentContractAmount", "entitlementTransition", "freeStayReason", "fromStatus", "inventoryUnitId", "orderId", "toStatus"],
   LOCK_MAINTENANCE: ["arrivalDate", "departureDate", "inventoryUnit", "reason"],
   RELEASE_MAINTENANCE: ["arrivalDate", "departureDate", "inventoryUnitId", "maintenanceLockId"],
-  RECORD_COLLECTION: ["amountMinor", "currency", "method", "note", "orderId"],
-  RECORD_REFUND: ["amountMinor", "currency", "method", "note", "orderId", "referencesFactId"],
+  RECORD_COLLECTION: ["amountMinor", "currency", "method", "note", "orderId", "transactionReference"],
+  RECORD_REFUND: ["amountMinor", "currency", "method", "note", "orderId", "referencesFactId", "transactionReference"],
   REVERSE_FACT: ["amountMinor", "currency", "netEffectMinor", "note", "orderId", "reversesFactId"],
-  CHECK_IN: ["fromStatus", "inventoryUnitId", "orderId", "toStatus"],
+  CHECK_IN: ["entitlementTransition", "fromStatus", "inventoryUnitId", "orderId", "toStatus"],
   CHECK_OUT: ["amounts", "fromStatus", "inventoryUnitId", "orderId", "toStatus"],
+  REFRESH_MEMBER_COVERAGE: ["before", "inventoryUnitId", "orderId", "pricing", "stayTimeline"],
+  ADD_MEMBER_ENTITLEMENT_LOT: ["contractId", "expiresOn", "unitKind", "units"],
   ADJUST_MEMBER_ENTITLEMENT: ["adjustmentReason", "availableAfter", "availableBefore", "contractId", "entitlementLotId", "quantityDelta", "unitKind"],
   EXPIRE_MEMBER_ENTITLEMENT: ["asOfDate", "contractId", "entitlementLotId", "entryType", "expiresOn", "quantityDelta", "remainingAvailable", "unitKind"],
   ISSUE_TOKEN: ["accessCeiling", "expiresAt", "label", "subjectId"],
@@ -46,6 +49,12 @@ type Preview = {
 let app: FastifyInstance;
 let db: Kysely<Database>;
 let sequence = 0;
+
+function shiftLocalDate(value: string, days: number): string {
+  const date = parseLocalDate(value);
+  date.setUTCDate(date.getUTCDate() + days);
+  return date.toISOString().slice(0, 10);
+}
 
 function headers(prefix: string) {
   sequence += 1;
@@ -89,7 +98,7 @@ async function confirm(preview: Preview): Promise<Record<string, unknown>> {
   return (response.json() as { result: Record<string, unknown> }).result;
 }
 
-async function quote() {
+async function quote(options: { arrivalDate?: string; departureDate?: string; memberContractId?: string } = {}) {
   const response = await app.inject({
     method: "POST",
     url: "/api/v1/quotes",
@@ -98,9 +107,10 @@ async function quote() {
       propertyId: demo.propertyId,
       inventoryUnitId: demo.roomId,
       stayType: "TRANSIENT",
-      arrivalDate: "2028-04-10",
-      departureDate: "2028-04-14",
-      pricingPolicyVersionId: demo.transientPolicyId
+      arrivalDate: options.arrivalDate ?? "2028-04-10",
+      departureDate: options.departureDate ?? "2028-04-14",
+      pricingPolicyVersionId: demo.transientPolicyId,
+      ...(options.memberContractId ? { memberContractId: options.memberContractId } : {})
     }
   });
   expect(response.statusCode, response.body).toBe(200);
@@ -129,6 +139,16 @@ describe("Command effect HTTP contract", () => {
       return preview;
     };
 
+    await capture("CREATE_MEMBER", {
+      propertyId: demo.propertyId,
+      fullName: "Effect Contract Member",
+      identityCardNumber: "TEST-EFFECT-MEMBER-ID-001",
+      phone: "13800000001",
+      wechat: "effect-contract-member",
+      validFrom: "2028-01-01",
+      validUntil: "2029-12-31"
+    });
+
     const maintenance = await capture("LOCK_MAINTENANCE", {
       propertyId: demo.propertyId,
       inventoryUnitId: demo.secondRoomId,
@@ -142,16 +162,46 @@ describe("Command effect HTTP contract", () => {
       maintenanceLockId: maintenanceResult.maintenanceLockId
     });
 
+    await capture("ADD_MEMBER_ENTITLEMENT_LOT", {
+      propertyId: demo.propertyId,
+      memberContractId: demo.memberContractId,
+      unitKind: "ROOM_NIGHT",
+      units: 1,
+      expiresOn: "2029-12-31"
+    });
     await capture("ADJUST_MEMBER_ENTITLEMENT", {
       propertyId: demo.propertyId,
       entitlementLotId: demo.roomLotId,
       quantityDelta: 1,
       adjustmentReason: "Effect contract adjustment"
     });
+
+    const propertyToday = todayInTimeZone("Asia/Shanghai");
+    const expiredOn = shiftLocalDate(propertyToday, -1);
+    const expiryContractId = "member_contract_effect_expiry";
+    const expiredLotId = "entitlement_lot_effect_expiry";
+    await db.insertInto("member_contracts").values({
+      id: expiryContractId,
+      property_id: demo.propertyId,
+      member_id: demo.memberId,
+      member_name: "Effect Contract Expiry Member",
+      status: "ACTIVE",
+      valid_from: shiftLocalDate(propertyToday, -2),
+      valid_until: propertyToday,
+      version: 1
+    }).execute();
+    await db.insertInto("entitlement_lots").values({
+      id: expiredLotId,
+      contract_id: expiryContractId,
+      unit_kind: "ROOM_NIGHT",
+      total_units: 1,
+      expires_on: expiredOn,
+      version: 1
+    }).execute();
     await capture("EXPIRE_MEMBER_ENTITLEMENT", {
       propertyId: demo.propertyId,
-      entitlementLotId: demo.roomLotId,
-      asOfDate: "2030-01-02"
+      entitlementLotId: expiredLotId,
+      asOfDate: propertyToday
     });
 
     await capture("ISSUE_TOKEN", {
@@ -180,42 +230,57 @@ describe("Command effect HTTP contract", () => {
         fullName: "Effect Contract Guest",
         phone: "+86-138-0000-0000",
         documentNumber: "EFFECT-CONTRACT-001"
-      }
+      },
+      bookingChannelCode: "CTRIP",
+      channelOrderReference: "TEST-EFFECT-ORDER-001"
     });
     const orderId = (await confirm(createOrder)).orderId as string;
 
     await capture("SHORTEN_STAY", {
       propertyId: demo.propertyId,
       orderId,
-      newDepartureDate: "2028-04-13",
-      manualAdjustmentMinor: -100
+      newDepartureDate: "2028-04-13"
     });
     await capture("EXTEND_STAY", {
       propertyId: demo.propertyId,
       orderId,
-      newDepartureDate: "2028-04-15",
-      manualAdjustmentMinor: 100
+      newDepartureDate: "2028-04-15"
     });
     await capture("MOVE_UNIT", {
       propertyId: demo.propertyId,
       orderId,
       newInventoryUnitId: demo.secondRoomId,
-      effectiveDate: "2028-04-12",
-      manualAdjustmentMinor: 200
+      effectiveDate: "2028-04-12"
     });
     await capture("REPRICE_ORDER", {
       propertyId: demo.propertyId,
       orderId,
-      manualAdjustmentMinor: 0
+      targetCurrentContractAmountMinor: 47_900
     });
     await capture("CANCEL_ORDER", { propertyId: demo.propertyId, orderId });
     await capture("MARK_NO_SHOW", { propertyId: demo.propertyId, orderId });
+
+    const memberPriced = await quote({
+      arrivalDate: "2028-05-10",
+      departureDate: "2028-05-12",
+      memberContractId: demo.memberContractId
+    });
+    const memberOrder = await capture("CREATE_ORDER", {
+      propertyId: demo.propertyId,
+      quoteId: memberPriced.quoteId,
+      primaryGuest: { fullName: "Effect Contract Member Guest" },
+      bookingChannelCode: "WECOM",
+      channelOrderReference: null
+    });
+    const memberOrderId = (await confirm(memberOrder)).orderId as string;
+    await capture("REFRESH_MEMBER_COVERAGE", { propertyId: demo.propertyId, orderId: memberOrderId });
 
     const collection = await capture("RECORD_COLLECTION", {
       propertyId: demo.propertyId,
       orderId,
       amountMinor: 10_000,
       method: "CARD",
+      transactionReference: "TEST-EFFECT-TXN-COLLECTION",
       note: "Effect contract collection"
     });
     const collectionFactId = (await confirm(collection)).factId as string;
@@ -225,6 +290,7 @@ describe("Command effect HTTP contract", () => {
       amountMinor: 1_000,
       referencesFactId: collectionFactId,
       method: "CARD",
+      transactionReference: "TEST-EFFECT-TXN-REFUND",
       note: "Effect contract refund"
     });
     await capture("REVERSE_FACT", {

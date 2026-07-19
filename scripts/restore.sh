@@ -11,6 +11,36 @@ target="${2:?usage: ALLOW_RESTORE=true ./scripts/restore.sh BACKUP TARGET_DATABA
 container="${POSTGRES_CONTAINER:-qintopia-postgres}"
 user="${POSTGRES_USER:-qintopia}"
 live_database="${POSTGRES_DB:-qintopia}"
+target_created=false
+target_oid=""
+
+cleanup_partial_target() {
+  if [[ "$target_created" != "true" ]]; then
+    return
+  fi
+  local current_oid
+  if ! current_oid="$(docker exec "$container" psql -U "$user" -d postgres -Atc "SELECT oid FROM pg_database WHERE datname = '$target'")"; then
+    printf 'Restore failed and target database %s identity could not be verified; it was not removed automatically.\n' "$target" >&2
+    return
+  fi
+  if [[ -z "$current_oid" ]]; then
+    return
+  fi
+  if [[ -z "$target_oid" || "$current_oid" != "$target_oid" ]]; then
+    printf 'Restore failed but target database %s no longer has the OID created by this restore; it was not removed.\n' "$target" >&2
+    return
+  fi
+  if ! docker exec "$container" dropdb -U "$user" --if-exists "$target" >/dev/null 2>&1; then
+    printf 'Restore failed and partial target database %s could not be removed automatically.\n' "$target" >&2
+  fi
+}
+
+restore_failed() {
+  local status=$?
+  trap - ERR
+  cleanup_partial_target
+  exit "$status"
+}
 
 if [[ "$target" == "$live_database" ]]; then
   printf 'Refusing to restore over the configured live database %s.\n' "$live_database" >&2
@@ -26,11 +56,21 @@ if [[ "$target_exists" == "1" ]]; then
   printf 'Refusing restore because target database %s already exists. Choose a new database name.\n' "$target" >&2
   exit 2
 fi
+trap restore_failed ERR
 docker exec "$container" createdb -U "$user" "$target"
+target_created=true
+target_oid="$(docker exec "$container" psql -U "$user" -d postgres -Atc "SELECT oid FROM pg_database WHERE datname = '$target'")"
+if [[ ! "$target_oid" =~ ^[0-9]+$ ]]; then
+  printf 'Could not capture the identity of newly created target database %s.\n' "$target" >&2
+  false
+fi
 docker exec -i "$container" pg_restore -U "$user" -d "$target" --no-owner --no-privileges < "$backup"
-required_migrations="$(docker exec "$container" psql -U "$user" -d "$target" -At -v ON_ERROR_STOP=1 -c "SELECT count(*) FROM schema_migrations WHERE name IN ('001_initial.sql','002_immutability.sql','003_active_coverage_uniqueness.sql','004_security_identity_guards.sql','005_core_identity_and_entitlement_guards.sql','006_property_scoped_idempotency.sql')")"
-if [[ "$required_migrations" != "6" ]]; then
-  printf 'Restore target %s is missing required migrations (found %s of 6).\n' "$target" "$required_migrations" >&2
+required_migrations="$(docker exec "$container" psql -U "$user" -d "$target" -At -v ON_ERROR_STOP=1 -c "SELECT count(*) FROM schema_migrations WHERE name IN ('001_initial.sql','002_immutability.sql','003_active_coverage_uniqueness.sql','004_security_identity_guards.sql','005_core_identity_and_entitlement_guards.sql','006_property_scoped_idempotency.sql','007_reference_catalog.sql','008_reference_catalog_sealing.sql','009_booking_channels_and_transaction_references.sql','010_qintopia_2026_catalog_pricing_and_free_stays.sql','011_core_fact_shape_guards.sql')")"
+if [[ "$required_migrations" != "11" ]]; then
+  printf 'Restore target %s is missing required migrations (found %s of 11).\n' "$target" "$required_migrations" >&2
+  cleanup_partial_target
   exit 1
 fi
+trap - ERR
+target_created=false
 printf 'Restored %s into new database %s\n' "$backup" "$target"

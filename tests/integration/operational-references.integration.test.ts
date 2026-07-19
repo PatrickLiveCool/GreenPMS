@@ -1,0 +1,866 @@
+import { readFile, readdir } from "node:fs/promises";
+import { resolve } from "node:path";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import pg from "pg";
+import type { AuthPrincipal, BookingChannelCode, CommandEnvelope, ReceiptDto } from "@qintopia/contracts";
+import {
+  confirmCommandPreview,
+  createCommandPreview,
+  createDatabase,
+  databaseReady,
+  getOrderView,
+  type ConfirmRequest,
+  type Database
+} from "@qintopia/db";
+import type { Kysely } from "kysely";
+import { sha256 } from "@qintopia/domain";
+import { buildServer } from "../../apps/api/src/server.ts";
+import { createQuoteForTesting as createQuote } from "../../packages/db/src/pricing-service.ts";
+import { demo } from "../../packages/db/src/seed.ts";
+import { resetDatabase } from "../helpers/database.ts";
+
+const databaseUrl = process.env.OPERATIONAL_REFERENCES_INTEGRATION_DATABASE_URL
+  ?? "postgres://qintopia:qintopia@127.0.0.1:55432/qintopia_operational_references";
+const historicalDatabaseUrl = process.env.OPERATIONAL_REFERENCES_HISTORY_DATABASE_URL
+  ?? "postgres://qintopia:qintopia@127.0.0.1:55432/qintopia_operational_references_history";
+
+const principal: AuthPrincipal = {
+  subjectId: demo.agentSubjectId,
+  credentialId: "token_demo_write",
+  credentialType: "TOKEN",
+  displayName: "Demo Agent",
+  propertyAccess: new Map([[demo.propertyId, "WRITE"]])
+};
+
+let db: Kysely<Database>;
+let sequence = 0;
+
+function metadata(prefix: string) {
+  sequence += 1;
+  return { idempotencyKey: `${prefix}-${sequence}`, correlationId: `${prefix}-${sequence}` };
+}
+
+async function previewAndConfirm(envelope: CommandEnvelope, prefix: string): Promise<ReceiptDto> {
+  const preview = await createCommandPreview(db, principal, envelope, metadata(`${prefix}-preview`));
+  return confirmCommandPreview(db, principal, preview.preview.previewId, {
+    propertyId: envelope.input.propertyId as string,
+    commandType: envelope.commandType,
+    confirmation: true,
+    expectedEffectHash: preview.preview.effectHash,
+    reason: { code: "OPERATIONAL_REFERENCE_TEST", note: `Operational reference acceptance for ${prefix}` }
+  }, metadata(`${prefix}-confirm`));
+}
+
+async function createChannelOrder(options: {
+  code: BookingChannelCode;
+  channelOrderReference: string | null;
+  day: number;
+  prefix: string;
+}) {
+  const day = String(options.day).padStart(2, "0");
+  const nextDay = String(options.day + 1).padStart(2, "0");
+  const quote = await createQuote(db, {
+    propertyId: demo.propertyId,
+    inventoryUnitId: demo.roomId,
+    stayType: "FREE",
+    arrivalDate: `2028-12-${day}`,
+    departureDate: `2028-12-${nextDay}`,
+    pricingPolicyVersionId: demo.freePolicyId
+  });
+  const preview = await createCommandPreview(db, principal, {
+    commandType: "CREATE_ORDER",
+    input: {
+      propertyId: demo.propertyId,
+      quoteId: quote.quoteId,
+      primaryGuest: { fullName: `Channel Guest ${options.code}` },
+      bookingChannelCode: options.code,
+      channelOrderReference: options.channelOrderReference,
+      freeStayReason: `Channel contract fixture: ${options.code}`
+    }
+  }, metadata(`${options.prefix}-preview`));
+  const expectedReference = options.channelOrderReference?.trim() || null;
+  expect(preview.preview.effect).toMatchObject({
+    bookingChannelCode: options.code,
+    channelOrderReference: expectedReference
+  });
+  const confirmation: ConfirmRequest = {
+    propertyId: demo.propertyId,
+    commandType: "CREATE_ORDER",
+    confirmation: true,
+    expectedEffectHash: preview.preview.effectHash,
+    reason: { code: "CHANNEL_TEST", note: `Confirm ${options.code} channel order` }
+  };
+  const confirmMetadata = metadata(`${options.prefix}-confirm`);
+  const receipt = await confirmCommandPreview(db, principal, preview.preview.previewId, confirmation, confirmMetadata);
+  expect(receipt.result).toMatchObject({
+    bookingChannelCode: options.code,
+    channelOrderReference: expectedReference
+  });
+  return { receipt, previewId: preview.preview.previewId, confirmation, confirmMetadata };
+}
+
+async function commandArtifactCounts() {
+  const [facts, executions, receipts] = await Promise.all([
+    db.selectFrom("collection_facts").select(({ fn }) => fn.countAll<number>().as("count")).executeTakeFirstOrThrow(),
+    db.selectFrom("command_executions").select(({ fn }) => fn.countAll<number>().as("count")).executeTakeFirstOrThrow(),
+    db.selectFrom("command_receipts").select(({ fn }) => fn.countAll<number>().as("count")).executeTakeFirstOrThrow()
+  ]);
+  return [facts, executions, receipts].map((row) => Number(row.count));
+}
+
+async function orderArtifactCounts() {
+  const [orders, previews, executions, receipts] = await Promise.all([
+    db.selectFrom("orders").select(({ fn }) => fn.countAll<number>().as("count")).executeTakeFirstOrThrow(),
+    db.selectFrom("command_previews").select(({ fn }) => fn.countAll<number>().as("count")).executeTakeFirstOrThrow(),
+    db.selectFrom("command_executions").select(({ fn }) => fn.countAll<number>().as("count")).executeTakeFirstOrThrow(),
+    db.selectFrom("command_receipts").select(({ fn }) => fn.countAll<number>().as("count")).executeTakeFirstOrThrow()
+  ]);
+  return [orders, previews, executions, receipts].map((row) => Number(row.count));
+}
+
+async function recreateDatabaseThrough008(url: string): Promise<Kysely<Database>> {
+  const parsed = new URL(url);
+  const databaseName = parsed.pathname.slice(1);
+  const adminUrl = new URL(url);
+  adminUrl.pathname = "/qintopia";
+  const admin = new pg.Client({ connectionString: adminUrl.toString() });
+  await admin.connect();
+  try {
+    await admin.query("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()", [databaseName]);
+    await admin.query(`DROP DATABASE IF EXISTS "${databaseName.replaceAll('"', '""')}"`);
+    await admin.query(`CREATE DATABASE "${databaseName.replaceAll('"', '""')}"`);
+  } finally {
+    await admin.end();
+  }
+  const client = new pg.Client({ connectionString: url });
+  await client.connect();
+  try {
+    const directory = resolve(process.cwd(), "packages/db/src/migrations");
+    const migrations = (await readdir(directory)).filter((name) => /^00[1-8].*\.sql$/.test(name)).sort();
+    for (const migration of migrations) {
+      await client.query(await readFile(resolve(directory, migration), "utf8"));
+      await client.query("INSERT INTO schema_migrations(name) VALUES ($1) ON CONFLICT DO NOTHING", [migration]);
+    }
+  } finally {
+    await client.end();
+  }
+  const historicalDb = createDatabase(url);
+  await historicalDb.insertInto("properties").values({
+    id: demo.propertyId,
+    code: "QTP-SH",
+    name: "QinTopia legacy migration fixture",
+    timezone: "Asia/Shanghai",
+    currency: "CNY"
+  }).execute();
+  await historicalDb.insertInto("inventory_units").values({
+    id: demo.roomId,
+    property_id: demo.propertyId,
+    kind: "ROOM",
+    parent_room_id: null,
+    code: "101",
+    name: "Legacy Room 101",
+    active: true
+  }).execute();
+  await historicalDb.insertInto("pricing_policy_versions").values([
+    {
+      id: demo.transientPolicyId,
+      property_id: demo.propertyId,
+      code: "LEGACY-TRANSIENT-FLAT",
+      version: 1,
+      stay_type: "TRANSIENT",
+      calculation_kind: "FLAT_NIGHTLY",
+      nightly_rate_minor: 12_000,
+      currency: "CNY",
+      status: "PUBLISHED"
+    },
+    {
+      id: demo.freePolicyId,
+      property_id: demo.propertyId,
+      code: "FREE",
+      version: 1,
+      stay_type: "FREE",
+      calculation_kind: "FREE",
+      nightly_rate_minor: 0,
+      currency: "CNY",
+      status: "PUBLISHED"
+    }
+  ]).execute();
+  await historicalDb.insertInto("subjects").values({
+    id: demo.agentSubjectId,
+    username: "legacy-migration-agent",
+    display_name: "Legacy Migration Agent",
+    password_salt: "legacy-migration-fixture",
+    password_hash: "legacy-migration-fixture",
+    status: "ACTIVE",
+    auth_version: 1
+  }).execute();
+  await historicalDb.insertInto("subject_property_grants").values({
+    subject_id: demo.agentSubjectId,
+    property_id: demo.propertyId,
+    access_level: "WRITE"
+  }).execute();
+  await historicalDb.insertInto("api_tokens").values({
+    id: "token_demo_write",
+    subject_id: demo.agentSubjectId,
+    label: "Legacy migration write Token",
+    secret_hash: sha256(demo.writeToken),
+    access_ceiling: "WRITE",
+    property_scope: demo.propertyId,
+    expires_at: "2030-01-01T00:00:00.000Z",
+    revoked_at: null,
+    rotated_from_id: null,
+    replaced_by_id: null
+  }).execute();
+  return historicalDb;
+}
+
+async function dropDatabase(url: string): Promise<void> {
+  const parsed = new URL(url);
+  const databaseName = parsed.pathname.slice(1);
+  const adminUrl = new URL(url);
+  adminUrl.pathname = "/qintopia";
+  const admin = new pg.Client({ connectionString: adminUrl.toString() });
+  await admin.connect();
+  try {
+    await admin.query("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()", [databaseName]);
+    await admin.query(`DROP DATABASE IF EXISTS "${databaseName.replaceAll('"', '""')}"`);
+  } finally {
+    await admin.end();
+  }
+}
+
+describe.sequential("booking channels and external transaction references on PostgreSQL", () => {
+  beforeEach(async () => {
+    db = await resetDatabase(databaseUrl);
+  });
+
+  afterEach(async () => {
+    if (db) await db.destroy();
+  });
+
+  it("persists all four stable booking channels through Preview, Receipt, amendment, and Query", async () => {
+    const cases: Array<{ code: BookingChannelCode; reference: string | null; day: number }> = [
+      { code: "YOUMUDAO", reference: "  TEST-CHANNEL-YOUMUDAO  ", day: 1 },
+      { code: "CTRIP", reference: null, day: 3 },
+      { code: "MEITUAN", reference: "TEST-CHANNEL-MEITUAN", day: 5 },
+      { code: "WECOM", reference: null, day: 7 }
+    ];
+
+    for (const item of cases) {
+      const created = await createChannelOrder({
+        code: item.code,
+        channelOrderReference: item.reference,
+        day: item.day,
+        prefix: `channel-${item.code.toLowerCase()}`
+      });
+      const orderId = created.receipt.result!.orderId as string;
+      const view = await getOrderView(db, orderId);
+      expect(view.order.booking_channel_code).toBe(item.code);
+      expect(view.order.channel_order_reference).toBe(item.reference?.trim() || null);
+      expect(view.amendments[0]!.payload).toMatchObject({
+        bookingChannelCode: item.code,
+        channelOrderReference: item.reference?.trim() || null
+      });
+
+      if (item.code === "WECOM") {
+        const replay = await confirmCommandPreview(
+          db,
+          principal,
+          created.previewId,
+          created.confirmation,
+          created.confirmMetadata
+        );
+        expect(replay.receiptId).toBe(created.receipt.receiptId);
+        expect(await db.selectFrom("orders").select("id").where("id", "=", orderId).execute()).toHaveLength(1);
+      }
+    }
+  });
+
+  it("rejects missing, free-text, and WECOM-incompatible channels before creating any command artifact", async () => {
+    const quote = await createQuote(db, {
+      propertyId: demo.propertyId,
+      inventoryUnitId: demo.roomId,
+      stayType: "FREE",
+      arrivalDate: "2028-12-20",
+      departureDate: "2028-12-21",
+      pricingPolicyVersionId: demo.freePolicyId
+    });
+    const before = await orderArtifactCounts();
+    for (const fields of [
+      { channelOrderReference: null },
+      { bookingChannelCode: "LEGACY", channelOrderReference: null },
+      { bookingChannelCode: "WECOM", channelOrderReference: "MUST-NOT-PERSIST" }
+    ]) {
+      await expect(createCommandPreview(db, principal, {
+        commandType: "CREATE_ORDER",
+        input: {
+          propertyId: demo.propertyId,
+          quoteId: quote.quoteId,
+          primaryGuest: { fullName: "Rejected channel command" },
+          freeStayReason: "Invalid channel rejection fixture",
+          ...fields
+        }
+      }, metadata("invalid-order-channel"))).rejects.toMatchObject({ code: "VALIDATION_ERROR" });
+    }
+    expect(await orderArtifactCounts()).toEqual(before);
+  });
+
+  it("rejects missing references with zero command artifacts and records independent collection/refund references exactly once", async () => {
+    const created = await createChannelOrder({ code: "YOUMUDAO", channelOrderReference: "TEST-FUND-ORDER", day: 10, prefix: "fund-order" });
+    const orderId = created.receipt.result!.orderId as string;
+    const before = await commandArtifactCounts();
+    for (const transactionReference of [undefined, " \t\n "]) {
+      await expect(createCommandPreview(db, principal, {
+        commandType: "RECORD_COLLECTION",
+        input: { propertyId: demo.propertyId, orderId, amountMinor: 100, method: "CASH", transactionReference }
+      }, metadata("missing-transaction-reference"))).rejects.toMatchObject({ code: "VALIDATION_ERROR" });
+    }
+    expect(await commandArtifactCounts()).toEqual(before);
+
+    const collectionPreview = await createCommandPreview(db, principal, {
+      commandType: "RECORD_COLLECTION",
+      input: {
+        propertyId: demo.propertyId,
+        orderId,
+        amountMinor: 5_000,
+        method: "CARD",
+        transactionReference: "  TEST-TXN-COLLECTION-ONE  ",
+        note: "First independent collection"
+      }
+    }, metadata("collection-one-preview"));
+    expect(collectionPreview.preview.effect).toMatchObject({ transactionReference: "TEST-TXN-COLLECTION-ONE" });
+    const collectionConfirmation: ConfirmRequest = {
+      propertyId: demo.propertyId,
+      commandType: "RECORD_COLLECTION",
+      confirmation: true,
+      expectedEffectHash: collectionPreview.preview.effectHash,
+      reason: { code: "FACT_TEST", note: "Confirm first independent collection" }
+    };
+    const collectionMetadata = { idempotencyKey: "collection-one-confirm-stable", correlationId: "collection-one-confirm-stable" };
+    const collectionOne = await confirmCommandPreview(db, principal, collectionPreview.preview.previewId, collectionConfirmation, collectionMetadata);
+    const collectionReplay = await confirmCommandPreview(db, principal, collectionPreview.preview.previewId, collectionConfirmation, collectionMetadata);
+    expect(collectionReplay.receiptId).toBe(collectionOne.receiptId);
+    expect(collectionOne.result).toMatchObject({ transactionReference: "TEST-TXN-COLLECTION-ONE" });
+
+    const beforeInvalidRefunds = await commandArtifactCounts();
+    for (const transactionReference of [undefined, " \t\n "]) {
+      await expect(createCommandPreview(db, principal, {
+        commandType: "RECORD_REFUND",
+        input: {
+          propertyId: demo.propertyId,
+          orderId,
+          amountMinor: 100,
+          referencesFactId: collectionOne.factRefs[0],
+          method: "CARD",
+          transactionReference
+        }
+      }, metadata("missing-refund-transaction-reference"))).rejects.toMatchObject({ code: "VALIDATION_ERROR" });
+    }
+    expect(await commandArtifactCounts()).toEqual(beforeInvalidRefunds);
+
+    const collectionTwo = await previewAndConfirm({
+      commandType: "RECORD_COLLECTION",
+      input: {
+        propertyId: demo.propertyId,
+        orderId,
+        amountMinor: 4_000,
+        method: "BANK_TRANSFER",
+        transactionReference: "TEST-TXN-COLLECTION-TWO",
+        note: "Second independent collection"
+      }
+    }, "collection-two");
+    const refund = await previewAndConfirm({
+      commandType: "RECORD_REFUND",
+      input: {
+        propertyId: demo.propertyId,
+        orderId,
+        amountMinor: 1_500,
+        referencesFactId: collectionOne.factRefs[0],
+        method: "CARD",
+        transactionReference: "TEST-TXN-REFUND-ONE",
+        note: "Refund with its own external transaction"
+      }
+    }, "refund-one");
+    const reversal = await previewAndConfirm({
+      commandType: "REVERSE_FACT",
+      input: { propertyId: demo.propertyId, orderId, reversesFactId: collectionTwo.factRefs[0], note: "Reverse second collection" }
+    }, "reverse-second-collection");
+    expect(reversal.result).toMatchObject({ factType: "REVERSAL", transactionReference: null });
+
+    const facts = await db.selectFrom("collection_facts").selectAll().where("order_id", "=", orderId).orderBy("created_at").orderBy("fact_id").execute();
+    expect(facts).toHaveLength(4);
+    expect(facts.filter((fact) => fact.transaction_reference === "TEST-TXN-COLLECTION-ONE")).toHaveLength(1);
+    expect(facts.find((fact) => fact.fact_id === collectionTwo.factRefs[0])?.transaction_reference).toBe("TEST-TXN-COLLECTION-TWO");
+    expect(facts.find((fact) => fact.fact_id === refund.factRefs[0])).toMatchObject({
+      fact_type: "REFUND",
+      references_fact_id: collectionOne.factRefs[0],
+      transaction_reference: "TEST-TXN-REFUND-ONE"
+    });
+    expect(facts.find((fact) => fact.fact_id === reversal.factRefs[0])?.transaction_reference).toBeNull();
+  });
+
+  it("enforces the new-write rules for direct database inserts and keeps order channel identity immutable", async () => {
+    const directOrder = (id: string, bookingChannelCode: BookingChannelCode | null, channelOrderReference: string | null) => db.insertInto("orders").values({
+      id,
+      property_id: demo.propertyId,
+      status: "RESERVED",
+      stay_type: "FREE",
+      arrival_date: "2029-01-01",
+      departure_date: "2029-01-02",
+      primary_guest_snapshot: { fullName: "Direct database guard probe" },
+      booking_channel_code: bookingChannelCode,
+      channel_order_reference: channelOrderReference,
+      free_stay_reason: "Direct database guard fixture",
+      pricing_policy_version_id: demo.freePolicyId,
+      member_contract_id: null,
+      current_revision_id: null,
+      version: 1
+    }).execute();
+
+    await expect(directOrder("order_direct_missing_channel", null, null)).rejects.toMatchObject({ constraint: "orders_new_booking_channel_required" });
+    await expect(directOrder("order_direct_wecom_reference", "WECOM", "MUST-NOT-PERSIST")).rejects.toMatchObject({ constraint: "orders_wecom_has_no_channel_order_reference" });
+    await directOrder("order_direct_blank_reference", "CTRIP", " \t\n ");
+    expect(await db.selectFrom("orders").select("channel_order_reference").where("id", "=", "order_direct_blank_reference").executeTakeFirstOrThrow()).toEqual({ channel_order_reference: null });
+    await db.deleteFrom("orders").where("id", "=", "order_direct_blank_reference").execute();
+
+    const created = await createChannelOrder({ code: "CTRIP", channelOrderReference: "TEST-IMMUTABLE-CHANNEL", day: 12, prefix: "immutable-channel" });
+    const orderId = created.receipt.result!.orderId as string;
+    const secondOrder = await createChannelOrder({ code: "MEITUAN", channelOrderReference: "TEST-REFUND-OTHER-ORDER", day: 14, prefix: "refund-other-order" });
+    const secondOrderId = secondOrder.receipt.result!.orderId as string;
+    await expect(db.updateTable("orders").set({ booking_channel_code: "MEITUAN" }).where("id", "=", orderId).execute()).rejects.toThrow(/booking channel.*immutable/);
+    await expect(db.updateTable("orders").set({ channel_order_reference: "CHANGED" }).where("id", "=", orderId).execute()).rejects.toThrow(/booking channel.*immutable/);
+
+    const baseFact = {
+      order_id: orderId,
+      amount_minor: 100,
+      currency: "CNY",
+      references_fact_id: null,
+      reverses_fact_id: null,
+      method: "CASH",
+      note: "Direct fact guard probe",
+      command_id: "command_direct_fact_guard"
+    };
+    await expect(db.insertInto("collection_facts").values({
+      ...baseFact,
+      fact_id: "fact_direct_missing_transaction",
+      fact_type: "COLLECTION",
+      net_effect_minor: 100,
+      transaction_reference: null
+    }).execute()).rejects.toMatchObject({ constraint: "collection_facts_new_transaction_reference_required" });
+    await expect(db.insertInto("collection_facts").values({
+      ...baseFact,
+      fact_id: "fact_direct_blank_transaction",
+      fact_type: "REFUND",
+      net_effect_minor: -100,
+      transaction_reference: "\t\n"
+    }).execute()).rejects.toMatchObject({ constraint: "collection_facts_new_transaction_reference_required" });
+    await expect(db.insertInto("collection_facts").values({
+      ...baseFact,
+      fact_id: "fact_direct_reversal_transaction",
+      fact_type: "REVERSAL",
+      net_effect_minor: -100,
+      transaction_reference: "MUST-NOT-PERSIST"
+    }).execute()).rejects.toMatchObject({ constraint: "collection_facts_reversal_transaction_reference_null" });
+    await expect(db.insertInto("collection_facts").values({
+      ...baseFact,
+      fact_id: "fact_direct_refund_missing_reference",
+      fact_type: "REFUND",
+      net_effect_minor: -100,
+      transaction_reference: "TEST-DIRECT-REFUND-MISSING-REFERENCE"
+    }).execute()).rejects.toMatchObject({ constraint: "collection_facts_refund_reference_required" });
+    await expect(db.insertInto("collection_facts").values({
+      ...baseFact,
+      fact_id: "fact_direct_collection_wrong_currency",
+      fact_type: "COLLECTION",
+      net_effect_minor: 100,
+      currency: "USD",
+      transaction_reference: "TEST-DIRECT-COLLECTION-WRONG-CURRENCY"
+    }).execute()).rejects.toMatchObject({ constraint: "collection_facts_order_currency_match" });
+    await expect(db.insertInto("collection_facts").values({
+      ...baseFact,
+      fact_id: "fact_direct_collection_wrong_net",
+      fact_type: "COLLECTION",
+      net_effect_minor: -100,
+      transaction_reference: "TEST-DIRECT-COLLECTION-WRONG-NET"
+    }).execute()).rejects.toMatchObject({ constraint: "collection_facts_collection_net_effect" });
+
+    await db.insertInto("collection_facts").values({
+      ...baseFact,
+      fact_id: "fact_direct_valid_collection",
+      fact_type: "COLLECTION",
+      net_effect_minor: 100,
+      transaction_reference: "TEST-DIRECT-VALID-COLLECTION",
+      command_id: "command_direct_valid_fact"
+    }).execute();
+    await expect(db.insertInto("collection_facts").values({
+      ...baseFact,
+      fact_id: "fact_direct_collection_reference",
+      fact_type: "COLLECTION",
+      net_effect_minor: 100,
+      references_fact_id: "fact_direct_valid_collection",
+      transaction_reference: "TEST-DIRECT-COLLECTION-REFERENCE"
+    }).execute()).rejects.toMatchObject({ constraint: "collection_facts_collection_reference_null" });
+    await expect(db.insertInto("collection_facts").values({
+      ...baseFact,
+      fact_id: "fact_direct_collection_reversal",
+      fact_type: "COLLECTION",
+      net_effect_minor: 100,
+      reverses_fact_id: "fact_direct_valid_collection",
+      transaction_reference: "TEST-DIRECT-COLLECTION-REVERSAL"
+    }).execute()).rejects.toMatchObject({ constraint: "collection_facts_collection_reversal_null" });
+    await expect(db.insertInto("collection_facts").values({
+      ...baseFact,
+      fact_id: "fact_direct_refund_wrong_net",
+      fact_type: "REFUND",
+      net_effect_minor: 50,
+      amount_minor: 50,
+      references_fact_id: "fact_direct_valid_collection",
+      transaction_reference: "TEST-DIRECT-REFUND-WRONG-NET"
+    }).execute()).rejects.toMatchObject({ constraint: "collection_facts_refund_net_effect" });
+    await expect(db.insertInto("collection_facts").values({
+      ...baseFact,
+      fact_id: "fact_direct_refund_reversal",
+      fact_type: "REFUND",
+      net_effect_minor: -50,
+      amount_minor: 50,
+      references_fact_id: "fact_direct_valid_collection",
+      reverses_fact_id: "fact_direct_valid_collection",
+      transaction_reference: "TEST-DIRECT-REFUND-REVERSAL"
+    }).execute()).rejects.toMatchObject({ constraint: "collection_facts_refund_reversal_null" });
+    await db.insertInto("collection_facts").values({
+      ...baseFact,
+      fact_id: "fact_direct_valid_refund",
+      fact_type: "REFUND",
+      net_effect_minor: -50,
+      amount_minor: 50,
+      references_fact_id: "fact_direct_valid_collection",
+      transaction_reference: "TEST-DIRECT-VALID-REFUND",
+      command_id: "command_direct_valid_fact"
+    }).execute();
+    expect(await db.selectFrom("collection_facts").select(["references_fact_id", "transaction_reference"]).where("fact_id", "=", "fact_direct_valid_refund").executeTakeFirstOrThrow()).toEqual({
+      references_fact_id: "fact_direct_valid_collection",
+      transaction_reference: "TEST-DIRECT-VALID-REFUND"
+    });
+    await expect(db.insertInto("collection_facts").values({
+      ...baseFact,
+      fact_id: "fact_direct_refund_non_collection",
+      fact_type: "REFUND",
+      net_effect_minor: -10,
+      amount_minor: 10,
+      references_fact_id: "fact_direct_valid_refund",
+      transaction_reference: "TEST-DIRECT-REFUND-NON-COLLECTION"
+    }).execute()).rejects.toMatchObject({ constraint: "collection_facts_refund_reference_collection" });
+    await expect(db.insertInto("collection_facts").values({
+      ...baseFact,
+      fact_id: "fact_direct_refund_cross_order",
+      order_id: secondOrderId,
+      fact_type: "REFUND",
+      net_effect_minor: -10,
+      amount_minor: 10,
+      references_fact_id: "fact_direct_valid_collection",
+      transaction_reference: "TEST-DIRECT-REFUND-CROSS-ORDER"
+    }).execute()).rejects.toMatchObject({ constraint: "collection_facts_refund_reference_same_order" });
+
+    await db.insertInto("collection_facts").values({
+      ...baseFact,
+      fact_id: "fact_direct_reversal_source",
+      fact_type: "COLLECTION",
+      amount_minor: 70,
+      net_effect_minor: 70,
+      transaction_reference: "TEST-DIRECT-REVERSAL-SOURCE",
+      command_id: "command_direct_valid_reversal_source"
+    }).execute();
+    await expect(db.insertInto("collection_facts").values({
+      ...baseFact,
+      fact_id: "fact_direct_reversal_missing_target",
+      fact_type: "REVERSAL",
+      amount_minor: 70,
+      net_effect_minor: -70,
+      transaction_reference: null
+    }).execute()).rejects.toMatchObject({ constraint: "collection_facts_reversal_target_required" });
+    await expect(db.insertInto("collection_facts").values({
+      ...baseFact,
+      fact_id: "fact_direct_reversal_with_reference",
+      fact_type: "REVERSAL",
+      amount_minor: 70,
+      net_effect_minor: -70,
+      references_fact_id: "fact_direct_valid_collection",
+      reverses_fact_id: "fact_direct_reversal_source",
+      transaction_reference: null
+    }).execute()).rejects.toMatchObject({ constraint: "collection_facts_reversal_reference_null" });
+    await expect(db.insertInto("collection_facts").values({
+      ...baseFact,
+      fact_id: "fact_direct_reversal_wrong_net",
+      fact_type: "REVERSAL",
+      amount_minor: 70,
+      net_effect_minor: 70,
+      reverses_fact_id: "fact_direct_reversal_source",
+      transaction_reference: null
+    }).execute()).rejects.toMatchObject({ constraint: "collection_facts_reversal_net_effect" });
+    await expect(db.insertInto("collection_facts").values({
+      ...baseFact,
+      fact_id: "fact_direct_reversal_wrong_amount",
+      fact_type: "REVERSAL",
+      amount_minor: 60,
+      net_effect_minor: -70,
+      reverses_fact_id: "fact_direct_reversal_source",
+      transaction_reference: null
+    }).execute()).rejects.toMatchObject({ constraint: "collection_facts_reversal_amount" });
+    await expect(db.insertInto("collection_facts").values({
+      ...baseFact,
+      fact_id: "fact_direct_reversal_cross_order",
+      order_id: secondOrderId,
+      fact_type: "REVERSAL",
+      amount_minor: 70,
+      net_effect_minor: -70,
+      reverses_fact_id: "fact_direct_reversal_source",
+      transaction_reference: null
+    }).execute()).rejects.toMatchObject({ constraint: "collection_facts_reversal_same_order" });
+    await db.insertInto("collection_facts").values({
+      ...baseFact,
+      fact_id: "fact_direct_valid_reversal",
+      fact_type: "REVERSAL",
+      amount_minor: 70,
+      net_effect_minor: -70,
+      reverses_fact_id: "fact_direct_reversal_source",
+      transaction_reference: null,
+      command_id: "command_direct_valid_reversal"
+    }).execute();
+    expect(await db.selectFrom("collection_facts")
+      .select(["fact_type", "amount_minor", "net_effect_minor", "currency", "references_fact_id", "reverses_fact_id"])
+      .where("fact_id", "=", "fact_direct_valid_reversal").executeTakeFirstOrThrow()).toEqual({
+      fact_type: "REVERSAL",
+      amount_minor: 70,
+      net_effect_minor: -70,
+      currency: "CNY",
+      references_fact_id: null,
+      reverses_fact_id: "fact_direct_reversal_source"
+    });
+    await expect(db.insertInto("collection_facts").values({
+      ...baseFact,
+      fact_id: "fact_direct_reversal_of_reversal",
+      fact_type: "REVERSAL",
+      amount_minor: 70,
+      net_effect_minor: 70,
+      reverses_fact_id: "fact_direct_valid_reversal",
+      transaction_reference: null
+    }).execute()).rejects.toMatchObject({ constraint: "collection_facts_reversal_target_not_reversal" });
+    expect(await db.selectFrom("collection_facts").select("fact_id").where("command_id", "=", "command_direct_fact_guard").execute()).toHaveLength(0);
+  });
+
+  it("applies migrations 009 through 011 without inventing or validating historical fact values", async () => {
+    let historicalDb: Kysely<Database> | undefined;
+    try {
+      historicalDb = await recreateDatabaseThrough008(historicalDatabaseUrl);
+      const client = new pg.Client({ connectionString: historicalDatabaseUrl });
+      await client.connect();
+      try {
+        await client.query(`
+          INSERT INTO orders(id, property_id, status, stay_type, arrival_date, departure_date, primary_guest_snapshot, pricing_policy_version_id, member_contract_id, current_revision_id, version)
+          VALUES ('order_historical_nulls', '${demo.propertyId}', 'RESERVED', 'FREE', '2029-02-01', '2029-02-02', '{"fullName":"Historical Null Guest"}'::jsonb, '${demo.freePolicyId}', NULL, NULL, 1);
+          INSERT INTO stays(id, order_id, status) VALUES ('stay_historical_nulls', 'order_historical_nulls', 'PLANNED');
+          INSERT INTO amendments(id, order_id, sequence, amendment_type, reason_code, reason_note, prior_version, new_version, payload)
+          VALUES ('amend_historical_nulls', 'order_historical_nulls', 1, 'CREATE_ORDER', 'HISTORICAL', 'Created before channel capture', 0, 1, '{"quoteId":"quote_historical","inventoryUnitId":"${demo.roomId}","arrivalDate":"2029-02-01","departureDate":"2029-02-02"}'::jsonb);
+          INSERT INTO stay_segments(id, stay_id, sequence, inventory_unit_id, arrival_date, departure_date, segment_type, supersedes_segment_id, amendment_id)
+          VALUES ('segment_historical_nulls', 'stay_historical_nulls', 1, '${demo.roomId}', '2029-02-01', '2029-02-02', 'INITIAL', NULL, 'amend_historical_nulls');
+          INSERT INTO pricing_revisions(id, order_id, revision_no, amendment_id, policy_version_id, arrival_date, departure_date, coverage_set, cash_lines, manual_adjustment_minor, current_contract_amount_minor, currency)
+          VALUES ('revision_historical_nulls', 'order_historical_nulls', 1, 'amend_historical_nulls', '${demo.freePolicyId}', '2029-02-01', '2029-02-02', '[]'::jsonb, '[]'::jsonb, 0, 0, 'CNY');
+          UPDATE orders SET current_revision_id = 'revision_historical_nulls' WHERE id = 'order_historical_nulls';
+          INSERT INTO collection_facts(fact_id, order_id, fact_type, amount_minor, net_effect_minor, currency, references_fact_id, reverses_fact_id, method, note, command_id)
+          VALUES ('fact_historical_nulls', 'order_historical_nulls', 'COLLECTION', 100, 90, 'USD', NULL, NULL, 'CASH', 'Recorded before transaction reference and shape guards', 'command_historical_nulls');
+        `);
+        const migration009 = await readFile(resolve(process.cwd(), "packages/db/src/migrations/009_booking_channels_and_transaction_references.sql"), "utf8");
+        await client.query(migration009);
+        await client.query("INSERT INTO schema_migrations(name) VALUES ('009_booking_channels_and_transaction_references.sql')");
+        await client.query(`
+          INSERT INTO command_previews(id, subject_id, property_id, command_type, normalized_input, input_hash, effect, effect_hash, basis_versions, expires_at, status)
+          VALUES
+          (
+            'preview_historical_create', '${demo.agentSubjectId}', '${demo.propertyId}', 'CREATE_ORDER', '{}'::jsonb, repeat('a', 64),
+            jsonb_build_object(
+              'quoteId', 'quote_historical',
+              'primaryGuest', jsonb_build_object('fullName', 'Historical Preview Guest'),
+              'inventoryUnit', jsonb_build_object(
+                'id', '${demo.roomId}', 'propertyId', '${demo.propertyId}', 'kind', 'ROOM', 'roomId', '${demo.roomId}', 'code', '101', 'name', 'Room 101',
+                'catalogVersion', NULL, 'buildingCode', NULL, 'roomTypeCode', NULL, 'pricingProductCode', NULL,
+                'inventoryBasis', NULL, 'codeProvenance', NULL, 'physicalBedCount', NULL
+              ),
+              'stayType', 'FREE', 'arrivalDate', '2029-02-01', 'departureDate', '2029-02-02',
+              'pricingPolicyVersionId', '${demo.freePolicyId}', 'memberContractId', NULL,
+              'pricing', jsonb_build_object(
+                'coverageSet', '[]'::jsonb, 'cashLines', '[]'::jsonb,
+                'cashRemainder', jsonb_build_object('currency', 'CNY', 'minorUnits', 0),
+                'currentContractAmount', jsonb_build_object('currency', 'CNY', 'minorUnits', 0)
+              )
+            ),
+            repeat('b', 64), '{}'::jsonb, '2035-01-01T00:00:00Z', 'OPEN'
+          ),
+          (
+            'preview_historical_collection', '${demo.agentSubjectId}', '${demo.propertyId}', 'RECORD_COLLECTION', '{}'::jsonb, repeat('c', 64),
+            jsonb_build_object('orderId', 'order_historical_nulls', 'amountMinor', 100, 'currency', 'CNY', 'method', 'CASH', 'note', 'Historical collection preview'),
+            repeat('d', 64), '{}'::jsonb, '2035-01-01T00:00:00Z', 'OPEN'
+          );
+
+          INSERT INTO command_executions(id, subject_id, credential_id, property_id, command_type, idempotency_key, request_hash, correlation_id, state, completed_at)
+          VALUES
+            ('command_historical_create_receipt', '${demo.agentSubjectId}', 'token_demo_write', '${demo.propertyId}', 'CREATE_ORDER', 'historical-create-receipt', repeat('e', 64), 'historical-create-receipt', 'APPLIED', now()),
+            ('command_historical_collection_receipt', '${demo.agentSubjectId}', 'token_demo_write', '${demo.propertyId}', 'RECORD_COLLECTION', 'historical-collection-receipt', repeat('f', 64), 'historical-collection-receipt', 'APPLIED', now()),
+            ('command_historical_refund_receipt', '${demo.agentSubjectId}', 'token_demo_write', '${demo.propertyId}', 'RECORD_REFUND', 'historical-refund-receipt', repeat('1', 64), 'historical-refund-receipt', 'APPLIED', now()),
+            ('command_historical_reversal_receipt', '${demo.agentSubjectId}', 'token_demo_write', '${demo.propertyId}', 'REVERSE_FACT', 'historical-reversal-receipt', repeat('2', 64), 'historical-reversal-receipt', 'APPLIED', now()),
+            ('command_historical_preview_create_receipt', '${demo.agentSubjectId}', 'token_demo_write', '${demo.propertyId}', 'PREVIEW:CREATE_ORDER', 'historical-preview-create-receipt', repeat('3', 64), 'historical-preview-create-receipt', 'APPLIED', now()),
+            ('command_historical_preview_collection_receipt', '${demo.agentSubjectId}', 'token_demo_write', '${demo.propertyId}', 'PREVIEW:RECORD_COLLECTION', 'historical-preview-collection-receipt', repeat('4', 64), 'historical-preview-collection-receipt', 'APPLIED', now());
+
+          INSERT INTO command_receipts(id, command_id, execution_status, business_committed, result, error, resource_refs, fact_refs, committed_at)
+          VALUES
+            ('receipt_historical_create', 'command_historical_create_receipt', 'EXECUTED', true, '{"orderId":"order_historical_nulls","stayId":"stay_historical_nulls","segmentId":"segment_historical_nulls","pricingRevisionId":"revision_historical_nulls"}'::jsonb, NULL, '["order_historical_nulls"]'::jsonb, '[]'::jsonb, now()),
+            ('receipt_historical_collection', 'command_historical_collection_receipt', 'EXECUTED', true, '{"orderId":"order_historical_nulls","factId":"fact_historical_collection_receipt","factType":"COLLECTION","netEffectMinor":100}'::jsonb, NULL, '["order_historical_nulls"]'::jsonb, '["fact_historical_collection_receipt"]'::jsonb, now()),
+            ('receipt_historical_refund', 'command_historical_refund_receipt', 'EXECUTED', true, '{"orderId":"order_historical_nulls","factId":"fact_historical_refund_receipt","factType":"REFUND","netEffectMinor":-50}'::jsonb, NULL, '["order_historical_nulls"]'::jsonb, '["fact_historical_refund_receipt"]'::jsonb, now()),
+            ('receipt_historical_reversal', 'command_historical_reversal_receipt', 'EXECUTED', true, '{"orderId":"order_historical_nulls","factId":"fact_historical_reversal_receipt","factType":"REVERSAL","netEffectMinor":-100}'::jsonb, NULL, '["order_historical_nulls"]'::jsonb, '["fact_historical_reversal_receipt"]'::jsonb, now()),
+            (
+              'receipt_historical_preview_create', 'command_historical_preview_create_receipt', 'EXECUTED', true,
+              jsonb_build_object('preview', jsonb_build_object(
+                'previewId', 'preview_historical_create', 'commandType', 'CREATE_ORDER', 'effectHash', repeat('b', 64),
+                'effect', (SELECT effect FROM command_previews WHERE id = 'preview_historical_create'), 'expiresAt', '2035-01-01T00:00:00.000Z'
+              )), NULL, '["preview_historical_create"]'::jsonb, '[]'::jsonb, now()
+            ),
+            (
+              'receipt_historical_preview_collection', 'command_historical_preview_collection_receipt', 'EXECUTED', true,
+              jsonb_build_object('preview', jsonb_build_object(
+                'previewId', 'preview_historical_collection', 'commandType', 'RECORD_COLLECTION', 'effectHash', repeat('d', 64),
+                'effect', (SELECT effect FROM command_previews WHERE id = 'preview_historical_collection'), 'expiresAt', '2035-01-01T00:00:00.000Z'
+              )), NULL, '["preview_historical_collection"]'::jsonb, '[]'::jsonb, now()
+            );
+        `);
+        const migration010 = await readFile(resolve(process.cwd(), "packages/db/src/migrations/010_qintopia_2026_catalog_pricing_and_free_stays.sql"), "utf8");
+        await client.query(migration010);
+        await client.query("INSERT INTO schema_migrations(name) VALUES ('010_qintopia_2026_catalog_pricing_and_free_stays.sql')");
+        const migration011 = await readFile(resolve(process.cwd(), "packages/db/src/migrations/011_core_fact_shape_guards.sql"), "utf8");
+        await client.query(migration011);
+        await client.query("INSERT INTO schema_migrations(name) VALUES ('011_core_fact_shape_guards.sql')");
+      } finally {
+        await client.end();
+      }
+
+      const view = await getOrderView(historicalDb, "order_historical_nulls");
+      expect(view.order.booking_channel_code).toBeNull();
+      expect(view.order.channel_order_reference).toBeNull();
+      expect(view.collectionFacts[0]).toMatchObject({
+        amount_minor: 100,
+        net_effect_minor: 90,
+        currency: "USD",
+        transaction_reference: null
+      });
+      expect(await databaseReady(historicalDb)).toBe(true);
+
+      const app = await buildServer(historicalDb);
+      await app.ready();
+      try {
+        const detail = await app.inject({
+          method: "GET",
+          url: "/api/v1/orders/order_historical_nulls",
+          headers: { authorization: `Bearer ${demo.writeToken}` }
+        });
+        expect(detail.statusCode, detail.body).toBe(200);
+        expect(detail.json()).toMatchObject({
+          order: { booking_channel_code: null, channel_order_reference: null },
+          collectionFacts: [{ transaction_reference: null }]
+        });
+        const fact = await app.inject({
+          method: "GET",
+          url: "/api/v1/facts/fact_historical_nulls",
+          headers: { authorization: `Bearer ${demo.writeToken}` }
+        });
+        expect(fact.statusCode, fact.body).toBe(200);
+        expect(fact.json()).toMatchObject({ fact_id: "fact_historical_nulls", transaction_reference: null });
+
+        const historicalCreatePreview = await app.inject({
+          method: "GET",
+          url: "/api/v1/command-previews/preview_historical_create",
+          headers: { authorization: `Bearer ${demo.writeToken}` }
+        });
+        expect(historicalCreatePreview.statusCode, historicalCreatePreview.body).toBe(200);
+        expect(historicalCreatePreview.json().effect).toMatchObject({ bookingChannelCode: null, channelOrderReference: null });
+        const historicalCollectionPreview = await app.inject({
+          method: "GET",
+          url: "/api/v1/command-previews/preview_historical_collection",
+          headers: { authorization: `Bearer ${demo.writeToken}` }
+        });
+        expect(historicalCollectionPreview.statusCode, historicalCollectionPreview.body).toBe(200);
+        expect(historicalCollectionPreview.json().effect).toMatchObject({ transactionReference: null });
+        const historicalCreatePreviewReceipt = await app.inject({
+          method: "GET",
+          url: "/api/v1/receipts/receipt_historical_preview_create",
+          headers: { authorization: `Bearer ${demo.writeToken}` }
+        });
+        expect(historicalCreatePreviewReceipt.statusCode, historicalCreatePreviewReceipt.body).toBe(200);
+        expect(historicalCreatePreviewReceipt.json().result.preview.effect).toMatchObject({ bookingChannelCode: null, channelOrderReference: null });
+        const historicalCollectionPreviewReceipt = await app.inject({
+          method: "GET",
+          url: "/api/v1/receipts/receipt_historical_preview_collection",
+          headers: { authorization: `Bearer ${demo.writeToken}` }
+        });
+        expect(historicalCollectionPreviewReceipt.statusCode, historicalCollectionPreviewReceipt.body).toBe(200);
+        expect(historicalCollectionPreviewReceipt.json().result.preview.effect).toMatchObject({ transactionReference: null });
+
+        for (const [receiptId, expected] of [
+          ["receipt_historical_create", { bookingChannelCode: null, channelOrderReference: null }],
+          ["receipt_historical_collection", { factType: "COLLECTION", transactionReference: null }],
+          ["receipt_historical_refund", { factType: "REFUND", transactionReference: null }],
+          ["receipt_historical_reversal", { factType: "REVERSAL", transactionReference: null }]
+        ] as const) {
+          const response = await app.inject({
+            method: "GET",
+            url: `/api/v1/receipts/${receiptId}`,
+            headers: { authorization: `Bearer ${demo.writeToken}` }
+          });
+          expect(response.statusCode, response.body).toBe(200);
+          expect(response.json().result).toMatchObject(expected);
+        }
+        const historicalCommand = await app.inject({
+          method: "GET",
+          url: "/api/v1/commands/command_historical_reversal_receipt",
+          headers: { authorization: `Bearer ${demo.writeToken}` }
+        });
+        expect(historicalCommand.statusCode, historicalCommand.body).toBe(200);
+        expect(historicalCommand.json().result).toMatchObject({ factType: "REVERSAL", transactionReference: null });
+
+        const storedPreviews = await historicalDb.selectFrom("command_previews")
+          .select(["id", "effect"])
+          .where("id", "in", ["preview_historical_create", "preview_historical_collection"])
+          .orderBy("id")
+          .execute();
+        expect(Object.hasOwn(storedPreviews[0]!.effect as object, "transactionReference")).toBe(false);
+        expect(Object.hasOwn(storedPreviews[1]!.effect as object, "bookingChannelCode")).toBe(false);
+        const storedReceipts = await historicalDb.selectFrom("command_receipts")
+          .select(["id", "result"])
+          .where("id", "in", [
+            "receipt_historical_create",
+            "receipt_historical_collection",
+            "receipt_historical_refund",
+            "receipt_historical_reversal",
+            "receipt_historical_preview_create",
+            "receipt_historical_preview_collection"
+          ])
+          .execute();
+        for (const receipt of storedReceipts) {
+          const result = receipt.result as object;
+          expect(Object.hasOwn(result, "bookingChannelCode")).toBe(false);
+          expect(Object.hasOwn(result, "transactionReference")).toBe(false);
+        }
+        const storedPreviewReceiptById = new Map(storedReceipts.map((receipt) => [receipt.id, receipt.result as Record<string, unknown>]));
+        const storedCreatePreviewResult = storedPreviewReceiptById.get("receipt_historical_preview_create")!;
+        const storedCreatePreview = storedCreatePreviewResult.preview as Record<string, unknown>;
+        expect(Object.hasOwn((storedCreatePreview.effect as object), "bookingChannelCode")).toBe(false);
+        const storedCollectionPreviewResult = storedPreviewReceiptById.get("receipt_historical_preview_collection")!;
+        const storedCollectionPreview = storedCollectionPreviewResult.preview as Record<string, unknown>;
+        expect(Object.hasOwn((storedCollectionPreview.effect as object), "transactionReference")).toBe(false);
+      } finally {
+        await app.close();
+        historicalDb = undefined;
+      }
+    } finally {
+      if (historicalDb) await historicalDb.destroy();
+      await dropDatabase(historicalDatabaseUrl);
+    }
+  }, 60_000);
+});

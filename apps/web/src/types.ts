@@ -1,5 +1,6 @@
 import type {
   AmountSummaryDto,
+  BookingChannelCode,
   CommandType,
   CreateQuoteCommandResponseDto,
   PreviewDto,
@@ -81,6 +82,13 @@ export interface InventoryUnitDto {
   code: string;
   name: string;
   active: boolean;
+  catalog_version: string | null;
+  building_code: string | null;
+  room_type_code: string | null;
+  pricing_product_code: string | null;
+  inventory_basis: "INDEPENDENT" | "WHOLE_ROOM_COMBINATION" | null;
+  code_provenance: "SOURCE_EXPLICIT" | "USER_CONFIRMED_RENAMED" | "PMS_GENERATED" | null;
+  physical_bed_count: number | null;
 }
 
 export interface PricingPolicyVersionDto {
@@ -88,9 +96,13 @@ export interface PricingPolicyVersionDto {
   property_id: string;
   code: string;
   version: number;
-  stay_type: StayType;
-  calculation_kind: "FLAT_NIGHTLY" | "FREE";
-  nightly_rate_minor: number;
+  stay_type: StayType | null;
+  calculation_kind: "FLAT_NIGHTLY" | "DURATION_BAND_TOTAL" | "FREE";
+  nightly_rate_minor: number | null;
+  product_anchor_rates_minor: Record<string, { "1": number; "7": number; "14": number; "30": number }> | null;
+  effective_from: string | null;
+  effective_until: string | null;
+  rounding_rule: "FINAL_TOTAL_WHOLE_YUAN_HALF_UP" | null;
   currency: string;
   status: "PUBLISHED";
 }
@@ -98,12 +110,44 @@ export interface PricingPolicyVersionDto {
 export interface MemberContractDto {
   id: string;
   property_id: string;
+  member_id: string | null;
   member_name: string;
   status: "ACTIVE" | "EXPIRED";
   valid_from: string;
   valid_until: string;
   version: number;
   created_at: string;
+}
+
+export interface MemberDto {
+  id: string;
+  identity_card_number: string;
+  full_name: string;
+  phone: string;
+  wechat: string;
+  created_at: string;
+}
+
+export interface MemberExternalReferenceDto {
+  id: string;
+  member_id: string;
+  property_id: string;
+  provider: "FEISHU_BASE";
+  source_container_id: string;
+  source_table_id: string;
+  external_record_id: string;
+  created_at: string;
+}
+
+export interface MemberAvailableBalanceDto {
+  ROOM_NIGHT: number;
+  BED_NIGHT: number;
+}
+
+export interface MemberLotBalanceDto {
+  lotId: string;
+  unitKind: "ROOM_NIGHT" | "BED_NIGHT";
+  availableUnits: number;
 }
 
 export interface EntitlementLotDto {
@@ -130,15 +174,28 @@ export interface EntitlementLedgerDto {
 }
 
 export interface MemberViewDto {
-  contract: MemberContractDto;
+  member: MemberDto;
+  contracts: MemberContractDto[];
   lots: EntitlementLotDto[];
   ledger: EntitlementLedgerDto[];
+  externalReferences: MemberExternalReferenceDto[];
+  lotBalances: MemberLotBalanceDto[];
+  availableBalance: MemberAvailableBalanceDto;
+  balanceAsOfDate: string;
+}
+
+export interface MemberSummaryDto {
+  member: MemberDto;
+  contracts: MemberContractDto[];
+  availableBalance: MemberAvailableBalanceDto;
+  balanceAsOfDate: string;
 }
 
 export interface MetaDto {
   properties: PropertyDto[];
   inventoryUnits: InventoryUnitDto[];
   pricingPolicyVersions: PricingPolicyVersionDto[];
+  members: MemberDto[];
   memberContracts: MemberContractDto[];
 }
 
@@ -155,6 +212,13 @@ export interface UnitAvailabilityDto {
   roomId: string;
   code: string;
   name: string;
+  catalogVersion: string | null;
+  buildingCode: string | null;
+  roomTypeCode: string | null;
+  pricingProductCode: string | null;
+  inventoryBasis: "INDEPENDENT" | "WHOLE_ROOM_COMBINATION" | null;
+  codeProvenance: "SOURCE_EXPLICIT" | "USER_CONFIRMED_RENAMED" | "PMS_GENERATED" | null;
+  physicalBedCount: number | null;
   nights: AvailabilityNightDto[];
   available: boolean;
 }
@@ -185,6 +249,9 @@ export interface OrderRowDto {
   arrival_date: string;
   departure_date: string;
   primary_guest_snapshot: Record<string, unknown>;
+  booking_channel_code: BookingChannelCode | null;
+  channel_order_reference: string | null;
+  free_stay_reason: string | null;
   pricing_policy_version_id: string;
   member_contract_id: string | null;
   current_revision_id: string | null;
@@ -229,6 +296,7 @@ export interface PricingRevisionDto {
   departure_date: string;
   coverage_set: unknown;
   cash_lines: unknown;
+  policy_base_amount_minor: number;
   manual_adjustment_minor: number;
   current_contract_amount_minor: number;
   currency: string;
@@ -260,6 +328,7 @@ export interface CollectionFactDto {
   reverses_fact_id: string | null;
   method: string;
   note: string;
+  transaction_reference: string | null;
   command_id: string;
   created_at: string;
 }
@@ -296,6 +365,7 @@ export interface CommandRequest {
 
 export type {
   AmountSummaryDto,
+  BookingChannelCode,
   CommandType,
   CreateQuoteCommandResponseDto,
   PreviewDto,

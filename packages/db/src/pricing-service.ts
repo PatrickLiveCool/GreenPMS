@@ -1,6 +1,6 @@
 import { sql, type Kysely, type Transaction } from "kysely";
 import { DomainError, type InventoryUnitKind, type QuoteDto, type StayType, type StoredQuoteDto } from "@qintopia/contracts";
-import { calculatePricing, entitlementKindFor, enumerateServiceDates, newId, stableHash, type CoverageCandidate, type PricingPolicy } from "@qintopia/domain";
+import { calculatePricing, entitlementKindFor, enumerateServiceDates, isTransientDuration, newId, stableHash, type CoverageCandidate, type DurationBandAnchors, type PricingPolicy } from "@qintopia/domain";
 import { entitlementAvailableBalance, parsePostgresBigInt } from "./entitlement-balance.ts";
 import { listAvailability, loadInventoryUnit, type DbExecutor } from "./inventory.ts";
 import type { Database } from "./schema.ts";
@@ -26,11 +26,17 @@ export async function loadPricingPolicy(db: DbExecutor, propertyId: string, poli
     .where("status", "=", "PUBLISHED")
     .executeTakeFirst();
   if (!row) throw new DomainError("POLICY_VERSION_NOT_FOUND", "Pricing policy version not found", 404);
+  const rawAnchors = typeof row.product_anchor_rates_minor === "string" ? JSON.parse(row.product_anchor_rates_minor) as unknown : row.product_anchor_rates_minor;
+  const productAnchorRatesMinor = row.calculation_kind === "DURATION_BAND_TOTAL" ? rawAnchors as Record<string, DurationBandAnchors> : null;
   return {
     id: row.id,
-    stayType: row.stay_type as StayType,
+    stayType: row.stay_type as StayType | null,
     calculationKind: row.calculation_kind,
     nightlyRateMinor: row.nightly_rate_minor,
+    productAnchorRatesMinor,
+    effectiveFrom: row.effective_from,
+    effectiveUntil: row.effective_until,
+    roundingRule: row.rounding_rule,
     currency: row.currency
   };
 }
@@ -113,6 +119,9 @@ export async function createQuoteInTransaction(db: Transaction<Database>, reques
   const selected = availability.find((candidate) => candidate.id === unit.id);
   if (!selected?.available) throw new DomainError("INVENTORY_CONFLICT", "Inventory is not available for the requested dates", 409);
   const dates = enumerateServiceDates(request.arrivalDate, request.departureDate);
+  if (request.stayType === "TRANSIENT" && !isTransientDuration(dates.length)) {
+    throw new DomainError("PRICING_POLICY_UNCONFIGURED", "TRANSIENT stays must be strictly shorter than 7 nights", 422);
+  }
   const coverageCandidates = await allocateCoverageCandidates(db, {
     propertyId: request.propertyId,
     inventoryUnitKind: unit.kind,
@@ -123,10 +132,12 @@ export async function createQuoteInTransaction(db: Transaction<Database>, reques
     propertyId: request.propertyId,
     inventoryUnitId: unit.id,
     inventoryUnitKind: unit.kind,
+    inventoryProductCode: unit.pricingProductCode,
     arrivalDate: request.arrivalDate,
     departureDate: request.departureDate,
     stayType: request.stayType,
     policy,
+    memberCoverage: Boolean(request.memberContractId),
     coverageCandidates
   });
   const quoteId = newId("quote");

@@ -34,7 +34,7 @@ export async function resetDatabase(databaseUrl: string): Promise<Kysely<Databas
     await client.end();
   }
   const db = createDatabase(databaseUrl);
-  await seedDemo(db);
+  await seedDemo(db, { includeProtocolFixturePolicy: true });
   return db;
 }
 

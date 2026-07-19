@@ -30,14 +30,14 @@ describe('approved finite pricing policies', () => {
       }],
     });
     expect(quote.coverageSet).toHaveLength(1);
-    expect(quote.cashLines.map((line) => line.serviceDate)).toEqual(['2026-07-21', '2026-07-22']);
+    expect(quote.cashLines.filter((line) => 'serviceDate' in line).map((line) => line.serviceDate)).toEqual(['2026-07-21', '2026-07-22']);
     expect(quote.currentContractAmount.minorUnits).toBe(25_600);
   });
 
   it.each(['WEEKLY', 'MONTHLY', 'CUSTOM', 'FIXED_TERM', 'ROLLING'] as const)('rejects a matching but unapproved %s nightly policy', (stayType) => {
     const unapprovedPolicy: PricingPolicy = { ...policy, stayType };
     expect(() => calculatePricing({ ...base, stayType, policy: unapprovedPolicy, coverageCandidates: [] }))
-      .toThrowError(/approved real pricing facts/);
+      .toThrow(expect.objectContaining<Partial<DomainError>>({ code: 'PRICING_POLICY_UNCONFIGURED' }));
   });
 
   it('rejects policy calculation shapes that are not approved for their stay type', () => {
@@ -45,14 +45,14 @@ describe('approved finite pricing policies', () => {
       ...base,
       policy: { ...policy, calculationKind: 'FREE', nightlyRateMinor: 0 },
       coverageCandidates: [],
-    })).toThrowError(/approved real pricing facts/);
+    })).toThrow(expect.objectContaining<Partial<DomainError>>({ code: 'PRICING_POLICY_UNCONFIGURED' }));
 
     expect(() => calculatePricing({
       ...base,
       stayType: 'FREE',
       policy: { ...policy, stayType: 'FREE', calculationKind: 'FLAT_NIGHTLY' },
       coverageCandidates: [],
-    })).toThrowError(/approved real pricing facts/);
+    })).toThrow(expect.objectContaining<Partial<DomainError>>({ code: 'PRICING_POLICY_UNCONFIGURED' }));
   });
 
   it('rejects unapproved cross-month fixed-night calculations', () => {

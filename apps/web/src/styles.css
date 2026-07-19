@@ -588,6 +588,47 @@ textarea:focus-visible {
   overflow-wrap: anywhere;
 }
 
+.service-failure {
+  width: min(100%, 560px);
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr);
+  align-items: start;
+  gap: 10px;
+  padding: 16px;
+  border: 1px solid #deb9b6;
+  border-radius: 6px;
+  background: var(--danger-soft);
+  color: var(--danger-hover);
+}
+
+.service-failure h1 {
+  font-size: 15px;
+  line-height: 1.3;
+}
+
+.service-failure p,
+.session-action-error p {
+  margin-top: 3px;
+  overflow-wrap: anywhere;
+}
+
+.startup-state > .button {
+  justify-self: center;
+}
+
+.session-action-error {
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px 14px;
+  margin: 12px 22px 0;
+  padding: 12px 14px;
+  border: 1px solid #deb9b6;
+  border-radius: 6px;
+  background: var(--danger-soft);
+  color: var(--danger-hover);
+}
+
 .empty-state {
   min-height: 150px;
   display: grid;
@@ -2216,6 +2257,10 @@ pre {
     margin-left: auto;
   }
 
+  .session-action-error {
+    margin: 12px 14px 0;
+  }
+
   .property-meta {
     display: none;
   }
@@ -2264,6 +2309,18 @@ pre {
   .queue-actions {
     grid-column: 3;
     grid-row: 1 / 3;
+  }
+}
+
+@media (max-width: 560px) {
+  .session-action-error {
+    grid-template-columns: 20px minmax(0, 1fr);
+    align-items: start;
+  }
+
+  .session-action-error .button {
+    grid-column: 1 / -1;
+    width: 100%;
   }
 }
 

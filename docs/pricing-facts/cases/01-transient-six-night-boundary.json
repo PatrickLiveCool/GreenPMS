@@ -1,0 +1,72 @@
+{
+  "caseId": "rev561-transient-6-night",
+  "anonymizedOrderRef": "OWNER-CONFIRMED-RULE-TRANSIENT-6",
+  "businessExplanation": "Six nights remains transient and uses six times the published P1 quad-bed anchor.",
+  "businessPlan": "TRANSIENT",
+  "scenarioTags": ["BASELINE", "BOUNDARY"],
+  "propertyTimeZone": "Asia/Shanghai",
+  "currency": "CNY",
+  "inventoryUnitKind": "BED",
+  "arrivalDate": "2026-02-25",
+  "departureDate": "2026-03-03",
+  "departureCharged": false,
+  "priceInputs": {
+    "policyVersionReference": "policy_qintopia_public_2026_rev561_v1",
+    "initialProductCode": "shared_bath_quad_bed",
+    "initialInventoryUnitReference": "BED-101-A"
+  },
+  "coverageSet": [],
+  "amendments": [],
+  "rounding": { "stage": "FINAL_STAY_TOTAL", "unit": "CNY_YUAN", "mode": "HALF_UP_POSITIVE" },
+  "boundaryEvidence": {
+    "boundaryName": "strictly-less-than-seven transient boundary",
+    "comparisonCaseId": "rev561-weekly-shorten-7-to-6",
+    "observedBehaviorChange": "Six nights uses P1 while seven nights enters the seven-night band."
+  },
+  "expected": {
+    "pricingRevisions": [{
+      "revisionNo": 1,
+      "amendmentType": "CREATE_ORDER",
+      "pricingPolicyVersionReference": "policy_qintopia_public_2026_rev561_v1",
+      "arrivalDate": "2026-02-25",
+      "departureDate": "2026-03-03",
+      "coverageSet": [],
+      "cashLines": [{
+        "lineKind": "STAY_TOTAL",
+        "pricingBandAnchorNights": 1,
+        "calculationSegments": [{
+          "inventoryUnitReference": "BED-101-A",
+          "pricingProductCode": "shared_bath_quad_bed",
+          "arrivalDate": "2026-02-25",
+          "departureDate": "2026-03-03",
+          "nights": 6,
+          "anchorAmountMinor": 5800,
+          "numeratorMinor": 34800,
+          "denominator": 1
+        }],
+        "amountMinor": 34800
+      }],
+      "manualAdjustmentMinor": 0,
+      "cashRemainderMinor": 34800,
+      "currentContractAmountMinor": 34800,
+      "roundingEvidence": { "rule": "FINAL_STAY_TOTAL_WHOLE_YUAN_HALF_UP", "pricingBandAnchorNights": 1 }
+    }],
+    "cashLines": [{
+      "lineKind": "STAY_TOTAL",
+      "pricingBandAnchorNights": 1,
+      "calculationSegments": [{
+        "inventoryUnitReference": "BED-101-A",
+        "pricingProductCode": "shared_bath_quad_bed",
+        "arrivalDate": "2026-02-25",
+        "departureDate": "2026-03-03",
+        "nights": 6,
+        "anchorAmountMinor": 5800,
+        "numeratorMinor": 34800,
+        "denominator": 1
+      }],
+      "amountMinor": 34800
+    }],
+    "cashRemainderMinor": 34800,
+    "currentContractAmountMinor": 34800
+  }
+}

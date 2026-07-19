@@ -1,0 +1,387 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="4200" height="3940" viewBox="0 0 4200 3940">
+  <rect x="0" y="0" width="4200" height="3940" fill="#F6F7F4"/>
+
+  <g font-family="Noto Sans SC, PingFang SC, sans-serif" letter-spacing="0">
+    <!-- Header -->
+    <rect x="0" y="0" width="4200" height="250" fill="#172A27"/>
+    <rect x="0" y="0" width="24" height="250" fill="#4FB286"/>
+    <text x="90" y="90" fill="#FFFFFF" font-size="54" font-weight="700">QinTopia PMS｜工作人员工作流程与人工输入字段</text>
+    <text x="92" y="145" fill="#CFE2DA" font-size="25">当前已实现流程 + 已确认待补契约｜依据现有 Web、API、PostgreSQL 与自动化测试梳理</text>
+
+    <rect x="2860" y="58" width="1220" height="128" rx="8" fill="#223C36" stroke="#45645B" stroke-width="2"/>
+    <circle cx="2920" cy="101" r="10" fill="#2F80ED"/>
+    <text x="2945" y="109" fill="#EAF3F0" font-size="23">当前人工输入</text>
+    <circle cx="3220" cy="101" r="10" fill="#A7B1AD"/>
+    <text x="3245" y="109" fill="#EAF3F0" font-size="23">系统自动</text>
+    <rect x="3485" y="89" width="18" height="18" fill="#F4B740"/>
+    <text x="3520" y="109" fill="#EAF3F0" font-size="23">待确认</text>
+    <rect x="3750" y="89" width="18" height="18" fill="#E35D6A"/>
+    <text x="3785" y="109" fill="#EAF3F0" font-size="23">尚未实现</text>
+    <text x="2910" y="158" fill="#AFC5BD" font-size="20">“必”=人工必填　“选”=人工可选　“继承”=从上一步或当前对象带入</text>
+
+    <!-- Main journey lane -->
+    <rect x="60" y="300" width="4080" height="930" rx="8" fill="#ECF4F1" stroke="#C9DBD4" stroke-width="2"/>
+    <rect x="60" y="300" width="4080" height="84" fill="#DCEBE5"/>
+    <text x="120" y="355" fill="#1D4A3D" font-size="34" font-weight="700">主住宿经营流程</text>
+    <text x="470" y="354" fill="#56756B" font-size="23">从登录、房态、报价到订单、入住与退房</text>
+    <line x1="145" y1="785" x2="3760" y2="785" stroke="#95AEA5" stroke-width="8" stroke-linecap="round"/>
+
+    <!-- Main card 1 -->
+    <rect x="120" y="430" width="470" height="720" rx="8" fill="#FFFFFF" stroke="#8EA49D" stroke-width="3"/>
+    <rect x="120" y="430" width="470" height="86" rx="8" fill="#2D4741"/>
+    <circle cx="165" cy="473" r="25" fill="#FFFFFF"/>
+    <text x="165" y="482" text-anchor="middle" fill="#2D4741" font-size="27" font-weight="700">1</text>
+    <text x="205" y="483" fill="#FFFFFF" font-size="29" font-weight="700">登录与工作区</text>
+    <text x="155" y="560" fill="#2F80ED" font-size="23" font-weight="700">工作人员提供</text>
+    <text x="155" y="605" fill="#25322E" font-size="24">必　账号</text>
+    <text x="155" y="642" fill="#25322E" font-size="24">必　密码</text>
+    <text x="155" y="679" fill="#25322E" font-size="24">必　当前物业</text>
+    <text x="155" y="714" fill="#6B7773" font-size="21">可沿用上次选择或首个有权物业</text>
+    <line x1="155" y1="748" x2="555" y2="748" stroke="#D7E0DD" stroke-width="2"/>
+    <text x="155" y="830" fill="#7B8984" font-size="23" font-weight="700">系统自动加载</text>
+    <text x="155" y="872" fill="#56635F" font-size="22">主体 / SESSION</text>
+    <text x="155" y="908" fill="#56635F" font-size="22">物业 READ 或 WRITE 权限</text>
+    <text x="155" y="944" fill="#56635F" font-size="22">物业时区 / 币种</text>
+    <text x="155" y="1002" fill="#7B8984" font-size="21">入口：房态 · 订单 · 会员</text>
+    <text x="155" y="1035" fill="#7B8984" font-size="21">Token · 移动履约</text>
+
+    <!-- Main card 2 -->
+    <rect x="650" y="430" width="470" height="720" rx="8" fill="#FFFFFF" stroke="#5A9F91" stroke-width="3"/>
+    <rect x="650" y="430" width="470" height="86" rx="8" fill="#2A7B6D"/>
+    <circle cx="695" cy="473" r="25" fill="#FFFFFF"/>
+    <text x="695" y="482" text-anchor="middle" fill="#2A7B6D" font-size="27" font-weight="700">2</text>
+    <text x="735" y="483" fill="#FFFFFF" font-size="29" font-weight="700">查询房态</text>
+    <text x="685" y="560" fill="#2F80ED" font-size="23" font-weight="700">工作人员提供</text>
+    <text x="685" y="605" fill="#25322E" font-size="24">必　到店日期</text>
+    <text x="685" y="642" fill="#25322E" font-size="24">必　离店日期</text>
+    <text x="685" y="679" fill="#25322E" font-size="24">选　全部 / 整房 / 床位</text>
+    <text x="685" y="716" fill="#25322E" font-size="24">必　选择房间或床位</text>
+    <line x1="685" y1="748" x2="1085" y2="748" stroke="#D7E0DD" stroke-width="2"/>
+    <text x="685" y="830" fill="#7B8984" font-size="23" font-weight="700">系统返回</text>
+    <text x="685" y="872" fill="#56635F" font-size="22">逐日 available / blocked</text>
+    <text x="685" y="908" fill="#56635F" font-size="22">blocking Claim ID</text>
+    <rect x="680" y="955" width="410" height="132" rx="6" fill="#FFF1F2" stroke="#E35D6A" stroke-width="2" stroke-dasharray="9 7"/>
+    <text x="705" y="992" fill="#B63E4C" font-size="21" font-weight="700">尚未实现的目标输出</text>
+    <text x="705" y="1028" fill="#8C3943" font-size="20">typed source · asOf · revision</text>
+    <text x="705" y="1062" fill="#8C3943" font-size="20">freshness · stale / unknown</text>
+
+    <!-- Main card 3 -->
+    <rect x="1180" y="430" width="470" height="720" rx="8" fill="#FFFFFF" stroke="#6F9FCC" stroke-width="3"/>
+    <rect x="1180" y="430" width="470" height="86" rx="8" fill="#326FA8"/>
+    <circle cx="1225" cy="473" r="25" fill="#FFFFFF"/>
+    <text x="1225" y="482" text-anchor="middle" fill="#326FA8" font-size="27" font-weight="700">3</text>
+    <text x="1265" y="483" fill="#FFFFFF" font-size="29" font-weight="700">获取服务端报价</text>
+    <text x="1215" y="560" fill="#2F80ED" font-size="23" font-weight="700">工作人员提供</text>
+    <text x="1215" y="605" fill="#25322E" font-size="24">必　住宿类型</text>
+    <text x="1215" y="642" fill="#25322E" font-size="24">必　计价政策版本</text>
+    <text x="1215" y="679" fill="#25322E" font-size="24">选　会员合同</text>
+    <text x="1215" y="722" fill="#7B8984" font-size="21">继承：物业、库存、到店/离店日期</text>
+    <line x1="1215" y1="748" x2="1615" y2="748" stroke="#D7E0DD" stroke-width="2"/>
+    <text x="1215" y="830" fill="#7B8984" font-size="23" font-weight="700">系统计算并返回</text>
+    <text x="1215" y="872" fill="#56635F" font-size="22">Quote ID / 有效期 / Receipt</text>
+    <text x="1215" y="908" fill="#56635F" font-size="22">coverageSet / 现金明细</text>
+    <text x="1215" y="944" fill="#56635F" font-size="22">cashRemainder</text>
+    <text x="1215" y="980" fill="#56635F" font-size="22">currentContractAmount</text>
+    <rect x="1215" y="1022" width="400" height="65" rx="6" fill="#EAF2FA"/>
+    <text x="1235" y="1062" fill="#326FA8" font-size="20">唯一 READ 可执行的写审计动作</text>
+
+    <!-- Main card 4 -->
+    <rect x="1710" y="430" width="470" height="720" rx="8" fill="#FFFFFF" stroke="#66A67C" stroke-width="3"/>
+    <rect x="1710" y="430" width="470" height="86" rx="8" fill="#39875A"/>
+    <circle cx="1755" cy="473" r="25" fill="#FFFFFF"/>
+    <text x="1755" y="482" text-anchor="middle" fill="#39875A" font-size="27" font-weight="700">4</text>
+    <text x="1795" y="483" fill="#FFFFFF" font-size="29" font-weight="700">创建订单</text>
+    <text x="1745" y="560" fill="#2F80ED" font-size="23" font-weight="700">工作人员提供</text>
+    <text x="1745" y="605" fill="#25322E" font-size="24">必　主要居住人姓名</text>
+    <text x="1745" y="642" fill="#25322E" font-size="24">选　联系电话</text>
+    <text x="1745" y="679" fill="#25322E" font-size="24">选　证件号码</text>
+    <text x="1745" y="721" fill="#7B8984" font-size="21">继承：Quote ID / 物业</text>
+    <rect x="1740" y="752" width="410" height="172" rx="6" fill="#FFF1F2" stroke="#E35D6A" stroke-width="2" stroke-dasharray="9 7"/>
+    <text x="1765" y="790" fill="#B63E4C" font-size="21" font-weight="700">已确认尚未实现</text>
+    <text x="1765" y="828" fill="#8C3943" font-size="21">必　sourceChannelCode</text>
+    <text x="1765" y="864" fill="#8C3943" font-size="20">游牧岛 / 携程 / 美团 / 企业微信</text>
+    <text x="1765" y="900" fill="#8C3943" font-size="21">待定　channelOrderReference</text>
+    <text x="1745" y="972" fill="#7B8984" font-size="23" font-weight="700">系统原子产生</text>
+    <text x="1745" y="1010" fill="#56635F" font-size="21">Order / Stay / Segment / Claim</text>
+    <text x="1745" y="1044" fill="#56635F" font-size="21">Pricing Revision / Coverage</text>
+    <text x="1745" y="1078" fill="#56635F" font-size="21">初始 RESERVED / PLANNED</text>
+
+    <!-- Main card 5 -->
+    <rect x="2240" y="430" width="470" height="720" rx="8" fill="#FFFFFF" stroke="#C9A25B" stroke-width="3"/>
+    <rect x="2240" y="430" width="470" height="86" rx="8" fill="#9B6A22"/>
+    <circle cx="2285" cy="473" r="25" fill="#FFFFFF"/>
+    <text x="2285" y="482" text-anchor="middle" fill="#9B6A22" font-size="27" font-weight="700">5</text>
+    <text x="2325" y="483" fill="#FFFFFF" font-size="29" font-weight="700">已预订工作台</text>
+    <text x="2275" y="560" fill="#2F80ED" font-size="23" font-weight="700">工作人员选择</text>
+    <text x="2275" y="605" fill="#25322E" font-size="24">选　订单 ID / 住客搜索</text>
+    <text x="2275" y="642" fill="#25322E" font-size="24">选　订单状态筛选</text>
+    <text x="2275" y="679" fill="#25322E" font-size="24">必　目标订单</text>
+    <line x1="2275" y1="722" x2="2675" y2="722" stroke="#D7E0DD" stroke-width="2"/>
+    <text x="2275" y="830" fill="#7B8984" font-size="23" font-weight="700">可进入的人工动作</text>
+    <text x="2275" y="872" fill="#56635F" font-size="22">收款 / 退款 / 冲销</text>
+    <text x="2275" y="908" fill="#56635F" font-size="22">续住 / 缩短 / 换房 / 调价</text>
+    <text x="2275" y="944" fill="#56635F" font-size="22">取消 / 未到 / 入住</text>
+    <rect x="2275" y="994" width="400" height="88" rx="6" fill="#FFF8E8" stroke="#D7B16A" stroke-width="2"/>
+    <text x="2295" y="1028" fill="#77501D" font-size="20">所有高风险动作均进入</text>
+    <text x="2295" y="1060" fill="#77501D" font-size="21" font-weight="700">Preview → Confirm → Receipt</text>
+
+    <!-- Main card 6 -->
+    <rect x="2770" y="430" width="470" height="720" rx="8" fill="#FFFFFF" stroke="#9B8BB5" stroke-width="3"/>
+    <rect x="2770" y="430" width="470" height="86" rx="8" fill="#6E5A8C"/>
+    <circle cx="2815" cy="473" r="25" fill="#FFFFFF"/>
+    <text x="2815" y="482" text-anchor="middle" fill="#6E5A8C" font-size="27" font-weight="700">6</text>
+    <text x="2855" y="483" fill="#FFFFFF" font-size="29" font-weight="700">入住与在住</text>
+    <text x="2805" y="560" fill="#2F80ED" font-size="23" font-weight="700">工作人员选择</text>
+    <text x="2805" y="605" fill="#25322E" font-size="24">选　营业日期</text>
+    <text x="2805" y="642" fill="#25322E" font-size="24">选　今日到店 / 在住队列</text>
+    <text x="2805" y="679" fill="#25322E" font-size="24">必　目标订单 + 入住动作</text>
+    <text x="2805" y="721" fill="#7B8984" font-size="21">无入住专属表单字段</text>
+    <line x1="2805" y1="748" x2="3205" y2="748" stroke="#D7E0DD" stroke-width="2"/>
+    <text x="2805" y="830" fill="#7B8984" font-size="23" font-weight="700">通用确认时提供</text>
+    <text x="2805" y="872" fill="#25322E" font-size="22">必　原因代码</text>
+    <text x="2805" y="908" fill="#25322E" font-size="22">必　原因说明</text>
+    <text x="2805" y="960" fill="#7B8984" font-size="21">系统：Order → CHECKED_IN</text>
+    <text x="2805" y="994" fill="#7B8984" font-size="21">Stay → IN_HOUSE</text>
+    <text x="2805" y="1048" fill="#56635F" font-size="21">在住期间可再次进入住宿变更</text>
+
+    <!-- Main card 7 -->
+    <rect x="3300" y="430" width="470" height="720" rx="8" fill="#FFFFFF" stroke="#5B8A78" stroke-width="3"/>
+    <rect x="3300" y="430" width="470" height="86" rx="8" fill="#315E50"/>
+    <circle cx="3345" cy="473" r="25" fill="#FFFFFF"/>
+    <text x="3345" y="482" text-anchor="middle" fill="#315E50" font-size="27" font-weight="700">7</text>
+    <text x="3385" y="483" fill="#FFFFFF" font-size="29" font-weight="700">退房与完成</text>
+    <text x="3335" y="560" fill="#2F80ED" font-size="23" font-weight="700">工作人员选择</text>
+    <text x="3335" y="605" fill="#25322E" font-size="24">选　营业日期 / 离店队列</text>
+    <text x="3335" y="642" fill="#25322E" font-size="24">必　目标订单 + 退房动作</text>
+    <text x="3335" y="684" fill="#7B8984" font-size="21">无退房专属表单字段</text>
+    <line x1="3335" y1="722" x2="3735" y2="722" stroke="#D7E0DD" stroke-width="2"/>
+    <text x="3335" y="830" fill="#7B8984" font-size="23" font-weight="700">通用确认时提供</text>
+    <text x="3335" y="872" fill="#25322E" font-size="22">必　原因代码</text>
+    <text x="3335" y="908" fill="#25322E" font-size="22">必　原因说明</text>
+    <text x="3335" y="960" fill="#7B8984" font-size="21">系统：Order → CHECKED_OUT</text>
+    <text x="3335" y="994" fill="#7B8984" font-size="21">Stay → COMPLETED</text>
+    <text x="3335" y="1028" fill="#7B8984" font-size="21">权益 CONSUME / 释放库存</text>
+    <text x="3335" y="1070" fill="#315E50" font-size="22" font-weight="700">持久 Receipt 与事实引用</text>
+
+    <!-- Main arrowheads -->
+    <polygon points="642,785 620,770 620,800" fill="#617A71"/>
+    <polygon points="1172,785 1150,770 1150,800" fill="#617A71"/>
+    <polygon points="1702,785 1680,770 1680,800" fill="#617A71"/>
+    <polygon points="2232,785 2210,770 2210,800" fill="#617A71"/>
+    <polygon points="2762,785 2740,770 2740,800" fill="#617A71"/>
+    <polygon points="3292,785 3270,770 3270,800" fill="#617A71"/>
+
+    <!-- Finance lane -->
+    <rect x="60" y="1280" width="4080" height="650" rx="8" fill="#FFF8E8" stroke="#E5D3AA" stroke-width="2"/>
+    <rect x="60" y="1280" width="4080" height="82" fill="#F5E8C9"/>
+    <text x="120" y="1335" fill="#6E4B18" font-size="34" font-weight="700">订单内资金事实</text>
+    <text x="475" y="1334" fill="#8B6B37" font-size="23">工作人员人工登记，不代表银行确认或自动结算</text>
+    <polyline points="2475,1150 2475,1248 575,1248 575,1280" fill="none" stroke="#B08B47" stroke-width="5"/>
+    <polygon points="575,1280 560,1258 590,1258" fill="#B08B47"/>
+
+    <rect x="140" y="1405" width="880" height="460" rx="8" fill="#FFFFFF" stroke="#C79B45" stroke-width="3"/>
+    <rect x="140" y="1405" width="880" height="74" rx="8" fill="#A97418"/>
+    <text x="180" y="1454" fill="#FFFFFF" font-size="28" font-weight="700">记录收款 COLLECTION</text>
+    <text x="180" y="1524" fill="#2F80ED" font-size="22" font-weight="700">当前人工字段</text>
+    <text x="180" y="1564" fill="#25322E" font-size="23">必　金额（最小货币单位正整数）</text>
+    <text x="180" y="1600" fill="#25322E" font-size="23">必　方式：CASH / BANK_TRANSFER / CARD / OTHER</text>
+    <text x="180" y="1636" fill="#25322E" font-size="23">选　备注</text>
+    <rect x="170" y="1672" width="820" height="155" rx="6" fill="#FFF1F2" stroke="#E35D6A" stroke-width="2" stroke-dasharray="9 7"/>
+    <text x="198" y="1710" fill="#B63E4C" font-size="21" font-weight="700">已确认尚未实现</text>
+    <text x="198" y="1748" fill="#8C3943" font-size="21">必　transactionChannelCode</text>
+    <text x="198" y="1783" fill="#8C3943" font-size="21">必　transactionReference　　必　occurredAt</text>
+
+    <rect x="1070" y="1405" width="880" height="460" rx="8" fill="#FFFFFF" stroke="#C98256" stroke-width="3"/>
+    <rect x="1070" y="1405" width="880" height="74" rx="8" fill="#A95D32"/>
+    <text x="1110" y="1454" fill="#FFFFFF" font-size="28" font-weight="700">记录退款 REFUND</text>
+    <text x="1110" y="1524" fill="#2F80ED" font-size="22" font-weight="700">当前人工字段</text>
+    <text x="1110" y="1564" fill="#25322E" font-size="23">必　引用同订单原收款 Fact</text>
+    <text x="1110" y="1600" fill="#25322E" font-size="23">必　退款金额　　必　方式</text>
+    <text x="1110" y="1636" fill="#25322E" font-size="23">选　备注</text>
+    <rect x="1100" y="1672" width="820" height="155" rx="6" fill="#FFF1F2" stroke="#E35D6A" stroke-width="2" stroke-dasharray="9 7"/>
+    <text x="1128" y="1710" fill="#B63E4C" font-size="21" font-weight="700">已确认尚未实现</text>
+    <text x="1128" y="1748" fill="#8C3943" font-size="21">必　退款渠道 + 本次退款交易号</text>
+    <text x="1128" y="1783" fill="#8C3943" font-size="21">必　实际退款时间 occurredAt</text>
+
+    <rect x="2000" y="1405" width="880" height="460" rx="8" fill="#FFFFFF" stroke="#9B8BB5" stroke-width="3"/>
+    <rect x="2000" y="1405" width="880" height="74" rx="8" fill="#6E5A8C"/>
+    <text x="2040" y="1454" fill="#FFFFFF" font-size="28" font-weight="700">冲销与金额视图</text>
+    <text x="2040" y="1524" fill="#2F80ED" font-size="22" font-weight="700">冲销时人工提供</text>
+    <text x="2040" y="1564" fill="#25322E" font-size="23">必　目标收款或退款 Fact</text>
+    <text x="2040" y="1600" fill="#25322E" font-size="23">必　冲销备注</text>
+    <text x="2040" y="1650" fill="#7B8984" font-size="22" font-weight="700">系统自动计算</text>
+    <text x="2040" y="1688" fill="#56635F" font-size="21">金额 / 币种 / 净影响 / 可退上限</text>
+    <text x="2040" y="1730" fill="#56635F" font-size="21">currentContractAmount</text>
+    <text x="2040" y="1765" fill="#56635F" font-size="21">netRecordedCollection</text>
+    <text x="2040" y="1800" fill="#56635F" font-size="21">collectionDifference</text>
+
+    <rect x="2930" y="1405" width="1110" height="460" rx="8" fill="#FFFFFF" stroke="#778C85" stroke-width="3"/>
+    <rect x="2930" y="1405" width="1110" height="74" rx="8" fill="#394F48"/>
+    <text x="2970" y="1454" fill="#FFFFFF" font-size="28" font-weight="700">渠道目录与引用规则（待补契约）</text>
+    <text x="2970" y="1524" fill="#B63E4C" font-size="22" font-weight="700">稳定 code，不直接把中文名写成自由文本</text>
+    <text x="2970" y="1570" fill="#25322E" font-size="23">YOUMUDAO　游牧岛</text>
+    <text x="2970" y="1607" fill="#25322E" font-size="23">CTRIP　　　 携程</text>
+    <text x="2970" y="1644" fill="#25322E" font-size="23">MEITUAN　　 美团</text>
+    <text x="2970" y="1681" fill="#25322E" font-size="23">WECOM　　　 企业微信</text>
+    <line x1="2970" y1="1715" x2="3995" y2="1715" stroke="#D7E0DD" stroke-width="2"/>
+    <text x="2970" y="1755" fill="#56635F" font-size="21">订单来源渠道 ≠ 每笔资金交易渠道</text>
+    <text x="2970" y="1790" fill="#56635F" font-size="21">Fact ID / Receipt ID / Idempotency-Key</text>
+    <text x="2970" y="1824" fill="#56635F" font-size="21">均不能代替工作人员录入的交易号</text>
+
+    <!-- Stay change lane -->
+    <rect x="60" y="1980" width="4080" height="580" rx="8" fill="#F3F0F7" stroke="#D7CFE1" stroke-width="2"/>
+    <rect x="60" y="1980" width="4080" height="82" fill="#E6DFEE"/>
+    <text x="120" y="2035" fill="#594674" font-size="34" font-weight="700">订单内住宿变更与异常结束</text>
+    <text x="690" y="2034" fill="#77698A" font-size="23">每次变更追加 Amendment / Segment / Pricing Revision，不覆盖历史</text>
+    <polyline points="2475,1150 2475,1960 590,1960 590,1980" fill="none" stroke="#8B7A9F" stroke-width="5"/>
+    <polygon points="590,1980 575,1958 605,1958" fill="#8B7A9F"/>
+
+    <rect x="140" y="2105" width="900" height="390" rx="8" fill="#FFFFFF" stroke="#8C7AA3" stroke-width="3"/>
+    <text x="180" y="2165" fill="#594674" font-size="28" font-weight="700">续住 / 缩短</text>
+    <text x="180" y="2215" fill="#25322E" font-size="23">必　新离店日期</text>
+    <text x="180" y="2252" fill="#25322E" font-size="23">选　本 revision 手工调整金额</text>
+    <text x="180" y="2300" fill="#7B8984" font-size="21">系统使用成交时锁定政策重算</text>
+    <text x="180" y="2335" fill="#7B8984" font-size="21">释放或追加对应日期 Claim</text>
+    <rect x="180" y="2380" width="820" height="72" rx="6" fill="#EEE8F4"/>
+    <text x="205" y="2425" fill="#594674" font-size="21">然后进入公共 Preview / Confirm 安全门</text>
+
+    <rect x="1090" y="2105" width="900" height="390" rx="8" fill="#FFFFFF" stroke="#5C8CB7" stroke-width="3"/>
+    <text x="1130" y="2165" fill="#326FA8" font-size="28" font-weight="700">换房 MOVE_UNIT</text>
+    <text x="1130" y="2215" fill="#25322E" font-size="23">必　目标库存</text>
+    <text x="1130" y="2252" fill="#25322E" font-size="23">必　生效日期</text>
+    <text x="1130" y="2289" fill="#25322E" font-size="23">选　本 revision 手工调整金额</text>
+    <text x="1130" y="2340" fill="#7B8984" font-size="21">系统重验目标房/床及会员单位类型</text>
+    <text x="1130" y="2375" fill="#7B8984" font-size="21">旧 Claim 释放，新 Segment / Claim 追加</text>
+
+    <rect x="2040" y="2105" width="900" height="390" rx="8" fill="#FFFFFF" stroke="#67A47B" stroke-width="3"/>
+    <text x="2080" y="2165" fill="#39875A" font-size="28" font-weight="700">手工调价 REPRICE</text>
+    <text x="2080" y="2215" fill="#25322E" font-size="23">必　本 revision 手工调整金额</text>
+    <text x="2080" y="2265" fill="#7B8984" font-size="21">系统重算完整 pricing revision</text>
+    <text x="2080" y="2300" fill="#7B8984" font-size="21">新 revision 不继承旧手工调整</text>
+    <text x="2080" y="2355" fill="#56635F" font-size="21">金额变化始终追加历史，不覆盖成交事实</text>
+    <rect x="2080" y="2390" width="820" height="62" rx="6" fill="#E8F3EC"/>
+    <text x="2105" y="2431" fill="#39875A" font-size="20">未知计价规则直接拒绝，不使用默认公式</text>
+
+    <rect x="2990" y="2105" width="1050" height="390" rx="8" fill="#FFFFFF" stroke="#D07179" stroke-width="3"/>
+    <text x="3030" y="2165" fill="#A43E48" font-size="28" font-weight="700">取消 / 未到</text>
+    <text x="3030" y="2215" fill="#25322E" font-size="23">必　选择目标订单与动作</text>
+    <text x="3030" y="2252" fill="#7B8984" font-size="21">无动作专属业务字段</text>
+    <text x="3030" y="2300" fill="#25322E" font-size="23">必　公共原因代码 + 原因说明</text>
+    <text x="3030" y="2350" fill="#7B8984" font-size="21">系统释放未来库存与 HELD 会员覆盖</text>
+    <text x="3030" y="2387" fill="#7B8984" font-size="21">状态 → CANCELLED 或 NO_SHOW</text>
+    <rect x="3030" y="2420" width="970" height="40" rx="6" fill="#FFF1F2"/>
+    <text x="3055" y="2448" fill="#A43E48" font-size="19">零部分写入；失败时保持原订单事实</text>
+
+    <!-- Operations lane -->
+    <rect x="60" y="2610" width="4080" height="690" rx="8" fill="#EDF3F7" stroke="#CAD9E2" stroke-width="2"/>
+    <rect x="60" y="2610" width="4080" height="82" fill="#DCE8EF"/>
+    <text x="120" y="2665" fill="#2F5367" font-size="34" font-weight="700">独立运营旁路</text>
+    <text x="420" y="2664" fill="#5F7784" font-size="23">库存维护、会员权益与外围客户端访问</text>
+    <polyline points="885,1150 885,2585 590,2585 590,2610" fill="none" stroke="#6F93A6" stroke-width="5"/>
+    <polygon points="590,2610 575,2588 605,2588" fill="#6F93A6"/>
+
+    <rect x="140" y="2740" width="900" height="490" rx="8" fill="#FFFFFF" stroke="#5D8DA7" stroke-width="3"/>
+    <text x="180" y="2800" fill="#2F6E8A" font-size="28" font-weight="700">维修锁房 / 释放</text>
+    <text x="180" y="2850" fill="#2F80ED" font-size="22" font-weight="700">锁房时人工提供</text>
+    <text x="180" y="2890" fill="#25322E" font-size="23">必　库存单元</text>
+    <text x="180" y="2927" fill="#25322E" font-size="23">必　开始日期 / 结束日期</text>
+    <text x="180" y="2964" fill="#25322E" font-size="23">必　维修原因</text>
+    <text x="180" y="3015" fill="#2F80ED" font-size="22" font-weight="700">释放时人工选择</text>
+    <text x="180" y="3055" fill="#25322E" font-size="23">必　完整、当前有效的维修锁</text>
+    <text x="180" y="3105" fill="#7B8984" font-size="21">系统：Lock ID / Claim / version</text>
+    <text x="180" y="3140" fill="#7B8984" font-size="21">ACTIVE → RELEASED / Receipt</text>
+    <text x="180" y="3190" fill="#56635F" font-size="20">不可用部分日期选择伪造部分释放</text>
+
+    <rect x="1090" y="2740" width="900" height="490" rx="8" fill="#FFF8F8" stroke="#E35D6A" stroke-width="3" stroke-dasharray="12 8"/>
+    <text x="1130" y="2800" fill="#B63E4C" font-size="28" font-weight="700">尚未实现的运营来源</text>
+    <text x="1130" y="2850" fill="#B63E4C" font-size="22" font-weight="700">INTERNAL_USE 内部占用</text>
+    <text x="1130" y="2890" fill="#8C3943" font-size="22">拟需：库存单元、开始/结束日期</text>
+    <text x="1130" y="2927" fill="#8C3943" font-size="22">拟需：内部用途 / 原因</text>
+    <text x="1130" y="2977" fill="#7B8984" font-size="20">当前无 Block 表、Command、DTO 或 UI</text>
+    <line x1="1130" y1="3010" x2="1950" y2="3010" stroke="#E7B8BC" stroke-width="2"/>
+    <text x="1130" y="3052" fill="#B63E4C" font-size="22" font-weight="700">清洁 / Operations</text>
+    <text x="1130" y="3090" fill="#8C3943" font-size="22">任务模型、状态流、人工字段均未定义</text>
+    <text x="1130" y="3140" fill="#8C3943" font-size="21">不能用订单、免费住宿或维修锁冒充</text>
+    <text x="1130" y="3190" fill="#7B8984" font-size="20">目标房态还需 typed source 与稳定详情链接</text>
+
+    <rect x="2040" y="2740" width="900" height="490" rx="8" fill="#FFFFFF" stroke="#68A579" stroke-width="3"/>
+    <text x="2080" y="2800" fill="#39875A" font-size="28" font-weight="700">会员权益</text>
+    <text x="2080" y="2850" fill="#2F80ED" font-size="22" font-weight="700">先选择会员合同与 Lot</text>
+    <text x="2080" y="2895" fill="#39875A" font-size="22" font-weight="700">调整 ADJUST</text>
+    <text x="2080" y="2932" fill="#25322E" font-size="23">必　非零数量变化</text>
+    <text x="2080" y="2969" fill="#25322E" font-size="23">必　调整原因</text>
+    <text x="2080" y="3019" fill="#39875A" font-size="22" font-weight="700">到期 EXPIRE</text>
+    <text x="2080" y="3056" fill="#25322E" font-size="23">必　到期核算日期 asOfDate</text>
+    <text x="2080" y="3106" fill="#7B8984" font-size="21">系统重算余额与到期数量</text>
+    <text x="2080" y="3143" fill="#7B8984" font-size="21">追加不可变 Ledger Fact</text>
+    <text x="2080" y="3190" fill="#56635F" font-size="20">合同 / Lot ID / 版本从当前对象继承</text>
+
+    <rect x="2990" y="2740" width="1050" height="490" rx="8" fill="#FFFFFF" stroke="#8B7AA5" stroke-width="3"/>
+    <text x="3030" y="2800" fill="#594674" font-size="28" font-weight="700">Token 生命周期</text>
+    <text x="3030" y="2850" fill="#594674" font-size="22" font-weight="700">签发</text>
+    <text x="3030" y="2887" fill="#25322E" font-size="22">必　标签 / 权限上限 / 过期时间</text>
+    <text x="3030" y="2924" fill="#25322E" font-size="22">必　勾选“已安全保存一次性 secret”</text>
+    <text x="3030" y="2974" fill="#594674" font-size="22" font-weight="700">轮换</text>
+    <text x="3030" y="3011" fill="#25322E" font-size="22">必　目标 Token / 新过期时间</text>
+    <text x="3030" y="3048" fill="#25322E" font-size="22">必　确认已保存新 secret</text>
+    <text x="3030" y="3098" fill="#594674" font-size="22" font-weight="700">撤销</text>
+    <text x="3030" y="3135" fill="#25322E" font-size="22">必　选择目标 Token</text>
+    <text x="3030" y="3185" fill="#7B8984" font-size="20">secret 由客户端生成，服务端仅保存哈希</text>
+
+    <!-- Universal safety gate -->
+    <rect x="60" y="3350" width="4080" height="500" rx="8" fill="#172A27" stroke="#304942" stroke-width="2"/>
+    <text x="120" y="3410" fill="#FFFFFF" font-size="34" font-weight="700">所有高风险写操作共用安全闸门</text>
+    <text x="760" y="3409" fill="#BFD4CC" font-size="22">报价除外；报价为单阶段、可恢复的低风险命令</text>
+
+    <rect x="140" y="3470" width="450" height="100" rx="8" fill="#2E4D45" stroke="#5B7C72" stroke-width="2"/>
+    <text x="365" y="3512" text-anchor="middle" fill="#FFFFFF" font-size="22" font-weight="700">1　填写动作字段</text>
+    <text x="365" y="3546" text-anchor="middle" fill="#BFD4CC" font-size="19">人填 / 人选</text>
+    <line x1="590" y1="3520" x2="630" y2="3520" stroke="#8AA69C" stroke-width="5"/>
+    <polygon points="650,3520 628,3506 628,3534" fill="#8AA69C"/>
+
+    <rect x="650" y="3470" width="450" height="100" rx="8" fill="#234B63" stroke="#5C89A2" stroke-width="2"/>
+    <text x="875" y="3512" text-anchor="middle" fill="#FFFFFF" font-size="22" font-weight="700">2　服务端 Preview</text>
+    <text x="875" y="3546" text-anchor="middle" fill="#C4DCE8" font-size="19">授权 / 版本 / 库存 / 计价</text>
+    <line x1="1100" y1="3520" x2="1140" y2="3520" stroke="#8AA69C" stroke-width="5"/>
+    <polygon points="1160,3520 1138,3506 1138,3534" fill="#8AA69C"/>
+
+    <rect x="1160" y="3470" width="450" height="100" rx="8" fill="#3C4760" stroke="#6D7892" stroke-width="2"/>
+    <text x="1385" y="3512" text-anchor="middle" fill="#FFFFFF" font-size="22" font-weight="700">3　查看 effect</text>
+    <text x="1385" y="3546" text-anchor="middle" fill="#D5D9E3" font-size="19">差异 / 金额 / 有效期 / hash</text>
+    <line x1="1610" y1="3520" x2="1650" y2="3520" stroke="#8AA69C" stroke-width="5"/>
+    <polygon points="1670,3520 1648,3506 1648,3534" fill="#8AA69C"/>
+
+    <rect x="1670" y="3470" width="530" height="100" rx="8" fill="#704F1D" stroke="#A57C3A" stroke-width="2"/>
+    <text x="1935" y="3512" text-anchor="middle" fill="#FFFFFF" font-size="22" font-weight="700">4　人工确认依据</text>
+    <text x="1935" y="3546" text-anchor="middle" fill="#F3DFC0" font-size="19">必 reason.code + reason.note</text>
+    <line x1="2200" y1="3520" x2="2240" y2="3520" stroke="#8AA69C" stroke-width="5"/>
+    <polygon points="2260,3520 2238,3506 2238,3534" fill="#8AA69C"/>
+
+    <rect x="2260" y="3470" width="450" height="100" rx="8" fill="#7A323A" stroke="#A95A62" stroke-width="2"/>
+    <text x="2485" y="3512" text-anchor="middle" fill="#FFFFFF" font-size="22" font-weight="700">5　显式 Confirm</text>
+    <text x="2485" y="3546" text-anchor="middle" fill="#F0C8CC" font-size="19">确认一次并提交</text>
+    <line x1="2710" y1="3520" x2="2750" y2="3520" stroke="#8AA69C" stroke-width="5"/>
+    <polygon points="2770,3520 2748,3506 2748,3534" fill="#8AA69C"/>
+
+    <rect x="2770" y="3470" width="530" height="100" rx="8" fill="#245843" stroke="#4F806C" stroke-width="2"/>
+    <text x="3035" y="3512" text-anchor="middle" fill="#FFFFFF" font-size="22" font-weight="700">6　重验并原子提交</text>
+    <text x="3035" y="3546" text-anchor="middle" fill="#C6E0D5" font-size="19">事实 + 审计 + 命令状态</text>
+    <line x1="3300" y1="3520" x2="3340" y2="3520" stroke="#8AA69C" stroke-width="5"/>
+    <polygon points="3360,3520 3338,3506 3338,3534" fill="#8AA69C"/>
+
+    <polygon points="3360,3470 3970,3470 4020,3520 3970,3570 3360,3570 3310,3520" fill="#2F755B" stroke="#6DA38E" stroke-width="2"/>
+    <text x="3665" y="3512" text-anchor="middle" fill="#FFFFFF" font-size="22" font-weight="700">7　持久 Receipt</text>
+    <text x="3665" y="3546" text-anchor="middle" fill="#D0E7DE" font-size="19">资源引用 / 事实引用 / 提交结果</text>
+
+    <rect x="140" y="3625" width="3880" height="132" rx="8" fill="#223C36" stroke="#45645B" stroke-width="2"/>
+    <text x="180" y="3670" fill="#F4B740" font-size="22" font-weight="700">响应中断 / state-unknown</text>
+    <text x="520" y="3670" fill="#EAF3F0" font-size="22">保留原幂等键 → 点击“查询命令结果” → EXECUTED / NOT_EXECUTED / UNKNOWN</text>
+    <text x="180" y="3712" fill="#E35D6A" font-size="21" font-weight="700">禁止盲目重试：</text>
+    <text x="390" y="3712" fill="#BFD4CC" font-size="21">UNKNOWN 仍不可判断；Quote 与 Token 同样复用原恢复身份，不创建第二笔事实或 secret。</text>
+    <text x="180" y="3748" fill="#AFC5BD" font-size="19">冲突 / Preview 过期 / 权益不足 / 退款超限 / 状态不合法：修正输入或停止，失败必须零部分写入。</text>
+
+    <!-- Footer -->
+    <text x="80" y="3900" fill="#697873" font-size="20">系统自动字段：propertyId、对象 ID、idempotencyKey、correlationId、Preview ID、effect hash、Command ID、Receipt ID、Fact ID、提交时间。</text>
+    <text x="4120" y="3900" text-anchor="end" fill="#697873" font-size="20">梳理日期：2026-07-19｜依据当前代码与已确认业务补充</text>
+  </g>
+</svg>

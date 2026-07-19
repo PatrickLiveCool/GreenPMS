@@ -4,8 +4,8 @@ QinTopia PMS is the source of truth for room/bed inventory, orders, stay fulfill
 
 ## Prerequisites
 
-- Node.js 22 or newer and npm 10 or newer
-- Docker Engine with Compose v2 for the one-command path
+- Docker Engine with Compose v2 for the one-command path; this path does not require host Node.js
+- Node.js 22.x LTS and npm 10 or newer for local development and test commands
 - PostgreSQL 16 is always used for runtime and integration tests; there is no SQLite or in-memory fallback
 - Playwright Chromium for browser acceptance: `npx playwright install chromium`
 
@@ -16,7 +16,7 @@ cp .env.example .env
 docker compose up --build
 ```
 
-The Compose demo profile sets `SEED_DEMO_DATA=true`; the app waits for PostgreSQL, applies migrations, inserts idempotent demo data, and starts the built API/Web server. A production image run does not seed public demo credentials unless that flag is explicitly enabled.
+The copied `.env.example` sets `SEED_DEMO_DATA=true`; the app waits for PostgreSQL, applies migrations, inserts idempotent demo data, and starts the built API/Web server. Compose itself defaults seeding to `false`, so a production image run does not seed public demo credentials unless that flag is explicitly enabled.
 
 ## Start for development
 
@@ -25,8 +25,11 @@ npm install
 docker compose up -d postgres
 npm run db:migrate
 npm run db:seed
+npm run db:import:2026
 npm run dev
 ```
+
+Preview the bundled Feishu import without touching PostgreSQL with `npm run db:import:2026 -- --dry-run`. The import is optional, transactional, and idempotent; Docker startup can opt in with `IMPORT_2026_REFERENCE_CATALOG=true`. Run it only after the target property exists. `REFERENCE_CATALOG_PROPERTY_ID` and `REFERENCE_CATALOG_PROPERTY_CODE` must identify that property's exact code, `Asia/Shanghai` timezone, and `CNY` currency. The importer never creates properties or executable inventory, pricing, member-contract, or entitlement facts.
 
 If the local Docker installation has no Compose plugin, start the same database directly:
 
@@ -58,6 +61,8 @@ Open:
 
 Tokens are opaque; only SHA-256 hashes are stored. A Token is bound to one real subject and one property, and its effective access is the intersection of the subject's current grant and the Token ceiling. `ISSUE_TOKEN`, `ROTATE_TOKEN`, and `REVOKE_TOKEN` use the same Preview/Confirm/Receipt protocol. For issue or rotation, the client must generate a cryptographically secure 256-bit `qtp_` base64url `tokenSecret` and submit it in the Preview request. The server hashes it before persistence; neither the Preview nor the Receipt returns the secret. A rotated Token is revoked immediately, so the client must retain the replacement secret it generated.
 
+Members have an immutable internal `memberId` and a unique normalized identity-card business key, plus staff-entered name, phone, and WeChat fields. Search and balance queries resolve the person by identity card while orders and ledger facts retain internal IDs. A Feishu Base `record_id` identifies one stay application, not a person: repeated applications append independent `FEISHU_BASE` external-reference rows linked to the matched member. Base cannot create, freeze, release, or consume entitlement and PMS correctness never depends on a Base write-back.
+
 ## Agent command protocol
 
 Every business write requires `Idempotency-Key` and `X-Correlation-ID`. `POST /api/v1/quotes` is the one low-risk, single-stage command: READ access is sufficient, it does not use Preview/Confirm, and it returns `{ quote, receipt }`. The Quote row, `CREATE_QUOTE` execution, audit entry, and permanent Receipt commit in one transaction. Replaying the same key and payload returns that same Quote and Receipt.
@@ -70,6 +75,8 @@ High-risk commands are two-stage:
 4. Store the returned `commandId` and `receiptId`.
 
 Confirm locks and revalidates authorization, aggregate versions, inventory day slots, membership ledger state, and the locked pricing policy. A changed or expired Preview returns a durable `NOT_EXECUTED` Receipt and performs zero domain writes. Replaying the same subject/command/idempotency key and request returns the original Receipt; changing the request returns `IDEMPOTENCY_KEY_REUSED`.
+
+`CREATE_ORDER` requires one stable `bookingChannelCode`: `YOUMUDAO`, `CTRIP`, `MEITUAN`, or `WECOM`. `channelOrderReference` is optional, but must be `null` for `WECOM`. Every new `COLLECTION` and `REFUND` fact requires its own staff-entered `transactionReference`; a refund also retains its reference to the original collection Fact. This value is only the manually recorded external transaction reference. It does not prove external receipt, settlement, reconciliation, or write-off, and it is not replaced by a Fact, Receipt, Command, correlation, or idempotency identifier. Historical rows may return `null` when the value was not recorded.
 
 After a network interruption query either:
 
@@ -84,14 +91,19 @@ Results are `EXECUTED`, `NOT_EXECUTED`, or `UNKNOWN`. Do not retry an `UNKNOWN` 
 
 `CREATE_QUOTE` is a low-risk single-stage command: READ access is sufficient and Preview/Confirm do not apply, but both command headers, a durable Receipt, audit, idempotent replay, and recovery still apply. Expired Quotes cannot create an order, but their rows are retained and the durable Receipt permanently embeds the original Quote snapshot; only unexpired Quotes count toward the per-subject/property active quota.
 
-## Pricing boundary
+## Pricing and inventory boundary
 
-Published seed policies are deliberately finite:
+The verified Feishu revision 561 facts are normalized into an immutable catalog: 8 room categories, 44 physical rooms, 91 physical beds, 31 independent room-sale units, and 46 independent bed-sale units. Those 77 base units are the simultaneous-inventory denominator. The 13 dorm whole-room combinations lock their underlying beds and raise the queryable sales-entry count to 90 without creating extra capacity. The rejected source figure 97 remains provenance only and is never used as inventory. No separate electricity charge or electricity cash line is produced.
 
-- `policy_transient_v1`: fixed CNY 120.00 per uncovered night, within one calendar month
-- `policy_free_v1`: zero cash amount while still claiming inventory
+`policy_qintopia_public_2026_rev561_v1` is the executable, locked public-price policy. It is effective from `2026-02-25` with an open end date and contains 10 product anchor sets. The floor-price worksheet and the rounded-daily-price worksheet are excluded. Read the sealed evidence through `GET /api/v1/properties/{id}/reference-catalog`.
 
-Weekly, monthly, rolling, and cross-month calculations return `PRICING_POLICY_UNCONFIGURED`. They will only be published after real, user-supplied pricing cases define their cycle boundaries, proration, and rounding. Coverage is a set of service dates and inventory units backed by ROOM_NIGHT or BED_NIGHT lots; it is formed before cash lines and is never converted to a discount or cash value.
+For a continuous stay of `N` nights, the policy uses `P1` for `N < 7`, `P7/7` for `7 <= N < 14`, `P14/14` for `14 <= N < 30`, and `P30/30` for `N >= 30`. Extension, shortening, cross-month stays, and same-Stay moves select the band from the complete interval beginning at the original arrival. Cross-product moves price each segment with that one band's product anchor, sum exact segment amounts, and half-up round the final stay total once to a whole CNY yuan. Boundary price decreases are accepted. An order continues using its locked policy version even after another version is published.
+
+Manual repricing accepts a non-negative whole-yuan final target, stores the policy base, and derives the current revision's adjustment as `target - policyBase`. A later stay amendment recomputes from policy and does not inherit that adjustment. `policy_free_v1` keeps FREE stays at zero through all amendments and never touches membership.
+
+Member coverage is a concrete set of service dates backed by matching ROOM_NIGHT or BED_NIGHT lots. Reservation confirmation freezes available dates. Uncovered dates are priced individually at the locked product's `P1`, even when their count reaches a duration anchor. A later auditable entitlement lot can cover previously uncovered dates before final fulfillment; recorded cash is not automatically refunded. Successful CHECK_IN converts held coverage to consumed coverage. Pre-check-in cancellation or no-show releases held dates; ordinary cancellation or shortening never restores consumed entitlement. Membership purchase fees are non-refundable.
+
+The demo-only `policy_transient_v1` remains a clearly labelled fixed-rate fixture for protocol regression tests. It is not the QinTopia 2026 public-price policy.
 
 The only recomputed amount fields are:
 
@@ -111,11 +123,35 @@ npm run test:integration
 npm run build
 npm run test:contract
 npm run test:e2e
+npm run test:pricing-facts
 npm run verify:cold-start
+npm run verify:compose
 ./scripts/verify-backup-restore.sh
 ```
 
-The database suites terminate connections to, drop, and recreate dedicated databases. By default these are `qintopia_test`, `qintopia_command_protocol`, `qintopia_quote_command`, `qintopia_database_invariants`, `qintopia_security_integration`, `qintopia_receipt_references`, `qintopia_security_contract`, `qintopia_agent_journey_contract`, `qintopia_effect_contract`, and `qintopia_e2e`. Never point a test database environment variable at a database containing retained data. The suites use independent connections to prove whole-room/bed mutual exclusion, different-bed coexistence, stale Preview rollback, idempotency, Receipt atomicity, stay changes, collections/refunds, fulfillment, and Token lifecycle.
+For a workspace where the host TypeScript runtime cannot execute reliably, build one immutable verification image and use it for the two operational proofs. The default host paths remain unchanged:
+
+```bash
+docker build -t qintopia-pms:verify .
+VERIFY_APP_IMAGE=qintopia-pms:verify npm run verify:cold-start
+VERIFY_APP_IMAGE=qintopia-pms:verify npm run verify:restore
+```
+
+Containerized browser runners may use an installed Chromium binary by setting `PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH`; ordinary local Playwright runs continue to use the configured Playwright browser.
+
+`npm run verify:compose` proves the documented Compose path with an isolated project, container, ports, and volume, then removes only those resources. It auto-detects the Docker Compose plugin or standalone binary; set `COMPOSE_BIN=/path/to/docker-compose` when neither is on `PATH`.
+
+`npm run test:pricing-facts` executes the owner-confirmed finite examples in `docs/pricing-facts/cases` against the production domain implementation. Any missing scenario, schema mismatch, placeholder evidence, or amount difference fails the gate.
+
+The database suites terminate connections to, drop, and recreate dedicated databases. By default these are `qintopia_test`, `qintopia_command_protocol`, `qintopia_quote_command`, `qintopia_database_invariants`, `qintopia_pricing_policy_guard`, `qintopia_reference_catalog`, `qintopia_security_integration`, `qintopia_receipt_references`, `qintopia_operational_references`, `qintopia_operational_references_history`, `qintopia_member_profile_lifecycle`, `qintopia_member_entitlement_expiry`, `qintopia_security_contract`, `qintopia_agent_journey_contract`, `qintopia_effect_contract`, and `qintopia_e2e`. The migration-concurrency acceptance also creates and removes a PID-scoped `qintopia_migration_concurrency_*` database. Never point a test database environment variable at a database containing retained data.
+
+The public `test:integration`, `test:contract`, and `test:e2e` commands hold coordination and cleanup-guard PostgreSQL session advisory locks for their child process lifetime. The lock runner requires a POSIX host (Linux or macOS) and fails before connecting on Windows because Node cannot verify descendant process groups there. It starts the suite root in its own process group and periodically records that root plus every observed descendant PGID, including descendants that create a new session. Independent invocations using the same coordinator database and lock ID may be started concurrently; they wait and then run serially before any fixed database reset or E2E port binding can overlap. Different `TEST_SUITE_LOCK_DATABASE_URL` or `TEST_SUITE_LOCK_ID` values are separate coordination domains and do not make shared E2E ports safe.
+
+The `*:run` scripts are private implementation details and must not be called directly. Their environment marker is an accidental-use guard, not a security capability or proof of lock ownership; a developer who controls the shell can also invoke the underlying test tools directly. The default wait limit is ten minutes and can be changed with `TEST_SUITE_LOCK_TIMEOUT_MS`. `TEST_SUITE_LOCK_DATABASE_URL` must identify a stable administrative database, with a database name distinct from every reset target, used only to own the locks. The runner never creates or drops that database.
+
+If one lock connection is lost while the other survives, the runner retains the surviving fence until a fresh process-tree snapshot succeeds and every observed descendant group is proven gone. Snapshot, signal, or liveness errors keep that fence held and are retried instead of failing open; cleanup never kills the root after a failed fresh snapshot because that could erase the ancestry of a not-yet-observed detached group. Once a PGID has been observed it remains tracked even after reparenting. If both sessions in the same PostgreSQL failure domain are lost together, PostgreSQL has already released both locks and cannot fence a successor; the runner escalates observed child cleanup to `SIGKILL`, but this only shortens the exposure and is not a serialization guarantee. Keep the coordinator available for the entire suite, and after a coordinator restart do not start a successor until the previous runner and all observed groups are confirmed gone.
+
+This is user-space POSIX tracking, not a kernel cgroup: a short-lived child that creates an independent session and loses its observable parent entirely between two process snapshots can never be discovered afterward. Suite commands must not intentionally daemonize in that interval. The runner lowers the exposure with frequent snapshots and verifies the actual Playwright API/Vite descendant groups before releasing its fence. No lock file or randomly named database is left behind. The suites use independent connections internally to prove whole-room/bed mutual exclusion, different-bed coexistence, stale Preview rollback, idempotency, Receipt atomicity, stay changes, collections/refunds, fulfillment, and Token lifecycle.
 
 ## Backup and restore
 

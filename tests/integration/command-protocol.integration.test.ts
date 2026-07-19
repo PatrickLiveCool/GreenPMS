@@ -60,6 +60,26 @@ async function waitForInventoryLockWait() {
   throw new Error("Timed out waiting for the owner Confirm to block on its inventory day");
 }
 
+async function waitForPreviewInsertLockWait() {
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    const result = await sql<{ waiting: boolean }>`
+      select exists (
+        select 1
+        from pg_stat_activity
+        where datname = current_database()
+          and pid <> pg_backend_pid()
+          and state = 'active'
+          and wait_event_type = 'Lock'
+          and query like '%command_previews%'
+      ) as waiting
+    `.execute(db);
+    if (result.rows[0]?.waiting) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error("Timed out waiting for the Preview insert blocker");
+}
+
 beforeEach(async () => {
   db = await resetDatabase(databaseUrl);
 });
@@ -170,6 +190,72 @@ describe("durable command protocol", () => {
     expect(new Set(receipts.map((receipt) => receipt.result?.tokenId)).size).toBe(2);
   });
 
+  it("fences concurrent same-key Preview creation without leaking a serialization failure", async () => {
+    const blockerLock = "qintopia:test:preview-idempotency-owner";
+    await sql.raw(`
+      CREATE OR REPLACE FUNCTION block_preview_idempotency_owner() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN
+        PERFORM pg_advisory_xact_lock(hashtextextended('${blockerLock}', 0::bigint));
+        RETURN NEW;
+      END $$;
+      CREATE TRIGGER block_preview_idempotency_owner_before_insert BEFORE INSERT ON command_previews
+      FOR EACH ROW EXECUTE FUNCTION block_preview_idempotency_owner();
+    `).execute(db);
+
+    let releaseBlocker!: () => void;
+    let reportLocked!: () => void;
+    const blockerGate = new Promise<void>((resolve) => { releaseBlocker = resolve; });
+    const locked = new Promise<void>((resolve) => { reportLocked = resolve; });
+    const blocker = db.connection().execute(async (connection) => {
+      await sql`select pg_advisory_lock(hashtextextended(${blockerLock}, 0::bigint))`.execute(connection);
+      reportLocked();
+      await blockerGate;
+      await sql`select pg_advisory_unlock(hashtextextended(${blockerLock}, 0::bigint))`.execute(connection);
+    });
+    await locked;
+
+    const envelope: CommandEnvelope = {
+      commandType: "LOCK_MAINTENANCE",
+      input: {
+        propertyId: demo.propertyId,
+        inventoryUnitId: demo.secondRoomId,
+        arrivalDate: "2028-06-20",
+        departureDate: "2028-06-21",
+        reason: "Concurrent Preview idempotency fence"
+      }
+    };
+    const commandMetadata = metadata("preview-concurrent-same-key");
+    const owner = createCommandPreview(db, principal, envelope, commandMetadata);
+    try {
+      await waitForPreviewInsertLockWait();
+      await expect(createCommandPreview(db, principal, envelope, commandMetadata))
+        .rejects.toMatchObject({ code: "COMMAND_STATUS_UNKNOWN", retryable: true });
+    } finally {
+      releaseBlocker();
+      await blocker;
+    }
+
+    const completed = await owner;
+    const replay = await createCommandPreview(db, principal, envelope, commandMetadata);
+    expect(replay).toEqual(completed);
+    const [executions, previews, receipts] = await Promise.all([
+      db.selectFrom("command_executions").select("id")
+        .where("command_type", "=", "PREVIEW:LOCK_MAINTENANCE")
+        .where("idempotency_key", "=", commandMetadata.idempotencyKey)
+        .execute(),
+      db.selectFrom("command_previews").select("id").execute(),
+      db.selectFrom("command_receipts")
+        .innerJoin("command_executions", "command_executions.id", "command_receipts.command_id")
+        .select("command_receipts.id")
+        .where("command_executions.command_type", "=", "PREVIEW:LOCK_MAINTENANCE")
+        .where("command_executions.idempotency_key", "=", commandMetadata.idempotencyKey)
+        .execute()
+    ]);
+    expect(executions).toHaveLength(1);
+    expect(previews).toHaveLength(1);
+    expect(receipts).toHaveLength(1);
+  });
+
   it("returns a durable PREVIEW_STALE Receipt when Token expiry crosses before Confirm", async () => {
     const baseNow = Date.now();
     const now = vi.spyOn(Date, "now").mockReturnValue(baseNow);
@@ -206,6 +292,67 @@ describe("durable command protocol", () => {
     } finally {
       now.mockRestore();
     }
+  });
+
+  it("expires a Preview durably and rejects confirmation with zero business writes", async () => {
+    const preview = await createCommandPreview(db, principal, {
+      commandType: "LOCK_MAINTENANCE",
+      input: {
+        propertyId: demo.propertyId,
+        inventoryUnitId: demo.secondRoomId,
+        arrivalDate: "2028-06-01",
+        departureDate: "2028-06-02",
+        reason: "Expired Preview acceptance"
+      }
+    }, metadata("ttl-preview"));
+    await db.updateTable("command_previews")
+      .set({ expires_at: new Date(Date.now() - 1_000) })
+      .where("id", "=", preview.preview.previewId)
+      .execute();
+
+    const confirmMetadata = metadata("ttl-confirm");
+    const confirmation = {
+      propertyId: demo.propertyId,
+      commandType: "LOCK_MAINTENANCE" as const,
+      confirmation: true as const,
+      expectedEffectHash: preview.preview.effectHash,
+      reason: { code: "TTL_ACCEPTANCE", note: "Expired Preview must never apply" }
+    };
+    const receipt = await confirmCommandPreview(db, principal, preview.preview.previewId, confirmation, confirmMetadata);
+    const replay = await confirmCommandPreview(db, principal, preview.preview.previewId, confirmation, confirmMetadata);
+    const secondMetadata = metadata("ttl-second-confirm");
+    const secondReceipt = await confirmCommandPreview(db, principal, preview.preview.previewId, confirmation, secondMetadata);
+    const storedPreview = await db.selectFrom("command_previews")
+      .select(["status", "used_at"])
+      .where("id", "=", preview.preview.previewId)
+      .executeTakeFirstOrThrow();
+    const [maintenanceLocks, inventoryClaims] = await Promise.all([
+      db.selectFrom("maintenance_locks").select(({ fn }) => fn.countAll<number>().as("count")).executeTakeFirstOrThrow(),
+      db.selectFrom("inventory_claims").select(({ fn }) => fn.countAll<number>().as("count")).executeTakeFirstOrThrow()
+    ]);
+
+    expect(receipt).toMatchObject({
+      executionStatus: "NOT_EXECUTED",
+      businessCommitted: false,
+      error: { code: "PREVIEW_STALE", details: { causeCode: "PREVIEW_EXPIRED" } },
+      resourceRefs: [],
+      factRefs: []
+    });
+    expect(replay).toEqual(receipt);
+    expect(secondReceipt).toMatchObject({
+      executionStatus: "NOT_EXECUTED",
+      businessCommitted: false,
+      error: { code: "PREVIEW_STALE", details: { causeCode: "PREVIEW_EXPIRED" } },
+      resourceRefs: [],
+      factRefs: []
+    });
+    expect(secondReceipt.receiptId).not.toBe(receipt.receiptId);
+    expect(secondReceipt.commandId).not.toBe(receipt.commandId);
+    expect(await findCommandResult(db, principal, demo.propertyId, "LOCK_MAINTENANCE", confirmMetadata.idempotencyKey)).toEqual(receipt);
+    expect(await findCommandResult(db, principal, demo.propertyId, "LOCK_MAINTENANCE", secondMetadata.idempotencyKey)).toEqual(secondReceipt);
+    expect(storedPreview).toEqual({ status: "EXPIRED", used_at: null });
+    expect(Number(maintenanceLocks.count)).toBe(0);
+    expect(Number(inventoryClaims.count)).toBe(0);
   });
 
   it("exposes UNKNOWN while a visible execution claim is blocked, then resolves to EXECUTED", async () => {

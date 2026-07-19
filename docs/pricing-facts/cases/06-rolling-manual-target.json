@@ -1,0 +1,106 @@
+{
+  "caseId": "rev561-rolling-manual-final-target",
+  "anonymizedOrderRef": "OWNER-CONFIRMED-RULE-MANUAL-TARGET",
+  "businessExplanation": "Manual repricing specifies a non-negative whole-yuan final amount and records target minus policy base as the revision adjustment.",
+  "businessPlan": "ROLLING",
+  "scenarioTags": ["MANUAL_ADJUSTMENT"],
+  "propertyTimeZone": "Asia/Shanghai",
+  "currency": "CNY",
+  "inventoryUnitKind": "ROOM",
+  "arrivalDate": "2026-03-01",
+  "departureDate": "2026-03-14",
+  "departureCharged": false,
+  "priceInputs": {
+    "policyVersionReference": "policy_qintopia_public_2026_rev561_v1",
+    "initialProductCode": "private_bath_standard_room",
+    "initialInventoryUnitReference": "ROOM-A01"
+  },
+  "coverageSet": [],
+  "amendments": [{
+    "sequence": 2,
+    "amendmentType": "REPRICE_ORDER",
+    "requestedAt": "2026-03-02T09:00:00.000Z",
+    "input": { "targetCurrentContractAmountMinor": 200000, "reason": "Owner-confirmed final-price override fact" }
+  }],
+  "rounding": { "stage": "POLICY_BASE_THEN_EXPLICIT_FINAL_TARGET", "unit": "CNY_YUAN", "mode": "HALF_UP_POSITIVE" },
+  "expected": {
+    "pricingRevisions": [
+      {
+        "revisionNo": 1,
+        "amendmentType": "CREATE_ORDER",
+        "pricingPolicyVersionReference": "policy_qintopia_public_2026_rev561_v1",
+        "arrivalDate": "2026-03-01",
+        "departureDate": "2026-03-14",
+        "coverageSet": [],
+        "cashLines": [{
+          "lineKind": "STAY_TOTAL",
+          "pricingBandAnchorNights": 7,
+          "calculationSegments": [{
+            "inventoryUnitReference": "ROOM-A01",
+            "pricingProductCode": "private_bath_standard_room",
+            "arrivalDate": "2026-03-01",
+            "departureDate": "2026-03-14",
+            "nights": 13,
+            "anchorAmountMinor": 102000,
+            "numeratorMinor": 1326000,
+            "denominator": 7
+          }],
+          "amountMinor": 189400
+        }],
+        "manualAdjustmentMinor": 0,
+        "cashRemainderMinor": 189400,
+        "currentContractAmountMinor": 189400,
+        "roundingEvidence": { "rule": "FINAL_STAY_TOTAL_WHOLE_YUAN_HALF_UP", "pricingBandAnchorNights": 7 }
+      },
+      {
+        "revisionNo": 2,
+        "amendmentType": "REPRICE_ORDER",
+        "pricingPolicyVersionReference": "policy_qintopia_public_2026_rev561_v1",
+        "arrivalDate": "2026-03-01",
+        "departureDate": "2026-03-14",
+        "coverageSet": [],
+        "cashLines": [{
+          "lineKind": "STAY_TOTAL",
+          "pricingBandAnchorNights": 7,
+          "calculationSegments": [{
+            "inventoryUnitReference": "ROOM-A01",
+            "pricingProductCode": "private_bath_standard_room",
+            "arrivalDate": "2026-03-01",
+            "departureDate": "2026-03-14",
+            "nights": 13,
+            "anchorAmountMinor": 102000,
+            "numeratorMinor": 1326000,
+            "denominator": 7
+          }],
+          "amountMinor": 189400
+        }],
+        "manualAdjustmentMinor": 10600,
+        "cashRemainderMinor": 189400,
+        "currentContractAmountMinor": 200000,
+        "roundingEvidence": {
+          "rule": "FINAL_STAY_TOTAL_WHOLE_YUAN_HALF_UP",
+          "pricingBandAnchorNights": 7,
+          "policyBaseAmountMinor": 189400,
+          "targetCurrentContractAmountMinor": 200000
+        }
+      }
+    ],
+    "cashLines": [{
+      "lineKind": "STAY_TOTAL",
+      "pricingBandAnchorNights": 7,
+      "calculationSegments": [{
+        "inventoryUnitReference": "ROOM-A01",
+        "pricingProductCode": "private_bath_standard_room",
+        "arrivalDate": "2026-03-01",
+        "departureDate": "2026-03-14",
+        "nights": 13,
+        "anchorAmountMinor": 102000,
+        "numeratorMinor": 1326000,
+        "denominator": 7
+      }],
+      "amountMinor": 189400
+    }],
+    "cashRemainderMinor": 189400,
+    "currentContractAmountMinor": 200000
+  }
+}

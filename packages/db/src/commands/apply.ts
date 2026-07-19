@@ -1,11 +1,11 @@
 import { sql, type Transaction } from "kysely";
 import { DomainError, type CommandReason, type CommandType, type CoverageItemDto } from "@qintopia/contracts";
-import { enumerateServiceDates, newId, parseLocalDate } from "@qintopia/domain";
+import { enumerateServiceDates, newId, parseLocalDate, requireTransactionReference, validateBookingChannel } from "@qintopia/domain";
 import { createInventoryClaims, loadInventoryUnit, lockRoomDays, lockUnitDates, releaseInventoryClaims } from "../inventory.ts";
 import { appendAmendment, consumeCoverage, holdCoverage, incrementContractAndLotVersions, loadActiveStayTimeline, loadOrderContext, lockOrder, reconcileCoverage, releaseCoverage, type StayTimelineItem } from "../orders.ts";
 import { loadStoredQuote, lockEntitlementLots } from "../pricing-service.ts";
 import type { Database } from "../schema.ts";
-import { requireObject, requireString } from "./effects.ts";
+import { normalizeIdentityCardNumber, requireObject, requireString } from "./effects.ts";
 
 export interface AppliedCommand {
   persistedResult: Record<string, unknown>;
@@ -17,6 +17,17 @@ function rethrowTokenSecretConflict(error: unknown): never {
   const databaseError = error as { code?: unknown; constraint?: unknown };
   if (databaseError.code === "23505" && databaseError.constraint === "api_tokens_secret_hash_key") {
     throw new DomainError("AGGREGATE_VERSION_CONFLICT", "Token secret is already assigned", 409);
+  }
+  throw error;
+}
+
+function rethrowMemberRegistrationConflict(error: unknown): never {
+  const databaseError = error as { code?: unknown; constraint?: unknown };
+  if (databaseError.code === "23505" && (
+    databaseError.constraint === "members_identity_card_number_key"
+    || databaseError.constraint === "member_external_references_source_key"
+  )) {
+    throw new DomainError("AGGREGATE_VERSION_CONFLICT", "Member identity or external application linkage changed after Preview", 409);
   }
   throw error;
 }
@@ -80,6 +91,35 @@ export async function lockCommandResources(trx: Transaction<Database>, commandTy
   const input = requireObject(rawInput);
   const propertyId = requireString(input, "propertyId");
 
+  if (commandType === "CREATE_MEMBER") {
+    const identityCardNumber = normalizeIdentityCardNumber(input.identityCardNumber);
+    const sourceApplicationRecordId = typeof input.sourceApplicationRecordId === "string" && input.sourceApplicationRecordId.trim()
+      ? input.sourceApplicationRecordId.trim()
+      : undefined;
+    const lockKeys = [`qintopia:member-identity:${identityCardNumber}`];
+    if (sourceApplicationRecordId) {
+      lockKeys.push(`qintopia:member-external:FEISHU_BASE:wiki:FtxUwOE6diwS8wkmaawcDhEPnMc:tbl4OryeWd0Td8jN:${sourceApplicationRecordId}`);
+    }
+    for (const lockKey of lockKeys.sort()) {
+      await sql`select pg_advisory_xact_lock(hashtextextended(${lockKey}, 0::bigint))`.execute(trx);
+    }
+    const member = await trx.selectFrom("members").select("id")
+      .where("identity_card_number", "=", identityCardNumber).forUpdate().executeTakeFirst();
+    if (member) {
+      await trx.selectFrom("member_contracts").select("id")
+        .where("member_id", "=", member.id).where("property_id", "=", propertyId).forUpdate().execute();
+    }
+    if (sourceApplicationRecordId) {
+      await trx.selectFrom("member_external_references").select("id")
+        .where("provider", "=", "FEISHU_BASE")
+        .where("source_container_id", "=", "wiki:FtxUwOE6diwS8wkmaawcDhEPnMc")
+        .where("source_table_id", "=", "tbl4OryeWd0Td8jN")
+        .where("external_record_id", "=", sourceApplicationRecordId)
+        .forUpdate().executeTakeFirst();
+    }
+    return;
+  }
+
   if (commandType === "CREATE_ORDER") {
     const quote = await loadStoredQuote(trx, requireString(input, "quoteId"));
     await lockEntitlementLots(trx, quote.memberContractId);
@@ -94,6 +134,14 @@ export async function lockCommandResources(trx: Transaction<Database>, commandTy
     const lock = await trx.selectFrom("maintenance_locks").selectAll().where("id", "=", requireString(input, "maintenanceLockId")).where("property_id", "=", propertyId).forUpdate().executeTakeFirst();
     if (!lock) throw new DomainError("NOT_FOUND", "Maintenance lock not found", 404);
     await lockUnitDates(trx, propertyId, lock.inventory_unit_id, lock.arrival_date, lock.departure_date);
+    return;
+  }
+  if (commandType === "ADD_MEMBER_ENTITLEMENT_LOT") {
+    const contractId = requireString(input, "memberContractId");
+    const contract = await trx.selectFrom("member_contracts").select("id")
+      .where("id", "=", contractId).where("property_id", "=", propertyId).executeTakeFirst();
+    if (!contract) throw new DomainError("NOT_FOUND", "Member contract not found", 404);
+    await lockEntitlementLots(trx, contractId);
     return;
   }
   if (commandType === "ADJUST_MEMBER_ENTITLEMENT" || commandType === "EXPIRE_MEMBER_ENTITLEMENT") {
@@ -204,6 +252,79 @@ export async function applyCommand(trx: Transaction<Database>, options: {
   const propertyId = requireString(input, "propertyId");
   const effect = options.effect;
 
+  if (options.commandType === "CREATE_MEMBER") {
+    const operation = requireString(effect, "operation");
+    const memberProfile = nestedObject(effect, "member");
+    const contractEffect = nestedObject(effect, "contract");
+    const memberCreated = operation === "CREATE_MEMBER_WITH_INITIAL_CONTRACT";
+    if (!memberCreated && operation !== "MATCH_EXISTING_MEMBER") {
+      throw new DomainError("INTERNAL_ERROR", "Member registration effect has an invalid operation", 500);
+    }
+    const memberId = memberCreated ? newId("member") : requireString(effect, "memberId");
+    const memberContractId = memberCreated ? newId("contract") : typeof effect.memberContractId === "string" ? effect.memberContractId : null;
+    try {
+      if (memberCreated) {
+        if (!memberContractId) throw new DomainError("INTERNAL_ERROR", "New member registration has no initial contract ID", 500);
+        await trx.insertInto("members").values({
+          id: memberId,
+          identity_card_number: normalizeIdentityCardNumber(memberProfile.identityCardNumber),
+          full_name: requireString(memberProfile, "fullName"),
+          phone: requireString(memberProfile, "phone"),
+          wechat: requireString(memberProfile, "wechat")
+        }).execute();
+        await trx.insertInto("member_contracts").values({
+          id: memberContractId,
+          property_id: propertyId,
+          member_id: memberId,
+          member_name: requireString(memberProfile, "fullName"),
+          status: "ACTIVE",
+          valid_from: requireString(contractEffect, "validFrom"),
+          valid_until: requireString(contractEffect, "validUntil"),
+          version: 1
+        }).execute();
+      }
+
+      let memberExternalReferenceId: string | null = null;
+      let externalReferenceCreated = false;
+      if (effect.externalReference !== null && effect.externalReference !== undefined) {
+        const externalReference = requireObject(effect.externalReference, "externalReference");
+        const referenceOperation = requireString(externalReference, "operation");
+        if (referenceOperation === "CREATE_LINK") {
+          memberExternalReferenceId = newId("memberref");
+          externalReferenceCreated = true;
+          await trx.insertInto("member_external_references").values({
+            id: memberExternalReferenceId,
+            member_id: memberId,
+            property_id: propertyId,
+            provider: "FEISHU_BASE",
+            source_container_id: requireString(externalReference, "sourceContainerId"),
+            source_table_id: requireString(externalReference, "sourceTableId"),
+            external_record_id: requireString(externalReference, "externalRecordId")
+          }).execute();
+        } else if (referenceOperation === "USE_EXISTING_LINK") {
+          memberExternalReferenceId = requireString(externalReference, "id");
+        } else {
+          throw new DomainError("INTERNAL_ERROR", "Member external-reference effect has an invalid operation", 500);
+        }
+      }
+      const resourceRefs = [memberId, ...(memberContractId ? [memberContractId] : []), ...(memberExternalReferenceId ? [memberExternalReferenceId] : [])];
+      return {
+        persistedResult: {
+          memberId,
+          memberContractId,
+          memberCreated,
+          memberContractCreated: memberCreated,
+          memberExternalReferenceId,
+          externalReferenceCreated
+        },
+        resourceRefs,
+        factRefs: []
+      };
+    } catch (error) {
+      rethrowMemberRegistrationConflict(error);
+    }
+  }
+
   if (options.commandType === "CREATE_ORDER") {
     const orderId = newId("order");
     const stayId = newId("stay");
@@ -214,18 +335,25 @@ export async function applyCommand(trx: Transaction<Database>, options: {
     const unitId = requireString(inventoryUnit, "id");
     const arrivalDate = requireString(effect, "arrivalDate");
     const departureDate = requireString(effect, "departureDate");
+    const stayType = requireString(effect, "stayType");
     const policyVersionId = requireString(effect, "pricingPolicyVersionId");
     const memberContractId = typeof effect.memberContractId === "string" ? effect.memberContractId : null;
+    const { bookingChannelCode, channelOrderReference } = validateBookingChannel(
+      effect.bookingChannelCode,
+      effect.channelOrderReference
+    );
+    const freeStayReason = stayType === "FREE" ? requireString(effect, "freeStayReason") : null;
     await trx.insertInto("orders").values({
-      id: orderId, property_id: propertyId, status: "RESERVED", stay_type: requireString(effect, "stayType"),
+      id: orderId, property_id: propertyId, status: "RESERVED", stay_type: stayType,
       arrival_date: arrivalDate, departure_date: departureDate, primary_guest_snapshot: nestedObject(effect, "primaryGuest"),
+      booking_channel_code: bookingChannelCode, channel_order_reference: channelOrderReference, free_stay_reason: freeStayReason,
       pricing_policy_version_id: policyVersionId, member_contract_id: memberContractId, current_revision_id: null, version: 1
     }).execute();
     await trx.insertInto("stays").values({ id: stayId, order_id: orderId, status: "PLANNED" }).execute();
     await trx.insertInto("amendments").values({
       id: amendmentId, order_id: orderId, sequence: 1, amendment_type: "CREATE_ORDER",
       reason_code: options.reason.code, reason_note: options.reason.note, prior_version: 0, new_version: 1,
-      payload: { quoteId: effect.quoteId, inventoryUnitId: unitId, arrivalDate, departureDate }
+      payload: { quoteId: effect.quoteId, inventoryUnitId: unitId, arrivalDate, departureDate, bookingChannelCode, channelOrderReference, freeStayReason }
     }).execute();
     await trx.insertInto("stay_segments").values({
       id: segmentId, stay_id: stayId, sequence: 1, inventory_unit_id: unitId, arrival_date: arrivalDate,
@@ -242,7 +370,7 @@ export async function applyCommand(trx: Transaction<Database>, options: {
       await bumpMembershipForCoverage(trx, memberContractId, pricing.coverageSet);
     }
     return {
-      persistedResult: { orderId, stayId, segmentId, pricingRevisionId: revisionId },
+      persistedResult: { orderId, stayId, segmentId, pricingRevisionId: revisionId, bookingChannelCode, channelOrderReference, freeStayReason },
       resourceRefs: [orderId, stayId, segmentId, revisionId, ...coverageRefs.coverageIds],
       factRefs: coverageRefs.factIds
     };
@@ -268,6 +396,32 @@ export async function applyCommand(trx: Transaction<Database>, options: {
     await releaseInventoryClaims(trx, "MAINTENANCE", [maintenanceLockId]);
     await trx.updateTable("maintenance_locks").set({ status: "RELEASED", version: sql`version + 1`, released_at: new Date() }).where("id", "=", maintenanceLockId).execute();
     return { persistedResult: { maintenanceLockId, status: "RELEASED" }, resourceRefs: [maintenanceLockId], factRefs: [] };
+  }
+
+  if (options.commandType === "ADD_MEMBER_ENTITLEMENT_LOT") {
+    const contractId = requireString(effect, "contractId");
+    const unitKind = requireString(effect, "unitKind");
+    if (unitKind !== "ROOM_NIGHT" && unitKind !== "BED_NIGHT") throw new DomainError("INTERNAL_ERROR", "Entitlement lot effect has an invalid unit kind", 500);
+    const units = effect.units;
+    if (!Number.isInteger(units) || (units as number) <= 0) throw new DomainError("INTERNAL_ERROR", "Entitlement lot effect has invalid units", 500);
+    const expiresOn = requireString(effect, "expiresOn");
+    const lotId = newId("lot");
+    const factId = newId("fact");
+    await trx.insertInto("entitlement_lots").values({
+      id: lotId, contract_id: contractId, unit_kind: unitKind, total_units: 0, expires_on: expiresOn, version: 1
+    }).execute();
+    await trx.insertInto("entitlement_ledger").values({
+      fact_id: factId, lot_id: lotId, entry_type: "ADJUST", quantity_delta: units as number,
+      service_date: null, order_id: null, coverage_id: null,
+      reason: `MEMBER_ENTITLEMENT_LOT_ADDED ${options.reason.code}: ${options.reason.note}`,
+      command_id: options.commandId
+    }).execute();
+    await trx.updateTable("member_contracts").set({ version: sql`version + 1` }).where("id", "=", contractId).execute();
+    return {
+      persistedResult: { entitlementLotId: lotId, contractId, adjustmentFactId: factId, units },
+      resourceRefs: [contractId, lotId],
+      factRefs: [factId]
+    };
   }
 
   if (options.commandType === "ADJUST_MEMBER_ENTITLEMENT") {
@@ -420,6 +574,11 @@ export async function applyCommand(trx: Transaction<Database>, options: {
       coverageIds.push(...held.coverageIds);
       coverageFactIds.push(...held.factIds);
       await bumpMembershipForCoverage(trx, context.order.member_contract_id, pricing.coverageSet);
+      if (context.order.status === "CHECKED_IN") {
+        const consumed = await consumeCoverage(trx, orderId, options.commandId);
+        coverageIds.push(...consumed.coverageIds);
+        coverageFactIds.push(...consumed.factIds);
+      }
     }
     await trx.updateTable("orders").set({
       departure_date: departureDate, current_revision_id: revisionId,
@@ -432,7 +591,7 @@ export async function applyCommand(trx: Transaction<Database>, options: {
     };
   }
 
-  if (options.commandType === "REPRICE_ORDER") {
+  if (options.commandType === "REPRICE_ORDER" || options.commandType === "REFRESH_MEMBER_COVERAGE") {
     const amendmentId = await appendAmendment(trx, {
       orderId, sequence: context.order.version + 1, amendmentType: options.commandType,
       reasonCode: options.reason.code, reasonNote: options.reason.note, priorVersion: context.order.version, payload: effect
@@ -443,7 +602,7 @@ export async function applyCommand(trx: Transaction<Database>, options: {
       policyVersionId: context.order.pricing_policy_version_id,
       arrivalDate: context.order.arrival_date, departureDate: context.order.departure_date, pricing
     });
-    const coverageRefs = context.order.member_contract_id
+    const reconciledCoverage = context.order.member_contract_id
       ? await reconcileCoverage(trx, {
         orderId,
         contractId: context.order.member_contract_id,
@@ -452,9 +611,22 @@ export async function applyCommand(trx: Transaction<Database>, options: {
         commandId: options.commandId
       })
       : { coverageIds: [], factIds: [] };
+    const consumedCoverage = context.order.member_contract_id && context.order.status === "CHECKED_IN"
+      ? await consumeCoverage(trx, orderId, options.commandId)
+      : { coverageIds: [], factIds: [] };
+    const coverageRefs = {
+      coverageIds: [...new Set([...reconciledCoverage.coverageIds, ...consumedCoverage.coverageIds])],
+      factIds: [...new Set([...reconciledCoverage.factIds, ...consumedCoverage.factIds])]
+    };
     await trx.updateTable("orders").set({ current_revision_id: revisionId, version: context.order.version + 1, updated_at: new Date() }).where("id", "=", orderId).execute();
+    const persistedResult: Record<string, unknown> = { orderId, amendmentId, pricingRevisionId: revisionId };
+    if (options.commandType === "REPRICE_ORDER") {
+      persistedResult.policyBaseAmount = moneyMinor(effect.policyBaseAmount, "policyBaseAmount");
+      persistedResult.targetCurrentContractAmount = moneyMinor(effect.targetCurrentContractAmount, "targetCurrentContractAmount");
+      persistedResult.manualAdjustmentMinor = effect.manualAdjustmentMinor;
+    }
     return {
-      persistedResult: { orderId, amendmentId, pricingRevisionId: revisionId },
+      persistedResult,
       resourceRefs: [orderId, amendmentId, revisionId, ...coverageRefs.coverageIds],
       factRefs: coverageRefs.factIds
     };
@@ -465,6 +637,7 @@ export async function applyCommand(trx: Transaction<Database>, options: {
     const amountMinor = effect.amountMinor as number;
     const factType = options.commandType === "RECORD_COLLECTION" ? "COLLECTION" : options.commandType === "RECORD_REFUND" ? "REFUND" : "REVERSAL";
     const netEffectMinor = factType === "COLLECTION" ? amountMinor : factType === "REFUND" ? -amountMinor : effect.netEffectMinor as number;
+    const transactionReference = factType === "REVERSAL" ? null : requireTransactionReference(effect.transactionReference);
     await trx.insertInto("collection_facts").values({
       fact_id: factId, order_id: orderId, fact_type: factType, amount_minor: amountMinor,
       net_effect_minor: netEffectMinor, currency: requireString(effect, "currency"),
@@ -472,9 +645,10 @@ export async function applyCommand(trx: Transaction<Database>, options: {
       reverses_fact_id: typeof effect.reversesFactId === "string" ? effect.reversesFactId : null,
       method: typeof effect.method === "string" ? effect.method : "REVERSAL",
       note: typeof effect.note === "string" ? effect.note : options.reason.note,
+      transaction_reference: transactionReference,
       command_id: options.commandId
     }).execute();
-    return { persistedResult: { orderId, factId, factType, netEffectMinor }, resourceRefs: [orderId], factRefs: [factId] };
+    return { persistedResult: { orderId, factId, factType, netEffectMinor, transactionReference }, resourceRefs: [orderId], factRefs: [factId] };
   }
 
   const statusCommands: Partial<Record<CommandType, { orderStatus: string; stayStatus: string }>> = {
@@ -490,19 +664,65 @@ export async function applyCommand(trx: Transaction<Database>, options: {
       reasonCode: options.reason.code, reasonNote: options.reason.note, priorVersion: context.order.version, payload: effect
     });
     let coverageRefs = { coverageIds: [] as string[], factIds: [] as string[] };
-    if (options.commandType === "CHECK_OUT") {
+    let statusPricingRevisionId: string | undefined;
+    if (context.order.stay_type === "FREE" && (options.commandType === "CANCEL_ORDER" || options.commandType === "MARK_NO_SHOW")) {
+      const prior = await trx.selectFrom("pricing_revisions").selectAll().where("id", "=", context.revision.id).executeTakeFirstOrThrow();
+      const coverageSet = prior.coverage_set as CoverageItemDto[];
+      const cashLines = prior.cash_lines as unknown[];
+      if (coverageSet.length !== 0 || cashLines.some((line) => {
+        const amount = line && typeof line === "object" ? (line as { amount?: { minorUnits?: unknown } }).amount?.minorUnits : undefined;
+        return amount !== 0;
+      }) || prior.current_contract_amount_minor !== 0) {
+        throw new DomainError("INTERNAL_ERROR", "Free stay pricing must remain zero and entitlement-free", 500);
+      }
+      statusPricingRevisionId = await insertRevision(trx, {
+        orderId,
+        revisionNo: context.revision.revisionNo + 1,
+        amendmentId,
+        policyVersionId: context.order.pricing_policy_version_id,
+        arrivalDate: context.order.arrival_date,
+        departureDate: context.order.departure_date,
+        pricing: {
+          coverageSet,
+          cashLines,
+          manualAdjustmentMinor: 0,
+          currentContractAmountMinor: 0,
+          currency: prior.currency
+        }
+      });
+    }
+    if (options.commandType === "CHECK_IN") {
       coverageRefs = await consumeCoverage(trx, orderId, options.commandId);
+    }
+    if (options.commandType === "CHECK_OUT") {
       await releaseInventoryClaims(trx, "ORDER_SEGMENT", context.segmentIds);
     }
     if (options.commandType === "CANCEL_ORDER" || options.commandType === "MARK_NO_SHOW") {
       coverageRefs = await releaseCoverage(trx, orderId, options.commandId);
       await releaseInventoryClaims(trx, "ORDER_SEGMENT", context.segmentIds);
     }
-    await trx.updateTable("orders").set({ status: target.orderStatus, version: context.order.version + 1, updated_at: new Date() }).where("id", "=", orderId).execute();
+    await trx.updateTable("orders").set({
+      status: target.orderStatus,
+      ...(statusPricingRevisionId ? { current_revision_id: statusPricingRevisionId } : {}),
+      version: context.order.version + 1,
+      updated_at: new Date()
+    }).where("id", "=", orderId).execute();
     await trx.updateTable("stays").set({ status: target.stayStatus }).where("id", "=", context.stay.id).execute();
     return {
-      persistedResult: { orderId, amendmentId, status: target.orderStatus },
-      resourceRefs: [orderId, amendmentId, ...coverageRefs.coverageIds],
+      persistedResult: {
+        orderId,
+        amendmentId,
+        status: target.orderStatus,
+        ...((options.commandType === "CHECK_IN" || options.commandType === "CANCEL_ORDER" || options.commandType === "MARK_NO_SHOW") ? {
+          entitlementTransition: {
+            from: "HELD",
+            to: options.commandType === "CHECK_IN" ? "CONSUMED" : "RELEASED",
+            coverageCount: coverageRefs.coverageIds.length
+          }
+        } : {}),
+        ...(statusPricingRevisionId ? { pricingRevisionId: statusPricingRevisionId } : {})
+      },
+      resourceRefs: [orderId, amendmentId, ...(statusPricingRevisionId ? [statusPricingRevisionId] : []), ...coverageRefs.coverageIds],
       factRefs: coverageRefs.factIds
     };
   }

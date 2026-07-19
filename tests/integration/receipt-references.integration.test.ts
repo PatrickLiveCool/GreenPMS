@@ -62,7 +62,9 @@ async function createMemberOrder(prefix: string, arrivalDate: string, departureD
     input: {
       propertyId: demo.propertyId,
       quoteId: quote.quoteId,
-      primaryGuest: { fullName: `Receipt reference guest ${prefix}` }
+      primaryGuest: { fullName: `Receipt reference guest ${prefix}` },
+      bookingChannelCode: "MEITUAN",
+      channelOrderReference: `TEST-RECEIPT-ORDER-${prefix}`
     }
   }, `${prefix}-create`);
   const orderId = receipt.result?.orderId;
@@ -121,9 +123,17 @@ async function expectExactLedgerReferences(options: {
 
 beforeAll(async () => {
   db = await resetDatabase(databaseUrl);
+  await db.insertInto("members").values({
+    id: "member_profile_receipt_references",
+    identity_card_number: "TEST-RECEIPT-REFERENCES-ID",
+    full_name: "Receipt Reference Member",
+    phone: "13800000002",
+    wechat: "receipt-reference-member"
+  }).execute();
   await db.insertInto("member_contracts").values({
     id: contractId,
     property_id: demo.propertyId,
+    member_id: "member_profile_receipt_references",
     member_name: "Receipt Reference Member",
     status: "ACTIVE",
     valid_from: "2026-01-01",
@@ -144,7 +154,7 @@ beforeAll(async () => {
       contract_id: contractId,
       unit_kind: "ROOM_NIGHT",
       total_units: 3,
-      expires_on: "2027-12-31",
+      expires_on: "2026-01-01",
       version: 1
     }
   ]).execute();
@@ -184,24 +194,26 @@ describe.sequential("Receipt permanent references for member entitlement facts",
     });
   });
 
-  it("ties CONSUME facts and coverage resources to the CHECK_OUT command", async () => {
+  it("ties CONSUME facts and coverage resources to the CHECK_IN command exactly once", async () => {
     const created = await createMemberOrder("consume", "2028-04-01", "2028-04-03");
     const coverageIds = created.coverage.map((item) => item.id);
-    await previewAndConfirm({
+    const checkedIn = await previewAndConfirm({
       commandType: "CHECK_IN",
       input: { propertyId: demo.propertyId, orderId: created.orderId }
     }, "consume-check-in");
+
+    await expectExactLedgerReferences({
+      receipt: checkedIn,
+      entryTypes: ["CONSUME", "CONSUME"],
+      coverageResourceIds: coverageIds,
+      resourceRefs: [created.orderId, checkedIn.result!.amendmentId as string, ...coverageIds]
+    });
+
     const checkedOut = await previewAndConfirm({
       commandType: "CHECK_OUT",
       input: { propertyId: demo.propertyId, orderId: created.orderId }
     }, "consume-check-out");
-
-    await expectExactLedgerReferences({
-      receipt: checkedOut,
-      entryTypes: ["CONSUME", "CONSUME"],
-      coverageResourceIds: coverageIds,
-      resourceRefs: [created.orderId, checkedOut.result!.amendmentId as string, ...coverageIds]
-    });
+    expect(checkedOut.factRefs).toEqual([]);
   });
 
   it("keeps retained and released coverage references exact when shortening", async () => {
@@ -248,7 +260,7 @@ describe.sequential("Receipt permanent references for member entitlement facts",
       label: "EXPIRE",
       envelope: {
         commandType: "EXPIRE_MEMBER_ENTITLEMENT",
-        input: { propertyId: demo.propertyId, entitlementLotId: expiringLotId, asOfDate: "2028-01-01" }
+        input: { propertyId: demo.propertyId, entitlementLotId: expiringLotId, asOfDate: "2026-01-02" }
       } satisfies CommandEnvelope,
       lotId: expiringLotId,
       entryType: "EXPIRE" as const

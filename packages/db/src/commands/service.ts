@@ -17,7 +17,7 @@ import { newId, sha256, stableHash } from "@qintopia/domain";
 import { createQuoteInTransaction } from "../pricing-service.ts";
 import type { Database } from "../schema.ts";
 import { applyCommand, lockCommandResources } from "./apply.ts";
-import { buildCommandEffect } from "./effects.ts";
+import { buildCommandEffect, projectCommandEffectForRead } from "./effects.ts";
 
 export interface ConfirmRequest {
   propertyId: string;
@@ -179,6 +179,28 @@ async function revalidateQuoteReadAccess(
 const opaqueTokenSecret = /^qtp_[A-Za-z0-9_-]{43}$/;
 
 function normalizeCommandEnvelope(envelope: CommandEnvelope): CommandEnvelope {
+  if (envelope.commandType === "CREATE_MEMBER") {
+    const trim = (field: string, uppercase = false) => {
+      const value = envelope.input[field];
+      if (typeof value !== "string") return value;
+      const normalized = value.trim();
+      return uppercase ? normalized.toUpperCase() : normalized;
+    };
+    return {
+      commandType: envelope.commandType,
+      input: {
+        ...envelope.input,
+        fullName: trim("fullName"),
+        identityCardNumber: trim("identityCardNumber", true),
+        phone: trim("phone"),
+        wechat: trim("wechat"),
+        validFrom: trim("validFrom"),
+        validUntil: trim("validUntil"),
+        ...(envelope.input.memberContractId !== undefined ? { memberContractId: trim("memberContractId") } : {}),
+        ...(envelope.input.sourceApplicationRecordId !== undefined ? { sourceApplicationRecordId: trim("sourceApplicationRecordId") } : {})
+      }
+    };
+  }
   if (envelope.commandType !== "ISSUE_TOKEN" && envelope.commandType !== "ROTATE_TOKEN") return envelope;
   const value = envelope.input.tokenSecret;
   if (typeof value !== "string" || !opaqueTokenSecret.test(value) || new Set(value.slice(4)).size < 16) {
@@ -260,11 +282,12 @@ async function receiptByCommand(db: Kysely<Database> | Transaction<Database>, co
     .select([
       "command_receipts.id", "command_receipts.command_id", "command_receipts.execution_status", "command_receipts.business_committed",
       "command_receipts.result", "command_receipts.error", "command_receipts.resource_refs", "command_receipts.fact_refs", "command_receipts.committed_at",
-      "command_executions.correlation_id"
+      "command_executions.correlation_id", "command_executions.command_type"
     ])
     .where("command_receipts.command_id", "=", commandId).executeTakeFirst();
   if (!row) return undefined;
-  const result = asRecord(row.result);
+  const storedResult = asRecord(row.result);
+  const result = storedResult ? projectReceiptResultForRead(row.command_type, storedResult) : undefined;
   const error = asRecord(row.error) as ErrorDto | undefined;
   return {
     receiptId: row.id,
@@ -278,6 +301,34 @@ async function receiptByCommand(db: Kysely<Database> | Transaction<Database>, co
     factRefs: asStringArray(row.fact_refs),
     ...(row.committed_at ? { committedAt: asDate(row.committed_at).toISOString() } : {})
   };
+}
+
+function projectReceiptResultForRead(commandType: string, result: Record<string, unknown>): Record<string, unknown> {
+  if (commandType.startsWith("PREVIEW:")) {
+    const preview = asRecord(result.preview);
+    const effect = preview ? asRecord(preview.effect) : undefined;
+    if (!preview || !effect) return result;
+    const previewCommandType = commandType.slice("PREVIEW:".length);
+    return {
+      ...result,
+      preview: { ...preview, effect: projectCommandEffectForRead(previewCommandType, effect) }
+    };
+  }
+  if (commandType === "CREATE_ORDER") {
+    return {
+      ...result,
+      bookingChannelCode: Object.hasOwn(result, "bookingChannelCode") ? result.bookingChannelCode : null,
+      channelOrderReference: Object.hasOwn(result, "channelOrderReference") ? result.channelOrderReference : null,
+      freeStayReason: Object.hasOwn(result, "freeStayReason") ? result.freeStayReason : null
+    };
+  }
+  if (commandType === "RECORD_COLLECTION" || commandType === "RECORD_REFUND" || commandType === "REVERSE_FACT") {
+    return {
+      ...result,
+      transactionReference: Object.hasOwn(result, "transactionReference") ? result.transactionReference : null
+    };
+  }
+  return result;
 }
 
 async function replayOrConflict(db: Kysely<Database> | Transaction<Database>, options: {
@@ -464,8 +515,9 @@ export async function createCommandPreview(db: Kysely<Database>, principal: Auth
   }
   const replay = await replayOrConflict(db, { subjectId: principal.subjectId, propertyId: requestedPropertyId, commandType: executionType, idempotencyKey: headers.idempotencyKey, requestHash });
   if (replay) return { preview: previewFromReceipt(replay), receipt: replay };
+  const commandLockKey = executionLockKey(principal.subjectId, requestedPropertyId, executionType, headers.idempotencyKey);
 
-  return db.transaction().setIsolationLevel("repeatable read").execute(async (trx) => {
+  return withExecutionLock(db, commandLockKey, (lockedDb) => lockedDb.transaction().setIsolationLevel("repeatable read").execute(async (trx) => {
     const built = await buildCommandEffect(trx, normalizedEnvelope.commandType, normalizedEnvelope.input);
     await assertTokenExpiryCeiling(trx, principal, normalizedEnvelope.commandType, built.effect);
     const access = principal.propertyAccess.get(built.propertyId);
@@ -506,7 +558,7 @@ export async function createCommandPreview(db: Kysely<Database>, principal: Auth
     const receipt = await receiptByCommand(trx, inserted.id);
     if (!receipt) throw new DomainError("INTERNAL_ERROR", "Preview receipt was not persisted", 500);
     return { preview, receipt };
-  });
+  }));
 }
 
 async function persistRejected(db: Kysely<Database>, principal: AuthPrincipal, options: {
@@ -518,8 +570,20 @@ async function persistRejected(db: Kysely<Database>, principal: AuthPrincipal, o
   reason: CommandReason;
   error: DomainError;
   replayExisting?: boolean;
+  expirePreviewId?: string;
 }): Promise<ReceiptDto> {
   return db.transaction().execute(async (trx) => {
+    if (options.expirePreviewId) {
+      await trx.updateTable("command_previews")
+        .set({ status: "EXPIRED", used_at: null })
+        .where("id", "=", options.expirePreviewId)
+        .where("subject_id", "=", principal.subjectId)
+        .where("property_id", "=", options.propertyId)
+        .where("command_type", "=", options.commandType)
+        .where("status", "=", "OPEN")
+        .where("expires_at", "<=", new Date())
+        .execute();
+    }
     const commandId = newId("command");
     const inserted = await trx.insertInto("command_executions").values({
       id: commandId, subject_id: principal.subjectId, credential_id: principal.credentialId, property_id: options.propertyId,
@@ -621,8 +685,13 @@ export async function confirmCommandPreview(db: Kysely<Database>, principal: Aut
         if (preview.property_id !== propertyId || preview.command_type !== commandType) {
           throw new DomainError("CONFIRMATION_MISMATCH", "Confirmed property or command type does not match the preview", 409);
         }
+        if (preview.status === "EXPIRED") {
+          throw new DomainError("PREVIEW_STALE", "Preview has expired; request a new preview", 409, false, { causeCode: "PREVIEW_EXPIRED" });
+        }
         if (preview.status !== "OPEN") throw new DomainError("PREVIEW_ALREADY_USED", "Preview has already been used", 409);
-        if (asDate(preview.expires_at).getTime() <= Date.now()) throw new DomainError("PREVIEW_EXPIRED", "Preview has expired", 409);
+        if (asDate(preview.expires_at).getTime() <= Date.now()) {
+          throw new DomainError("PREVIEW_STALE", "Preview has expired; request a new preview", 409, false, { causeCode: "PREVIEW_EXPIRED" });
+        }
         if (preview.effect_hash !== confirmation.expectedEffectHash) throw new DomainError("CONFIRMATION_MISMATCH", "Confirmed effect hash does not match the preview", 409);
         await lockCommandResources(trx, commandType, preview.normalized_input);
         let rebuilt;
@@ -634,6 +703,7 @@ export async function confirmCommandPreview(db: Kysely<Database>, principal: Aut
             "INVENTORY_CONFLICT",
             "ENTITLEMENT_CONFLICT",
             "AGGREGATE_VERSION_CONFLICT",
+            "INVALID_ORDER_STATE",
             "QUOTE_EXPIRED",
             "FACT_ALREADY_REVERSED",
             "REFUND_LIMIT_EXCEEDED"
@@ -701,7 +771,10 @@ export async function confirmCommandPreview(db: Kysely<Database>, principal: Aut
           requestHash,
           reason: confirmation.reason,
           error: rejectionError,
-          replayExisting: false
+          replayExisting: false,
+          ...(rejectionError.code === "PREVIEW_STALE" && rejectionError.details?.causeCode === "PREVIEW_EXPIRED"
+            ? { expirePreviewId: previewId }
+            : {})
         });
       } catch (persistenceError) {
         if (!(error instanceof DomainError)) throw error;

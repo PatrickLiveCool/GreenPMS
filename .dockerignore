@@ -1,9 +1,13 @@
 .git
 .env
+.env.*
+!.env.example
 node_modules
 **/node_modules
-**/dist
+apps/web/dist
 test-results
 playwright-report
 backups
-npm-debug.log*
+*.log
+.DS_Store
+**/.DS_Store

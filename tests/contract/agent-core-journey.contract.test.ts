@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
-import type { Kysely } from "kysely";
+import { sql, type Kysely } from "kysely";
 import type { CommandType } from "@qintopia/contracts";
 import { sha256 } from "@qintopia/domain";
 import type { Database } from "@qintopia/db";
@@ -41,6 +41,7 @@ type PreviewResponse = {
 };
 
 type CommandRun = {
+  preview: PreviewDto;
   receipt: ReceiptDto;
   confirmIdempotencyKey: string;
   correlationId: string;
@@ -56,14 +57,29 @@ function authHeaders(token: string) {
 }
 
 async function waitForUnknownRecovery(commandType: CommandType, idempotencyKey: string) {
+  const lockKey = `qintopia:command:${demo.agentSubjectId}:${demo.propertyId}:${commandType}:${idempotencyKey}`;
   const deadline = Date.now() + 10_000;
   while (Date.now() < deadline) {
-    const response = await app.inject({
-      method: "GET",
-      url: `/api/v1/command-results?propertyId=${demo.propertyId}&commandType=${commandType}&idempotencyKey=${idempotencyKey}`,
-      headers: { authorization: `Bearer ${demo.writeToken}` }
+    const acquired = await db.connection().execute(async (connection) => {
+      const result = await sql<{ acquired: boolean }>`
+        select pg_try_advisory_lock(hashtextextended(${lockKey}, 0::bigint)) as acquired
+      `.execute(connection);
+      if (result.rows[0]?.acquired) {
+        await sql`select pg_advisory_unlock(hashtextextended(${lockKey}, 0::bigint))`.execute(connection);
+        return true;
+      }
+      return false;
     });
-    if (response.statusCode === 200 && response.json().executionStatus === "UNKNOWN") return response;
+    if (!acquired) {
+      const response = await app.inject({
+        method: "GET",
+        url: `/api/v1/command-results?propertyId=${demo.propertyId}&commandType=${commandType}&idempotencyKey=${idempotencyKey}`,
+        headers: { authorization: `Bearer ${demo.writeToken}` }
+      });
+      expect(response.statusCode, response.body).toBe(200);
+      expect(response.json()).toEqual({ executionStatus: "UNKNOWN", businessCommitted: false });
+      return response;
+    }
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
   throw new Error("Timed out waiting for the active HTTP command execution lock");
@@ -165,7 +181,7 @@ async function runCommand(
     })
   ]));
 
-  return { receipt, confirmIdempotencyKey, correlationId };
+  return { preview: previewBody.preview, receipt, confirmIdempotencyKey, correlationId };
 }
 
 beforeAll(async () => {
@@ -330,8 +346,12 @@ describe("scoped agent HTTP core journey", () => {
         fullName: "Scoped Agent Journey Guest",
         phone: "13800000000",
         documentNumber: "AGENT-HTTP-2028"
-      }
+      },
+      bookingChannelCode: "MEITUAN",
+      channelOrderReference: "TEST-AGENT-ORDER-2028"
     }, "create-order");
+    expect(created.preview.effect).toMatchObject({ bookingChannelCode: "MEITUAN", channelOrderReference: "TEST-AGENT-ORDER-2028" });
+    expect(created.receipt.result).toMatchObject({ bookingChannelCode: "MEITUAN", channelOrderReference: "TEST-AGENT-ORDER-2028" });
     const orderId = created.receipt.result?.orderId as string;
     expect(orderId).toMatch(/^order_/);
     expect(created.receipt.resourceRefs).toContain(orderId);
@@ -349,7 +369,7 @@ describe("scoped agent HTTP core journey", () => {
 
     const memberAfterCreate = await app.inject({
       method: "GET",
-      url: `/api/v1/members/${demo.memberContractId}`,
+      url: `/api/v1/members/${demo.memberId}?propertyId=${demo.propertyId}`,
       headers: { authorization: `Bearer ${demo.writeToken}` }
     });
     expect(memberAfterCreate.statusCode, memberAfterCreate.body).toBe(200);
@@ -364,8 +384,11 @@ describe("scoped agent HTTP core journey", () => {
       orderId,
       amountMinor: 6_000,
       method: "CASH",
+      transactionReference: "TEST-AGENT-TXN-COLLECTION-ONE",
       note: "First independent installment"
     }, "collection-one");
+    expect(firstCollection.preview.effect).toMatchObject({ transactionReference: "TEST-AGENT-TXN-COLLECTION-ONE" });
+    expect(firstCollection.receipt.result).toMatchObject({ transactionReference: "TEST-AGENT-TXN-COLLECTION-ONE" });
     expect(firstCollection.receipt.factRefs).toHaveLength(1);
     const firstCollectionFactId = firstCollection.receipt.factRefs[0]!;
 
@@ -374,8 +397,11 @@ describe("scoped agent HTTP core journey", () => {
       orderId,
       amountMinor: 6_000,
       method: "BANK_TRANSFER",
+      transactionReference: "TEST-AGENT-TXN-COLLECTION-TWO",
       note: "Second independent installment"
     }, "collection-two");
+    expect(secondCollection.preview.effect).toMatchObject({ transactionReference: "TEST-AGENT-TXN-COLLECTION-TWO" });
+    expect(secondCollection.receipt.result).toMatchObject({ transactionReference: "TEST-AGENT-TXN-COLLECTION-TWO" });
     expect(secondCollection.receipt.factRefs).toHaveLength(1);
     expect(secondCollection.receipt.factRefs[0]).not.toBe(firstCollectionFactId);
 
@@ -392,8 +418,11 @@ describe("scoped agent HTTP core journey", () => {
       amountMinor: 3_000,
       referencesFactId: firstCollectionFactId,
       method: "CASH",
+      transactionReference: "TEST-AGENT-TXN-REFUND-ONE",
       note: "Partial refund referencing the first installment"
     }, "refund-first-collection");
+    expect(refund.preview.effect).toMatchObject({ transactionReference: "TEST-AGENT-TXN-REFUND-ONE" });
+    expect(refund.receipt.result).toMatchObject({ transactionReference: "TEST-AGENT-TXN-REFUND-ONE" });
     expect(refund.receipt.factRefs).toHaveLength(1);
     const refundFactId = refund.receipt.factRefs[0]!;
     const refundFactResponse = await app.inject({
@@ -408,10 +437,11 @@ describe("scoped agent HTTP core journey", () => {
       fact_type: "REFUND",
       amount_minor: 3_000,
       net_effect_minor: -3_000,
-      references_fact_id: firstCollectionFactId
+      references_fact_id: firstCollectionFactId,
+      transaction_reference: "TEST-AGENT-TXN-REFUND-ONE"
     });
 
-    await runCommand(demo.writeToken, "CHECK_IN", {
+    const checkedIn = await runCommand(demo.writeToken, "CHECK_IN", {
       propertyId: demo.propertyId,
       orderId
     }, "check-in");
@@ -450,7 +480,7 @@ describe("scoped agent HTTP core journey", () => {
 
     const memberAfterCheckout = await app.inject({
       method: "GET",
-      url: `/api/v1/members/${demo.memberContractId}`,
+      url: `/api/v1/members/${demo.memberId}?propertyId=${demo.propertyId}`,
       headers: { authorization: `Bearer ${demo.writeToken}` }
     });
     expect(memberAfterCheckout.statusCode, memberAfterCheckout.body).toBe(200);
@@ -458,8 +488,9 @@ describe("scoped agent HTTP core journey", () => {
       entry.order_id === orderId && entry.entry_type === "CONSUME"
     ));
     expect(consumeFacts).toHaveLength(2);
-    expect(checkedOut.receipt.resourceRefs).toEqual(expect.arrayContaining(finalOrder.coverageSet.map((item: { id: string }) => item.id)));
-    expect(checkedOut.receipt.factRefs).toEqual(expect.arrayContaining(consumeFacts.map((entry: { fact_id: string }) => entry.fact_id)));
+    expect(checkedIn.receipt.resourceRefs).toEqual(expect.arrayContaining(finalOrder.coverageSet.map((item: { id: string }) => item.id)));
+    expect(checkedIn.receipt.factRefs).toEqual(expect.arrayContaining(consumeFacts.map((entry: { fact_id: string }) => entry.fact_id)));
+    expect(checkedOut.receipt.factRefs).toEqual([]);
 
     for (const url of [
       `/api/v1/receipts/${created.receipt.receiptId}`,
