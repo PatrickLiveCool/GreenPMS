@@ -80,4 +80,55 @@ describe("QinTopia 2026 reference catalog snapshot", () => {
     duplicateSourceCell.publicRates.rates[4]!.sourceCell = "C31";
     expect(() => validateQintopia2026ReferenceCatalogSnapshot(duplicateSourceCell)).toThrow(/duplicate public rate source cell/);
   });
+
+  it("locks the import identity to the user-confirmed Feishu revision", async () => {
+    const source = await loadBundledQintopia2026Catalog();
+
+    const wrongImportId = structuredClone(source);
+    wrongImportId.importId = "qintopia-2026-feishu-revision-561-rewritten";
+    expect(() => validateQintopia2026ReferenceCatalogSnapshot(wrongImportId)).toThrow(/importId must remain .*revision-561-user-confirmed-v3/);
+
+    const wrongRevision = structuredClone(source);
+    wrongRevision.source.revision = 562;
+    expect(() => validateQintopia2026ReferenceCatalogSnapshot(wrongRevision)).toThrow(/source revision must remain 561/);
+
+    const wrongVersionDate = structuredClone(source);
+    wrongVersionDate.source.publicPriceVersionDate = "2026-03-01";
+    expect(() => validateQintopia2026ReferenceCatalogSnapshot(wrongVersionDate)).toThrow(/public price version date changed from revision 561/);
+  });
+
+  it("rejects room-type and building swaps even when every aggregate still closes", async () => {
+    const swapped = structuredClone(await loadBundledQintopia2026Catalog());
+    const a03 = swapped.inventory.rooms.find((room) => room.operationalCode === "A03")!;
+    const b01 = swapped.inventory.rooms.find((room) => room.operationalCode === "B01")!;
+
+    [a03.buildingCode, b01.buildingCode] = [b01.buildingCode, a03.buildingCode];
+    [a03.roomTypeKey, b01.roomTypeKey] = [b01.roomTypeKey, a03.roomTypeKey];
+
+    expect(() => validateQintopia2026ReferenceCatalogSnapshot(swapped)).toThrow(/canonical room A03 changed from revision 561/);
+  });
+
+  it("rejects synchronized rate and product-anchor tampering", async () => {
+    const tampered = structuredClone(await loadBundledQintopia2026Catalog());
+    const oneNightRate = tampered.publicRates.rates.find((rate) => rate.roomTypeKey === "private_bath_suite" && rate.nights === 1)!;
+    const roomProduct = tampered.publicRates.products.find((product) => product.productCode === "private_bath_suite_room")!;
+
+    oneNightRate.amountMinor += 100;
+    roomProduct.anchorsMinor["1"] += 100;
+
+    expect(() => validateQintopia2026ReferenceCatalogSnapshot(tampered)).toThrow(/canonical public rate private_bath_suite:1 changed from revision 561/);
+  });
+
+  it("rejects a coordinated two-person and four-person whole-room multiplier swap", async () => {
+    const swapped = structuredClone(await loadBundledQintopia2026Catalog());
+    const doubleRoom = swapped.publicRates.products.find((product) => product.productCode === "shared_bath_double_whole_room")!;
+    const quadRoom = swapped.publicRates.products.find((product) => product.productCode === "shared_bath_quad_whole_room")!;
+
+    doubleRoom.anchorMultiplier = 4;
+    doubleRoom.anchorsMinor = { "1": 27_200, "7": 152_000, "14": 220_000, "30": 360_000 };
+    quadRoom.anchorMultiplier = 2;
+    quadRoom.anchorsMinor = { "1": 11_600, "7": 61_600, "14": 96_000, "30": 156_000 };
+
+    expect(() => validateQintopia2026ReferenceCatalogSnapshot(swapped)).toThrow(/canonical pricing product shared_bath_double_whole_room changed from revision 561/);
+  });
 });

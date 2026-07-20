@@ -54,8 +54,8 @@ describe("database migration concurrency", () => {
         .sort();
       const rows = await client.query<{ name: string }>("SELECT name FROM schema_migrations ORDER BY name");
       expect(rows.rows.map((row) => row.name)).toEqual(expectedMigrations);
-      expect(expectedMigrations).toHaveLength(11);
-      expect(expectedMigrations).toContain("011_core_fact_shape_guards.sql");
+      expect(expectedMigrations).toHaveLength(12);
+      expect(expectedMigrations).toContain("012_legacy_demo_inventory_catalog_backfill.sql");
     } finally {
       await client.end();
     }

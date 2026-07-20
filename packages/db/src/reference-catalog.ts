@@ -69,6 +69,144 @@ interface MembershipProductSnapshot {
   sourceRange: string;
 }
 
+type CanonicalRoomTuple = readonly [
+  operationalCode: string,
+  buildingCode: string,
+  roomTypeKey: string,
+  sourceCode: string | null,
+  sourceLabel: string,
+  codeProvenance: PhysicalRoomSnapshot["codeProvenance"],
+  physicalBedCount: number,
+  physicalBedCodes: readonly string[] | null,
+  saleMode: PhysicalRoomSnapshot["saleMode"]
+];
+
+type CanonicalRateTuple = readonly [
+  roomTypeKey: string,
+  nights: PackageNights,
+  amountMinor: number,
+  sourceCell: string,
+  saleUnit: RateSnapshot["saleUnit"]
+];
+
+type CanonicalPricingProductTuple = readonly [
+  productCode: string,
+  roomTypeKey: string,
+  inventoryUnitKind: PricingProductSnapshot["inventoryUnitKind"],
+  anchorMultiplier: PricingProductSnapshot["anchorMultiplier"],
+  anchorsMinor: readonly [oneNight: number, sevenNights: number, fourteenNights: number, thirtyNights: number],
+  derivation: PricingProductSnapshot["derivation"]
+];
+
+const revision561ImportId = "qintopia-2026-feishu-revision-561-user-confirmed-v3";
+const revision561SourceRevision = 561;
+
+// These tuples are the independent data seal for the user-confirmed revision, not derived totals.
+const revision561RoomTuples = [
+  ["A01", "A", "private_bath_standard", "A01", "A01", "SOURCE_EXPLICIT", 2, ["A", "B"], "INDEPENDENT_ROOM"],
+  ["A02", "A", "private_bath_standard", "A02", "A02", "SOURCE_EXPLICIT", 2, ["A", "B"], "INDEPENDENT_ROOM"],
+  ["A03", "A", "private_bath_king", "A03", "A03", "SOURCE_EXPLICIT", 1, null, "INDEPENDENT_ROOM"],
+  ["A04", "A", "private_bath_king", "A04", "A04", "SOURCE_EXPLICIT", 1, null, "INDEPENDENT_ROOM"],
+  ["B01", "B", "private_bath_single", "B01", "B01", "SOURCE_EXPLICIT", 1, null, "INDEPENDENT_ROOM"],
+  ["B02", "B", "private_bath_single", "B02", "B02", "SOURCE_EXPLICIT", 1, null, "INDEPENDENT_ROOM"],
+  ["B03", "B", "private_bath_standard", "B03", "B03", "SOURCE_EXPLICIT", 2, ["A", "B"], "INDEPENDENT_ROOM"],
+  ["B04", "B", "private_bath_standard", "B04", "B04", "SOURCE_EXPLICIT", 2, ["A", "B"], "INDEPENDENT_ROOM"],
+  ["C01", "C", "private_bath_single", "I01", "I01", "USER_CONFIRMED_RENAMED", 1, null, "INDEPENDENT_ROOM"],
+  ["C02", "C", "private_bath_single", "I02", "I02", "USER_CONFIRMED_RENAMED", 1, null, "INDEPENDENT_ROOM"],
+  ["C03", "C", "private_bath_single", "I03", "I03", "USER_CONFIRMED_RENAMED", 1, null, "INDEPENDENT_ROOM"],
+  ["C04", "C", "private_bath_single", "I04", "I04", "USER_CONFIRMED_RENAMED", 1, null, "INDEPENDENT_ROOM"],
+  ["D-GEN-01", "D", "shared_bath_single", null, "养蜂 单", "PMS_GENERATED", 1, null, "INDEPENDENT_ROOM"],
+  ["D-GEN-02", "D", "shared_bath_single", null, "养蜂 单", "PMS_GENERATED", 1, null, "INDEPENDENT_ROOM"],
+  ["D-GEN-03", "D", "shared_bath_standard", null, "养蜂 双", "PMS_GENERATED", 2, ["A", "B"], "INDEPENDENT_ROOM"],
+  ["D-GEN-04", "D", "shared_bath_standard", null, "养蜂 双", "PMS_GENERATED", 2, ["A", "B"], "INDEPENDENT_ROOM"],
+  ["D-GEN-05", "D", "shared_bath_standard", null, "养蜂 双", "PMS_GENERATED", 2, ["A", "B"], "INDEPENDENT_ROOM"],
+  ["E-GEN-01", "E", "private_bath_standard", null, "蝴蝶 标间", "PMS_GENERATED", 2, ["A", "B"], "INDEPENDENT_ROOM"],
+  ["E-GEN-02", "E", "private_bath_single", null, "蝴蝶 单人间", "PMS_GENERATED", 1, null, "INDEPENDENT_ROOM"],
+  ["E-GEN-03", "E", "private_bath_suite", null, "蝴蝶 套房", "PMS_GENERATED", 2, ["A", "B"], "INDEPENDENT_ROOM"],
+  ["101", "1", "shared_bath_quad", "101", "101", "SOURCE_EXPLICIT", 4, ["A", "B", "C", "D"], "BED_WITH_WHOLE_ROOM_COMBINATION"],
+  ["102", "1", "shared_bath_quad", "102", "102", "SOURCE_EXPLICIT", 4, ["A", "B", "C", "D"], "BED_WITH_WHOLE_ROOM_COMBINATION"],
+  ["103", "1", "shared_bath_quad", "103", "103", "SOURCE_EXPLICIT", 4, ["A", "B", "C", "D"], "BED_WITH_WHOLE_ROOM_COMBINATION"],
+  ["104", "1", "shared_bath_double", "104", "104", "SOURCE_EXPLICIT", 2, ["A", "B"], "BED_WITH_WHOLE_ROOM_COMBINATION"],
+  ["105", "1", "shared_bath_quad", "105", "105", "SOURCE_EXPLICIT", 4, ["A", "B", "C", "D"], "BED_WITH_WHOLE_ROOM_COMBINATION"],
+  ["106", "1", "shared_bath_double", "106", "106", "SOURCE_EXPLICIT", 2, ["A", "B"], "BED_WITH_WHOLE_ROOM_COMBINATION"],
+  ["107", "1", "shared_bath_quad", "107", "107", "SOURCE_EXPLICIT", 4, ["A", "B", "C", "D"], "BED_WITH_WHOLE_ROOM_COMBINATION"],
+  ["108", "1", "shared_bath_quad", "108", "108", "SOURCE_EXPLICIT", 4, ["A", "B", "C", "D"], "BED_WITH_WHOLE_ROOM_COMBINATION"],
+  ["109", "1", "shared_bath_quad", "109", "109", "SOURCE_EXPLICIT", 4, ["A", "B", "C", "D"], "BED_WITH_WHOLE_ROOM_COMBINATION"],
+  ["201", "2", "shared_bath_single", "201", "201", "SOURCE_EXPLICIT", 1, null, "INDEPENDENT_ROOM"],
+  ["202", "2", "shared_bath_quad", "202", "202", "SOURCE_EXPLICIT", 4, ["A", "B", "C", "D"], "BED_WITH_WHOLE_ROOM_COMBINATION"],
+  ["203", "2", "shared_bath_quad", "203", "203", "SOURCE_EXPLICIT", 4, ["A", "B", "C", "D"], "BED_WITH_WHOLE_ROOM_COMBINATION"],
+  ["204", "2", "shared_bath_double", "204", "204", "SOURCE_EXPLICIT", 2, ["A", "B"], "BED_WITH_WHOLE_ROOM_COMBINATION"],
+  ["205", "2", "shared_bath_single", "205", "205", "SOURCE_EXPLICIT", 1, null, "INDEPENDENT_ROOM"],
+  ["206", "2", "shared_bath_quad", "206", "206", "SOURCE_EXPLICIT", 4, ["A", "B", "C", "D"], "BED_WITH_WHOLE_ROOM_COMBINATION"],
+  ["301", "3", "shared_bath_single", "301", "301 单", "SOURCE_EXPLICIT", 1, null, "INDEPENDENT_ROOM"],
+  ["302", "3", "shared_bath_single", "302", "302 单", "SOURCE_EXPLICIT", 1, null, "INDEPENDENT_ROOM"],
+  ["303", "3", "shared_bath_single", "303", "303 单", "SOURCE_EXPLICIT", 1, null, "INDEPENDENT_ROOM"],
+  ["304", "3", "shared_bath_single", "304", "304 单", "SOURCE_EXPLICIT", 1, null, "INDEPENDENT_ROOM"],
+  ["305", "3", "shared_bath_standard", "305", "305 双", "SOURCE_EXPLICIT", 2, ["A", "B"], "INDEPENDENT_ROOM"],
+  ["306", "3", "shared_bath_standard", "306", "306 双", "SOURCE_EXPLICIT", 2, ["A", "B"], "INDEPENDENT_ROOM"],
+  ["307", "3", "shared_bath_standard", "307", "307 双", "SOURCE_EXPLICIT", 2, ["A", "B"], "INDEPENDENT_ROOM"],
+  ["308", "3", "shared_bath_standard", "308", "308 双", "SOURCE_EXPLICIT", 2, ["A", "B"], "INDEPENDENT_ROOM"],
+  ["309", "3", "shared_bath_standard", "309", "309 双", "SOURCE_EXPLICIT", 2, ["A", "B"], "INDEPENDENT_ROOM"]
+] satisfies readonly CanonicalRoomTuple[];
+
+const revision561RateTuples = [
+  ["shared_bath_quad", 30, 78_000, "C31", "BED"],
+  ["shared_bath_quad", 14, 48_000, "D31", "BED"],
+  ["shared_bath_quad", 7, 30_800, "E31", "BED"],
+  ["shared_bath_quad", 1, 5_800, "F31", "BED"],
+  ["shared_bath_double", 30, 90_000, "C32", "BED"],
+  ["shared_bath_double", 14, 55_000, "D32", "BED"],
+  ["shared_bath_double", 7, 38_000, "E32", "BED"],
+  ["shared_bath_double", 1, 6_800, "F32", "BED"],
+  ["shared_bath_single", 30, 135_000, "C36", "ROOM"],
+  ["shared_bath_single", 14, 82_000, "D36", "ROOM"],
+  ["shared_bath_single", 7, 59_000, "E36", "ROOM"],
+  ["shared_bath_single", 1, 13_000, "F36", "ROOM"],
+  ["shared_bath_standard", 30, 195_000, "C37", "ROOM"],
+  ["shared_bath_standard", 14, 120_000, "D37", "ROOM"],
+  ["shared_bath_standard", 7, 79_000, "E37", "ROOM"],
+  ["shared_bath_standard", 1, 18_000, "F37", "ROOM"],
+  ["private_bath_single", 30, 180_000, "C41", "ROOM"],
+  ["private_bath_single", 14, 119_000, "D41", "ROOM"],
+  ["private_bath_single", 7, 72_000, "E41", "ROOM"],
+  ["private_bath_single", 1, 17_000, "F41", "ROOM"],
+  ["private_bath_standard", 30, 258_000, "C42", "ROOM"],
+  ["private_bath_standard", 14, 168_000, "D42", "ROOM"],
+  ["private_bath_standard", 7, 102_000, "E42", "ROOM"],
+  ["private_bath_standard", 1, 24_000, "F42", "ROOM"],
+  ["private_bath_king", 30, 258_000, "C43", "ROOM"],
+  ["private_bath_king", 14, 168_000, "D43", "ROOM"],
+  ["private_bath_king", 7, 102_000, "E43", "ROOM"],
+  ["private_bath_king", 1, 24_000, "F43", "ROOM"],
+  ["private_bath_suite", 30, 320_000, "C44", "ROOM"],
+  ["private_bath_suite", 14, 188_000, "D44", "ROOM"],
+  ["private_bath_suite", 7, 128_000, "E44", "ROOM"],
+  ["private_bath_suite", 1, 32_000, "F44", "ROOM"]
+] satisfies readonly CanonicalRateTuple[];
+
+const revision561PricingProductTuples = [
+  ["shared_bath_quad_bed", "shared_bath_quad", "BED", 1, [5_800, 30_800, 48_000, 78_000], "SOURCE_PUBLISHED"],
+  ["shared_bath_double_bed", "shared_bath_double", "BED", 1, [6_800, 38_000, 55_000, 90_000], "SOURCE_PUBLISHED"],
+  ["shared_bath_single_room", "shared_bath_single", "ROOM", 1, [13_000, 59_000, 82_000, 135_000], "SOURCE_PUBLISHED"],
+  ["shared_bath_standard_room", "shared_bath_standard", "ROOM", 1, [18_000, 79_000, 120_000, 195_000], "SOURCE_PUBLISHED"],
+  ["private_bath_single_room", "private_bath_single", "ROOM", 1, [17_000, 72_000, 119_000, 180_000], "SOURCE_PUBLISHED"],
+  ["private_bath_standard_room", "private_bath_standard", "ROOM", 1, [24_000, 102_000, 168_000, 258_000], "SOURCE_PUBLISHED"],
+  ["private_bath_king_room", "private_bath_king", "ROOM", 1, [24_000, 102_000, 168_000, 258_000], "SOURCE_PUBLISHED"],
+  ["private_bath_suite_room", "private_bath_suite", "ROOM", 1, [32_000, 128_000, 188_000, 320_000], "SOURCE_PUBLISHED"],
+  ["shared_bath_double_whole_room", "shared_bath_double", "ROOM", 2, [13_600, 76_000, 110_000, 180_000], "BED_ANCHORS_TIMES_PHYSICAL_BEDS"],
+  ["shared_bath_quad_whole_room", "shared_bath_quad", "ROOM", 4, [23_200, 123_200, 192_000, 312_000], "BED_ANCHORS_TIMES_PHYSICAL_BEDS"]
+] satisfies readonly CanonicalPricingProductTuple[];
+
+const revision561RoomTupleByCode = new Map<string, CanonicalRoomTuple>(
+  revision561RoomTuples.map((tuple) => [tuple[0], tuple] as const)
+);
+const revision561RateTupleByKey = new Map<string, CanonicalRateTuple>(
+  revision561RateTuples.map((tuple) => [`${tuple[0]}:${tuple[1]}`, tuple] as const)
+);
+const revision561PricingProductTupleByCode = new Map<string, CanonicalPricingProductTuple>(
+  revision561PricingProductTuples.map((tuple) => [tuple[0], tuple] as const)
+);
+
 export interface Qintopia2026ReferenceCatalogSnapshot {
   schemaVersion: string;
   importId: string;
@@ -163,18 +301,52 @@ function isPackageNights(value: unknown): value is PackageNights {
   return value === 1 || value === 7 || value === 14 || value === 30;
 }
 
+function roomTuple(room: PhysicalRoomSnapshot): CanonicalRoomTuple {
+  return [
+    room.operationalCode,
+    room.buildingCode,
+    room.roomTypeKey,
+    room.sourceCode,
+    room.sourceLabel,
+    room.codeProvenance,
+    room.physicalBedCount,
+    room.physicalBedCodes,
+    room.saleMode
+  ];
+}
+
+function rateTuple(rate: RateSnapshot): CanonicalRateTuple {
+  return [rate.roomTypeKey, rate.nights, rate.amountMinor, rate.sourceCell, rate.saleUnit];
+}
+
+function pricingProductTuple(product: PricingProductSnapshot): CanonicalPricingProductTuple {
+  return [
+    product.productCode,
+    product.roomTypeKey,
+    product.inventoryUnitKind,
+    product.anchorMultiplier,
+    [product.anchorsMinor["1"], product.anchorsMinor["7"], product.anchorsMinor["14"], product.anchorsMinor["30"]],
+    product.derivation
+  ];
+}
+
+function tuplesMatch(actual: readonly unknown[], expected: readonly unknown[]): boolean {
+  return JSON.stringify(actual) === JSON.stringify(expected);
+}
+
 export function validateQintopia2026ReferenceCatalogSnapshot(value: unknown): Qintopia2026ReferenceCatalogSnapshot {
   assertCatalog(isRecord(value), "top-level value must be an object");
   const snapshot = value as unknown as Qintopia2026ReferenceCatalogSnapshot;
   assertCatalog(snapshot.schemaVersion === "2.0.0", "unsupported schemaVersion");
-  assertCatalog(typeof snapshot.importId === "string" && snapshot.importId.length > 0, "importId is required");
+  assertCatalog(snapshot.importId === revision561ImportId, `importId must remain ${revision561ImportId}`);
   assertCatalog(isRecord(snapshot.property), "property is required");
   assertCatalog(snapshot.property.timezone === "Asia/Shanghai", "property timezone must be Asia/Shanghai");
   assertCatalog(snapshot.property.currency === "CNY", "property currency must be CNY");
   assertCatalog(isRecord(snapshot.source), "source is required");
   assertCatalog(snapshot.source.kind === "FEISHU_SPREADSHEET", "source kind must be FEISHU_SPREADSHEET");
-  assertCatalog(Number.isInteger(snapshot.source.revision) && snapshot.source.revision > 0, "source revision must be a positive integer");
-  assertCatalog(/^\d{4}-\d{2}-\d{2}$/.test(snapshot.source.publicPriceVersionDate), "source version date must be an ISO date");
+  assertCatalog(snapshot.source.revision === revision561SourceRevision, `source revision must remain ${revision561SourceRevision}`);
+  assertCatalog(snapshot.source.publicPriceVersionLabel === "2026年对外公布秦托邦定价表（2026.2.25）", "public price version label changed from revision 561");
+  assertCatalog(snapshot.source.publicPriceVersionDate === "2026-02-25", "public price version date changed from revision 561");
   assertCatalog(snapshot.source.effectiveFrom === "2026-02-25", "public pricing must not be effective before 2026-02-25");
   assertCatalog(snapshot.source.effectiveUntil === null, "unconfirmed effective end must remain open");
   assertCatalog(Array.isArray(snapshot.source.sheets), "source sheets are required");
@@ -249,6 +421,8 @@ export function validateQintopia2026ReferenceCatalogSnapshot(value: unknown): Qi
     const category = snapshot.inventory.categories.find((item) => item.roomTypeKey === room.roomTypeKey)!;
     const expectedSaleMode = category.saleUnit === "BED" ? "BED_WITH_WHOLE_ROOM_COMBINATION" : "INDEPENDENT_ROOM";
     assertCatalog(room.saleMode === expectedSaleMode, `room ${room.operationalCode} sale mode does not match ${room.roomTypeKey}`);
+    const expectedRoomTuple = revision561RoomTupleByCode.get(room.operationalCode);
+    assertCatalog(expectedRoomTuple !== undefined && tuplesMatch(roomTuple(room), expectedRoomTuple), `canonical room ${room.operationalCode} changed from revision 561`);
     if (room.saleMode === "BED_WITH_WHOLE_ROOM_COMBINATION") combinationRooms += 1;
     roomCountsByType.set(room.roomTypeKey, (roomCountsByType.get(room.roomTypeKey) ?? 0) + 1);
     bedCountsByType.set(room.roomTypeKey, (bedCountsByType.get(room.roomTypeKey) ?? 0) + room.physicalBedCount);
@@ -311,6 +485,8 @@ export function validateQintopia2026ReferenceCatalogSnapshot(value: unknown): Qi
     const key = `${rate.roomTypeKey}:${rate.nights}`;
     assertCatalog(!rateKeys.has(key), `duplicate rate ${key}`);
     rateKeys.add(key);
+    const expectedRateTuple = revision561RateTupleByKey.get(key);
+    assertCatalog(expectedRateTuple !== undefined && tuplesMatch(rateTuple(rate), expectedRateTuple), `canonical public rate ${key} changed from revision 561`);
   }
   for (const categoryKey of categoryKeys) {
     for (const nights of [1, 7, 14, 30] as const) {
@@ -328,6 +504,9 @@ export function validateQintopia2026ReferenceCatalogSnapshot(value: unknown): Qi
     assertCatalog(category !== undefined, `pricing product ${product.productCode} references an unknown room type`);
     assertCatalog(product.inventoryUnitKind === "ROOM" || product.inventoryUnitKind === "BED", `pricing product ${product.productCode} has an invalid inventory kind`);
     assertCatalog(product.anchorMultiplier === 1 || product.anchorMultiplier === 2 || product.anchorMultiplier === 4, `pricing product ${product.productCode} has an invalid multiplier`);
+    assertCatalog(isRecord(product.anchorsMinor), `pricing product ${product.productCode} anchors are required`);
+    const expectedProductTuple = revision561PricingProductTupleByCode.get(product.productCode);
+    assertCatalog(expectedProductTuple !== undefined && tuplesMatch(pricingProductTuple(product), expectedProductTuple), `canonical pricing product ${product.productCode} changed from revision 561`);
     for (const nights of [1, 7, 14, 30] as const) {
       const baseRate = snapshot.publicRates.rates.find((rate) => rate.roomTypeKey === product.roomTypeKey && rate.nights === nights);
       assertCatalog(baseRate !== undefined, `pricing product ${product.productCode} has no ${nights}-night anchor source`);

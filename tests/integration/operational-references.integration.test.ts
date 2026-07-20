@@ -16,7 +16,7 @@ import type { Kysely } from "kysely";
 import { sha256 } from "@qintopia/domain";
 import { buildServer } from "../../apps/api/src/server.ts";
 import { createQuoteForTesting as createQuote } from "../../packages/db/src/pricing-service.ts";
-import { demo } from "../../packages/db/src/seed.ts";
+import { demo, seedDemo } from "../../packages/db/src/seed.ts";
 import { resetDatabase } from "../helpers/database.ts";
 
 const databaseUrl = process.env.OPERATIONAL_REFERENCES_INTEGRATION_DATABASE_URL
@@ -152,15 +152,12 @@ async function recreateDatabaseThrough008(url: string): Promise<Kysely<Database>
     timezone: "Asia/Shanghai",
     currency: "CNY"
   }).execute();
-  await historicalDb.insertInto("inventory_units").values({
-    id: demo.roomId,
-    property_id: demo.propertyId,
-    kind: "ROOM",
-    parent_room_id: null,
-    code: "101",
-    name: "Legacy Room 101",
-    active: true
-  }).execute();
+  await historicalDb.insertInto("inventory_units").values([
+    { id: demo.roomId, property_id: demo.propertyId, kind: "ROOM", parent_room_id: null, code: "101", name: "Room 101", active: true },
+    { id: demo.bedAId, property_id: demo.propertyId, kind: "BED", parent_room_id: demo.roomId, code: "101-A", name: "Room 101 / Bed A", active: true },
+    { id: demo.bedBId, property_id: demo.propertyId, kind: "BED", parent_room_id: demo.roomId, code: "101-B", name: "Room 101 / Bed B", active: true },
+    { id: demo.secondRoomId, property_id: demo.propertyId, kind: "ROOM", parent_room_id: null, code: "102", name: "Room 102", active: true }
+  ]).execute();
   await historicalDb.insertInto("pricing_policy_versions").values([
     {
       id: demo.transientPolicyId,
@@ -648,7 +645,7 @@ describe.sequential("booking channels and external transaction references on Pos
     expect(await db.selectFrom("collection_facts").select("fact_id").where("command_id", "=", "command_direct_fact_guard").execute()).toHaveLength(0);
   });
 
-  it("applies migrations 009 through 011 without inventing or validating historical fact values", async () => {
+  it("applies migrations 009 through 012, preserves historical facts, and upgrades the legacy demo catalog", async () => {
     let historicalDb: Kysely<Database> | undefined;
     try {
       historicalDb = await recreateDatabaseThrough008(historicalDatabaseUrl);
@@ -737,9 +734,99 @@ describe.sequential("booking channels and external transaction references on Pos
         const migration011 = await readFile(resolve(process.cwd(), "packages/db/src/migrations/011_core_fact_shape_guards.sql"), "utf8");
         await client.query(migration011);
         await client.query("INSERT INTO schema_migrations(name) VALUES ('011_core_fact_shape_guards.sql')");
+        const migration012 = await readFile(resolve(process.cwd(), "packages/db/src/migrations/012_legacy_demo_inventory_catalog_backfill.sql"), "utf8");
+        await client.query(migration012);
+        await client.query("INSERT INTO schema_migrations(name) VALUES ('012_legacy_demo_inventory_catalog_backfill.sql')");
       } finally {
         await client.end();
       }
+
+      const upgradedLegacyUnits = await historicalDb.selectFrom("inventory_units")
+        .select([
+          "id",
+          "catalog_version",
+          "building_code",
+          "room_type_code",
+          "pricing_product_code",
+          "inventory_basis",
+          "code_provenance",
+          "physical_bed_count"
+        ])
+        .where("id", "in", [demo.roomId, demo.secondRoomId, demo.bedAId, demo.bedBId])
+        .orderBy("id")
+        .execute();
+      expect(upgradedLegacyUnits).toEqual([
+        {
+          id: demo.roomId,
+          catalog_version: "qintopia-2026-feishu-revision-561-user-confirmed-v3",
+          building_code: "1",
+          room_type_code: "shared_bath_quad",
+          pricing_product_code: "shared_bath_quad_whole_room",
+          inventory_basis: "WHOLE_ROOM_COMBINATION",
+          code_provenance: "SOURCE_EXPLICIT",
+          physical_bed_count: 4
+        },
+        {
+          id: demo.bedAId,
+          catalog_version: "qintopia-2026-feishu-revision-561-user-confirmed-v3",
+          building_code: "1",
+          room_type_code: "shared_bath_quad",
+          pricing_product_code: "shared_bath_quad_bed",
+          inventory_basis: "INDEPENDENT",
+          code_provenance: "SOURCE_EXPLICIT",
+          physical_bed_count: null
+        },
+        {
+          id: demo.bedBId,
+          catalog_version: "qintopia-2026-feishu-revision-561-user-confirmed-v3",
+          building_code: "1",
+          room_type_code: "shared_bath_quad",
+          pricing_product_code: "shared_bath_quad_bed",
+          inventory_basis: "INDEPENDENT",
+          code_provenance: "SOURCE_EXPLICIT",
+          physical_bed_count: null
+        },
+        {
+          id: demo.secondRoomId,
+          catalog_version: "qintopia-2026-feishu-revision-561-user-confirmed-v3",
+          building_code: "1",
+          room_type_code: "shared_bath_quad",
+          pricing_product_code: "shared_bath_quad_whole_room",
+          inventory_basis: "WHOLE_ROOM_COMBINATION",
+          code_provenance: "SOURCE_EXPLICIT",
+          physical_bed_count: 4
+        }
+      ]);
+
+      await seedDemo(historicalDb, { includeProtocolFixturePolicy: true });
+      const [rooms, beds, baseUnits, combinations, physicalBeds] = await Promise.all([
+        historicalDb.selectFrom("inventory_units").select(({ fn }) => fn.countAll<number>().as("count")).where("property_id", "=", demo.propertyId).where("kind", "=", "ROOM").executeTakeFirstOrThrow(),
+        historicalDb.selectFrom("inventory_units").select(({ fn }) => fn.countAll<number>().as("count")).where("property_id", "=", demo.propertyId).where("kind", "=", "BED").executeTakeFirstOrThrow(),
+        historicalDb.selectFrom("inventory_units").select(({ fn }) => fn.countAll<number>().as("count")).where("property_id", "=", demo.propertyId).where("inventory_basis", "=", "INDEPENDENT").executeTakeFirstOrThrow(),
+        historicalDb.selectFrom("inventory_units").select(({ fn }) => fn.countAll<number>().as("count")).where("property_id", "=", demo.propertyId).where("inventory_basis", "=", "WHOLE_ROOM_COMBINATION").executeTakeFirstOrThrow(),
+        historicalDb.selectFrom("inventory_units").select(({ fn }) => fn.sum<number>("physical_bed_count").as("count")).where("property_id", "=", demo.propertyId).where("kind", "=", "ROOM").executeTakeFirstOrThrow()
+      ]);
+      expect([
+        Number(rooms.count),
+        Number(beds.count),
+        Number(baseUnits.count),
+        Number(combinations.count),
+        Number(physicalBeds.count)
+      ]).toEqual([44, 46, 77, 13, 91]);
+
+      const upgradedBedQuotes = await Promise.all([demo.bedAId, demo.bedBId].map((inventoryUnitId) => createQuote(historicalDb!, {
+        propertyId: demo.propertyId,
+        inventoryUnitId,
+        stayType: "TRANSIENT",
+        arrivalDate: "2026-02-25",
+        departureDate: "2026-02-26",
+        pricingPolicyVersionId: demo.publicPricingPolicyId
+      })));
+      expect(upgradedBedQuotes.map((quote) => quote.currentContractAmount.minorUnits)).toEqual([5_800, 5_800]);
+      await expect(historicalDb.updateTable("inventory_units")
+        .set({ physical_bed_count: 2 })
+        .where("id", "=", demo.roomId)
+        .execute()).rejects.toMatchObject({ code: "55000" });
 
       const view = await getOrderView(historicalDb, "order_historical_nulls");
       expect(view.order.booking_channel_code).toBeNull();

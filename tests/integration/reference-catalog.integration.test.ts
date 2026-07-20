@@ -349,45 +349,34 @@ describe.sequential("2026 reference catalog import", () => {
 
   it("rejects sealed batches whose snapshot hash or persisted projection is inconsistent", async () => {
     const source = await loadBundledQintopia2026Catalog();
-    const wrongHashSnapshot = structuredClone(source);
-    wrongHashSnapshot.importId = "catalog_wrong_hash_fixture";
-    const incompleteSnapshot = structuredClone(source);
-    incompleteSnapshot.importId = "catalog_incomplete_projection_fixture";
     const sourceToken = "KsxGwst1wiOTTfkaO9OcfFognog";
-
-    try {
-      await db.insertInto("catalog_import_batches").values([
-        {
-          id: wrongHashSnapshot.importId,
-          property_id: demo.propertyId,
-          source_document_token: sourceToken,
-          source_revision: wrongHashSnapshot.source.revision,
-          source_version_date: wrongHashSnapshot.source.publicPriceVersionDate,
-          source_snapshot: JSON.stringify(wrongHashSnapshot),
-          content_hash: "0".repeat(64),
-          execution_state: "REFERENCE_ONLY",
-          sealed_at: null
-        },
-        {
-          id: incompleteSnapshot.importId,
-          property_id: demo.propertyId,
-          source_document_token: sourceToken,
-          source_revision: incompleteSnapshot.source.revision,
-          source_version_date: incompleteSnapshot.source.publicPriceVersionDate,
-          source_snapshot: JSON.stringify(incompleteSnapshot),
-          content_hash: stableHash(incompleteSnapshot),
-          execution_state: "REFERENCE_ONLY",
-          sealed_at: null
-        }
-      ]).execute();
+    const insertSealedBatch = async (contentHash: string) => {
+      await db.insertInto("catalog_import_batches").values({
+        id: source.importId,
+        property_id: demo.propertyId,
+        source_document_token: sourceToken,
+        source_revision: source.source.revision,
+        source_version_date: source.source.publicPriceVersionDate,
+        source_snapshot: JSON.stringify(source),
+        content_hash: contentHash,
+        execution_state: "REFERENCE_ONLY",
+        sealed_at: null
+      }).execute();
       await db.updateTable("catalog_import_batches")
         .set({ sealed_at: sql<Date>`CURRENT_TIMESTAMP` })
-        .where("id", "in", [wrongHashSnapshot.importId, incompleteSnapshot.importId])
+        .where("id", "=", source.importId)
         .execute();
+    };
 
-      await expect(loadReferenceCatalog(db, demo.propertyId, wrongHashSnapshot.importId))
+    try {
+      await resetSuiteDatabase();
+      await insertSealedBatch("0".repeat(64));
+      await expect(loadReferenceCatalog(db, demo.propertyId, source.importId))
         .rejects.toThrow(/content hash does not match/);
-      await expect(loadReferenceCatalog(db, demo.propertyId, incompleteSnapshot.importId))
+
+      await resetSuiteDatabase();
+      await insertSealedBatch(stableHash(source));
+      await expect(loadReferenceCatalog(db, demo.propertyId, source.importId))
         .rejects.toThrow(/sealed inventory rows do not match/);
     } finally {
       await resetSuiteDatabase();
