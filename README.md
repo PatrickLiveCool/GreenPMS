@@ -78,6 +78,8 @@ Confirm locks and revalidates authorization, aggregate versions, inventory day s
 
 `CREATE_ORDER` requires one stable `bookingChannelCode`: `YOUMUDAO`, `CTRIP`, `MEITUAN`, or `WECOM`. `channelOrderReference` is optional, but must be `null` for `WECOM`. Every new `COLLECTION` and `REFUND` fact requires its own staff-entered `transactionReference`; a refund also retains its reference to the original collection Fact. This value is only the manually recorded external transaction reference. It does not prove external receipt, settlement, reconciliation, or write-off, and it is not replaced by a Fact, Receipt, Command, correlation, or idempotency identifier. Historical rows may return `null` when the value was not recorded.
 
+Every new normal or free-stay order also requires a trimmed, nonblank `primaryGuest.nickname` of at most 200 characters. It is stored with the immutable primary-guest snapshot and returned through Preview, Receipt, order queries, amendments, and room status. Historical snapshots may return a missing or `null` nickname; the Web derives the “历史未记录” compatibility label without persisting a fabricated value.
+
 After a network interruption query either:
 
 ```text

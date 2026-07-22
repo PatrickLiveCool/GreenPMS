@@ -51,6 +51,10 @@ context:
 
 **会员身份：** 会员档案手工保存姓名、唯一身份证号业务键、手机号和微信号；内部关系使用不可变 `memberId`。余额必须由该会员 Lot/Ledger 服务端计算，支持身份证号查找，不把余额当作可覆盖档案字段。
 
+**居住人昵称与身份边界：** 每个新建订单的不可变主要居住人快照必须保存去除首尾空白后仍非空的昵称；昵称属于该订单成交时的居住人事实，不从会员档案动态读取，也不随会员资料变化而改写历史订单。历史主要居住人快照可能缺少 `nickname` JSON 键，也可能显式保存 `null`；Query/API 必须忠实保留原始缺键或 `null` 形态，不伪造业务值，也不把两者强制归一化成新事实。Web 可对这两种情况派生显示“历史未记录”，但不得持久化该提示或其他虚构昵称。会员只表示权益/结算方式差异，不拥有或替代居住人身份；非会员与会员订单使用同一主要居住人快照规则。
+
+**多人间父房聚合：** 拆床销售房间的逐日父格使用 `已占床位数/实体床位总数`，例如四人间三个子床具有有效住宿事实时显示 `3/4`。分子只统计当天由有效正常 `Order` 或 `FREE_STAY` 住宿事实占用的不同子床；维修/锁房、`INTERNAL_USE`、清洁和其他非居住人来源不进入该住客占用比例。空间允许时父格优先显示居住人快照昵称；紧凑格至少保留比例，并在鼠标悬停及键盘聚焦时提供全部有权查看的昵称列表。该聚合是服务端事实投影，不改变整房与子床的双向互斥规则。
+
 **飞书申请引用：** 飞书 Base 原生 `record_id` 只标识一次入住申请，不是会员 ID；同一自然人可有多个申请。PMS 以 `provider + source container + table + external_record_id` 唯一保存 append-only 外部引用并关联 `memberId`。身份证号已存在时复用既有会员并追加申请引用，不覆盖档案；Base 回写 `memberId` 只是可选投影，失败不影响 PMS。Base 不得发放、冻结或核销权益，现有 webhook 认证值不得进入代码、日志或文档，必须作为独立受控密钥轮换。
 
 ## Code Map
@@ -78,6 +82,12 @@ context:
 - Given 新 COLLECTION 或 REFUND，when Preview/Confirm，then 必须保存该事实自身的非空 `transactionReference`；退款仍引用原 COLLECTION，REVERSAL 保持无交易号语义。
 - Given 缺失/非法字段或幂等重放，when 命令执行，then 缺失值零业务写入，同键同载荷返回原 Receipt 且不重复产生 Order/Fact。
 - Given Web/API 查询，when 查看 Preview、Receipt 与订单详情，then 渠道和每笔交易号均可追溯，且不被解释为外部已到账、已结清或已核销。
+
+**Confirmed guest nickname and room-status acceptance:**
+- Given 新建正常或免费住宿订单，when Preview/Confirm，then 主要居住人快照必须包含非空昵称，Receipt/Query 返回最终持久昵称；会员选择与否不改变该校验。
+- Given 历史订单的主要居住人快照缺少 `nickname` 键或显式保存 `null`，when Query/API/Web 展示，then API 忠实保留对应的缺键或 `null` 形态，Web 只派生显示“历史未记录”，且不会产生回填写入。
+- Given 多人间的不同子床在同一天由正常订单或免费住宿占用，when 查询/展示父房格，then 显示 `已占/总床数` 并优先显示昵称；空间不足时至少显示比例，悬停和键盘聚焦可查看全部有权昵称。
+- Given 同一多人间存在维修、内部占用或清洁来源，when 计算住客占用比例，then 这些来源不增加分子，但仍按各自 typed source 和既有冲突规则呈现。
 
 **Acceptance Criteria:**
 - Given 空目录与 README，when 安装并启动，then PostgreSQL 迁移/种子、演示账号、health/readiness、Web 和 OpenAPI 可用。

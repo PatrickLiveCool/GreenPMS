@@ -62,7 +62,7 @@ async function createMemberOrder(prefix: string, arrivalDate: string, departureD
     input: {
       propertyId: demo.propertyId,
       quoteId: quote.quoteId,
-      primaryGuest: { fullName: `Member lifecycle ${prefix}` },
+      primaryGuest: { fullName: `Member lifecycle ${prefix}`, nickname: `Member ${prefix}` },
       bookingChannelCode: "WECOM",
       channelOrderReference: null
     }

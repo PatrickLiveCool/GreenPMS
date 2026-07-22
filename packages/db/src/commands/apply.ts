@@ -355,6 +355,9 @@ export async function applyCommand(trx: Transaction<Database>, options: {
     const segmentId = newId("segment");
     const pricing = pricingSnapshot(effect);
     const inventoryUnit = nestedObject(effect, "inventoryUnit");
+    const primaryGuest = nestedObject(effect, "primaryGuest");
+    requireString(primaryGuest, "fullName");
+    requireString(primaryGuest, "nickname");
     const unitId = requireString(inventoryUnit, "id");
     const arrivalDate = requireString(effect, "arrivalDate");
     const departureDate = requireString(effect, "departureDate");
@@ -368,7 +371,7 @@ export async function applyCommand(trx: Transaction<Database>, options: {
     const freeStayReason = stayType === "FREE" ? requireString(effect, "freeStayReason") : null;
     await trx.insertInto("orders").values({
       id: orderId, property_id: propertyId, status: "RESERVED", stay_type: stayType,
-      arrival_date: arrivalDate, departure_date: departureDate, primary_guest_snapshot: nestedObject(effect, "primaryGuest"),
+      arrival_date: arrivalDate, departure_date: departureDate, primary_guest_snapshot: primaryGuest,
       booking_channel_code: bookingChannelCode, channel_order_reference: channelOrderReference, free_stay_reason: freeStayReason,
       pricing_policy_version_id: policyVersionId, member_contract_id: memberContractId, current_revision_id: null, version: 1
     }).execute();
@@ -376,7 +379,7 @@ export async function applyCommand(trx: Transaction<Database>, options: {
     await trx.insertInto("amendments").values({
       id: amendmentId, order_id: orderId, sequence: 1, amendment_type: "CREATE_ORDER",
       reason_code: options.reason.code, reason_note: options.reason.note, prior_version: 0, new_version: 1,
-      payload: { quoteId: effect.quoteId, inventoryUnitId: unitId, arrivalDate, departureDate, bookingChannelCode, channelOrderReference, freeStayReason },
+      payload: { quoteId: effect.quoteId, inventoryUnitId: unitId, arrivalDate, departureDate, primaryGuest, bookingChannelCode, channelOrderReference, freeStayReason },
       command_id: options.commandId
     }).execute();
     await trx.insertInto("stay_segments").values({
@@ -394,7 +397,7 @@ export async function applyCommand(trx: Transaction<Database>, options: {
       await bumpMembershipForCoverage(trx, memberContractId, pricing.coverageSet);
     }
     return {
-      persistedResult: { orderId, stayId, segmentId, pricingRevisionId: revisionId, bookingChannelCode, channelOrderReference, freeStayReason },
+      persistedResult: { orderId, stayId, segmentId, pricingRevisionId: revisionId, primaryGuest, bookingChannelCode, channelOrderReference, freeStayReason },
       resourceRefs: [orderId, stayId, segmentId, revisionId, ...coverageRefs.coverageIds],
       factRefs: coverageRefs.factIds
     };

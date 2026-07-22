@@ -12,7 +12,7 @@ import {
   type ConfirmRequest,
   type Database
 } from "@qintopia/db";
-import type { Kysely } from "kysely";
+import { sql, type Kysely } from "kysely";
 import { sha256 } from "@qintopia/domain";
 import { buildServer } from "../../apps/api/src/server.ts";
 import { createQuoteForTesting as createQuote } from "../../packages/db/src/pricing-service.ts";
@@ -72,7 +72,7 @@ async function createChannelOrder(options: {
     input: {
       propertyId: demo.propertyId,
       quoteId: quote.quoteId,
-      primaryGuest: { fullName: `Channel Guest ${options.code}` },
+      primaryGuest: { fullName: `Channel Guest ${options.code}`, nickname: `Channel ${options.code}` },
       bookingChannelCode: options.code,
       channelOrderReference: options.channelOrderReference,
       freeStayReason: `Channel contract fixture: ${options.code}`
@@ -293,7 +293,7 @@ describe.sequential("booking channels and external transaction references on Pos
         input: {
           propertyId: demo.propertyId,
           quoteId: quote.quoteId,
-          primaryGuest: { fullName: "Rejected channel command" },
+          primaryGuest: { fullName: "Rejected channel command", nickname: "Rejected Channel" },
           freeStayReason: "Invalid channel rejection fixture",
           ...fields
         }
@@ -397,14 +397,19 @@ describe.sequential("booking channels and external transaction references on Pos
   });
 
   it("enforces the new-write rules for direct database inserts and keeps order channel identity immutable", async () => {
-    const directOrder = (id: string, bookingChannelCode: BookingChannelCode | null, channelOrderReference: string | null) => db.insertInto("orders").values({
+    const directOrder = (
+      id: string,
+      bookingChannelCode: BookingChannelCode | null,
+      channelOrderReference: string | null,
+      primaryGuestSnapshot: unknown = { fullName: "Direct database guard probe", nickname: "Direct Guard" }
+    ) => db.insertInto("orders").values({
       id,
       property_id: demo.propertyId,
       status: "RESERVED",
       stay_type: "FREE",
       arrival_date: "2029-01-01",
       departure_date: "2029-01-02",
-      primary_guest_snapshot: { fullName: "Direct database guard probe" },
+      primary_guest_snapshot: primaryGuestSnapshot,
       booking_channel_code: bookingChannelCode,
       channel_order_reference: channelOrderReference,
       free_stay_reason: "Direct database guard fixture",
@@ -419,6 +424,57 @@ describe.sequential("booking channels and external transaction references on Pos
     await directOrder("order_direct_blank_reference", "CTRIP", " \t\n ");
     expect(await db.selectFrom("orders").select("channel_order_reference").where("id", "=", "order_direct_blank_reference").executeTakeFirstOrThrow()).toEqual({ channel_order_reference: null });
     await db.deleteFrom("orders").where("id", "=", "order_direct_blank_reference").execute();
+
+    const orderCountBeforeNicknameRejections = await db.selectFrom("orders")
+      .select(({ fn }) => fn.countAll<number>().as("count"))
+      .executeTakeFirstOrThrow();
+    await expect(directOrder(
+      "order_direct_missing_nickname",
+      "CTRIP",
+      null,
+      { fullName: "Direct missing nickname probe" }
+    )).rejects.toMatchObject({ constraint: "orders_new_primary_guest_nickname_required" });
+    await expect(directOrder(
+      "order_direct_null_nickname",
+      "CTRIP",
+      null,
+      { fullName: "Direct null nickname probe", nickname: null }
+    )).rejects.toMatchObject({ constraint: "orders_new_primary_guest_nickname_required" });
+    await expect(directOrder(
+      "order_direct_blank_nickname",
+      "CTRIP",
+      null,
+      { fullName: "Direct blank nickname probe", nickname: " \t\n " }
+    )).rejects.toMatchObject({ constraint: "orders_new_primary_guest_nickname_required" });
+    await expect(directOrder(
+      "order_direct_oversized_nickname",
+      "CTRIP",
+      null,
+      { fullName: "Direct oversized nickname probe", nickname: "N".repeat(201) }
+    )).rejects.toMatchObject({ constraint: "orders_new_primary_guest_nickname_length" });
+    await expect(directOrder(
+      "order_direct_non_object_guest_snapshot",
+      "CTRIP",
+      null,
+      sql<unknown>`'[]'::jsonb`
+    )).rejects.toMatchObject({ constraint: "orders_new_primary_guest_snapshot_object" });
+    const orderCountAfterNicknameRejections = await db.selectFrom("orders")
+      .select(({ fn }) => fn.countAll<number>().as("count"))
+      .executeTakeFirstOrThrow();
+    expect(Number(orderCountAfterNicknameRejections.count)).toBe(Number(orderCountBeforeNicknameRejections.count));
+    await directOrder(
+      "order_direct_padded_nickname",
+      "CTRIP",
+      null,
+      { fullName: "Direct padded nickname probe", nickname: " \t Direct Guard \n " }
+    );
+    expect(await db.selectFrom("orders")
+      .select("primary_guest_snapshot")
+      .where("id", "=", "order_direct_padded_nickname")
+      .executeTakeFirstOrThrow()).toEqual({
+      primary_guest_snapshot: { fullName: "Direct padded nickname probe", nickname: "Direct Guard" }
+    });
+    await db.deleteFrom("orders").where("id", "=", "order_direct_padded_nickname").execute();
 
     const created = await createChannelOrder({ code: "CTRIP", channelOrderReference: "TEST-IMMUTABLE-CHANNEL", day: 12, prefix: "immutable-channel" });
     const orderId = created.receipt.result!.orderId as string;
@@ -645,7 +701,7 @@ describe.sequential("booking channels and external transaction references on Pos
     expect(await db.selectFrom("collection_facts").select("fact_id").where("command_id", "=", "command_direct_fact_guard").execute()).toHaveLength(0);
   });
 
-  it("applies migrations 009 through 013, preserves historical facts, and upgrades the legacy demo catalog", async () => {
+  it("applies migrations 009 through 014, preserves historical facts, and upgrades the legacy demo catalog", async () => {
     let historicalDb: Kysely<Database> | undefined;
     try {
       historicalDb = await recreateDatabaseThrough008(historicalDatabaseUrl);
@@ -665,6 +721,17 @@ describe.sequential("booking channels and external transaction references on Pos
           UPDATE orders SET current_revision_id = 'revision_historical_nulls' WHERE id = 'order_historical_nulls';
           INSERT INTO collection_facts(fact_id, order_id, fact_type, amount_minor, net_effect_minor, currency, references_fact_id, reverses_fact_id, method, note, command_id)
           VALUES ('fact_historical_nulls', 'order_historical_nulls', 'COLLECTION', 100, 90, 'USD', NULL, NULL, 'CASH', 'Recorded before transaction reference and shape guards', 'command_historical_nulls');
+
+          INSERT INTO orders(id, property_id, status, stay_type, arrival_date, departure_date, primary_guest_snapshot, pricing_policy_version_id, member_contract_id, current_revision_id, version)
+          VALUES ('order_historical_explicit_null', '${demo.propertyId}', 'RESERVED', 'FREE', '2029-02-03', '2029-02-04', '{"fullName":"Historical Explicit Null Guest","nickname":null}'::jsonb, '${demo.freePolicyId}', NULL, NULL, 1);
+          INSERT INTO stays(id, order_id, status) VALUES ('stay_historical_explicit_null', 'order_historical_explicit_null', 'PLANNED');
+          INSERT INTO amendments(id, order_id, sequence, amendment_type, reason_code, reason_note, prior_version, new_version, payload)
+          VALUES ('amend_historical_explicit_null', 'order_historical_explicit_null', 1, 'CREATE_ORDER', 'HISTORICAL', 'Created with an explicit null nickname', 0, 1, '{"quoteId":"quote_historical_explicit_null","inventoryUnitId":"${demo.secondRoomId}","arrivalDate":"2029-02-03","departureDate":"2029-02-04"}'::jsonb);
+          INSERT INTO stay_segments(id, stay_id, sequence, inventory_unit_id, arrival_date, departure_date, segment_type, supersedes_segment_id, amendment_id)
+          VALUES ('segment_historical_explicit_null', 'stay_historical_explicit_null', 1, '${demo.secondRoomId}', '2029-02-03', '2029-02-04', 'INITIAL', NULL, 'amend_historical_explicit_null');
+          INSERT INTO pricing_revisions(id, order_id, revision_no, amendment_id, policy_version_id, arrival_date, departure_date, coverage_set, cash_lines, manual_adjustment_minor, current_contract_amount_minor, currency)
+          VALUES ('revision_historical_explicit_null', 'order_historical_explicit_null', 1, 'amend_historical_explicit_null', '${demo.freePolicyId}', '2029-02-03', '2029-02-04', '[]'::jsonb, '[]'::jsonb, 0, 0, 'CNY');
+          UPDATE orders SET current_revision_id = 'revision_historical_explicit_null' WHERE id = 'order_historical_explicit_null';
         `);
         const migration009 = await readFile(resolve(process.cwd(), "packages/db/src/migrations/009_booking_channels_and_transaction_references.sql"), "utf8");
         await client.query(migration009);
@@ -698,6 +765,13 @@ describe.sequential("booking channels and external transaction references on Pos
             repeat('d', 64), '{}'::jsonb, '2035-01-01T00:00:00Z', 'OPEN'
           );
 
+          INSERT INTO command_previews(id, subject_id, property_id, command_type, normalized_input, input_hash, effect, effect_hash, basis_versions, expires_at, status)
+          SELECT
+            'preview_historical_create_explicit_null', subject_id, property_id, command_type, normalized_input, repeat('7', 64),
+            jsonb_set(effect, '{primaryGuest,nickname}', 'null'::jsonb, true), repeat('8', 64), basis_versions, expires_at, status
+          FROM command_previews
+          WHERE id = 'preview_historical_create';
+
           INSERT INTO command_executions(id, subject_id, credential_id, property_id, command_type, idempotency_key, request_hash, correlation_id, state, completed_at)
           VALUES
             ('command_historical_create_receipt', '${demo.agentSubjectId}', 'token_demo_write', '${demo.propertyId}', 'CREATE_ORDER', 'historical-create-receipt', repeat('e', 64), 'historical-create-receipt', 'APPLIED', now()),
@@ -705,6 +779,7 @@ describe.sequential("booking channels and external transaction references on Pos
             ('command_historical_refund_receipt', '${demo.agentSubjectId}', 'token_demo_write', '${demo.propertyId}', 'RECORD_REFUND', 'historical-refund-receipt', repeat('1', 64), 'historical-refund-receipt', 'APPLIED', now()),
             ('command_historical_reversal_receipt', '${demo.agentSubjectId}', 'token_demo_write', '${demo.propertyId}', 'REVERSE_FACT', 'historical-reversal-receipt', repeat('2', 64), 'historical-reversal-receipt', 'APPLIED', now()),
             ('command_historical_preview_create_receipt', '${demo.agentSubjectId}', 'token_demo_write', '${demo.propertyId}', 'PREVIEW:CREATE_ORDER', 'historical-preview-create-receipt', repeat('3', 64), 'historical-preview-create-receipt', 'APPLIED', now()),
+            ('command_historical_preview_create_explicit_null_receipt', '${demo.agentSubjectId}', 'token_demo_write', '${demo.propertyId}', 'PREVIEW:CREATE_ORDER', 'historical-preview-create-explicit-null-receipt', repeat('7', 64), 'historical-preview-create-explicit-null-receipt', 'APPLIED', now()),
             ('command_historical_preview_collection_receipt', '${demo.agentSubjectId}', 'token_demo_write', '${demo.propertyId}', 'PREVIEW:RECORD_COLLECTION', 'historical-preview-collection-receipt', repeat('4', 64), 'historical-preview-collection-receipt', 'APPLIED', now());
 
           INSERT INTO command_receipts(id, command_id, execution_status, business_committed, result, error, resource_refs, fact_refs, committed_at)
@@ -726,6 +801,13 @@ describe.sequential("booking channels and external transaction references on Pos
                 'previewId', 'preview_historical_collection', 'commandType', 'RECORD_COLLECTION', 'effectHash', repeat('d', 64),
                 'effect', (SELECT effect FROM command_previews WHERE id = 'preview_historical_collection'), 'expiresAt', '2035-01-01T00:00:00.000Z'
               )), NULL, '["preview_historical_collection"]'::jsonb, '[]'::jsonb, now()
+            ),
+            (
+              'receipt_historical_preview_create_explicit_null', 'command_historical_preview_create_explicit_null_receipt', 'EXECUTED', true,
+              jsonb_build_object('preview', jsonb_build_object(
+                'previewId', 'preview_historical_create_explicit_null', 'commandType', 'CREATE_ORDER', 'effectHash', repeat('8', 64),
+                'effect', (SELECT effect FROM command_previews WHERE id = 'preview_historical_create_explicit_null'), 'expiresAt', '2035-01-01T00:00:00.000Z'
+              )), NULL, '["preview_historical_create_explicit_null"]'::jsonb, '[]'::jsonb, now()
             );
         `);
         const migration010 = await readFile(resolve(process.cwd(), "packages/db/src/migrations/010_qintopia_2026_catalog_pricing_and_free_stays.sql"), "utf8");
@@ -740,9 +822,51 @@ describe.sequential("booking channels and external transaction references on Pos
         const migration013 = await readFile(resolve(process.cwd(), "packages/db/src/migrations/013_room_status_operations.sql"), "utf8");
         await client.query(migration013);
         await client.query("INSERT INTO schema_migrations(name) VALUES ('013_room_status_operations.sql')");
+        const migration014 = await readFile(resolve(process.cwd(), "packages/db/src/migrations/014_new_order_primary_guest_nickname.sql"), "utf8");
+        await client.query(migration014);
+        await client.query("INSERT INTO schema_migrations(name) VALUES ('014_new_order_primary_guest_nickname.sql')");
       } finally {
         await client.end();
       }
+
+      const historicalNicknameSnapshots = await historicalDb.selectFrom("orders")
+        .select(["id", "primary_guest_snapshot"])
+        .where("id", "in", ["order_historical_nulls", "order_historical_explicit_null"])
+        .orderBy("id")
+        .execute();
+      expect(historicalNicknameSnapshots).toEqual([
+        {
+          id: "order_historical_explicit_null",
+          primary_guest_snapshot: { fullName: "Historical Explicit Null Guest", nickname: null }
+        },
+        {
+          id: "order_historical_nulls",
+          primary_guest_snapshot: { fullName: "Historical Null Guest" }
+        }
+      ]);
+      const historicalOrderCountBeforeRejectedInsert = await historicalDb.selectFrom("orders")
+        .select(({ fn }) => fn.countAll<number>().as("count"))
+        .executeTakeFirstOrThrow();
+      await expect(historicalDb.insertInto("orders").values({
+        id: "order_post_migration_missing_nickname",
+        property_id: demo.propertyId,
+        status: "RESERVED",
+        stay_type: "FREE",
+        arrival_date: "2029-02-05",
+        departure_date: "2029-02-06",
+        primary_guest_snapshot: { fullName: "Post-migration missing nickname probe" },
+        booking_channel_code: "CTRIP",
+        channel_order_reference: null,
+        free_stay_reason: "Post-migration nickname guard fixture",
+        pricing_policy_version_id: demo.freePolicyId,
+        member_contract_id: null,
+        current_revision_id: null,
+        version: 1
+      }).execute()).rejects.toMatchObject({ constraint: "orders_new_primary_guest_nickname_required" });
+      const historicalOrderCountAfterRejectedInsert = await historicalDb.selectFrom("orders")
+        .select(({ fn }) => fn.countAll<number>().as("count"))
+        .executeTakeFirstOrThrow();
+      expect(Number(historicalOrderCountAfterRejectedInsert.count)).toBe(Number(historicalOrderCountBeforeRejectedInsert.count));
 
       const upgradedLegacyUnits = await historicalDb.selectFrom("inventory_units")
         .select([
@@ -834,6 +958,7 @@ describe.sequential("booking channels and external transaction references on Pos
       const view = await getOrderView(historicalDb, "order_historical_nulls");
       expect(view.order.booking_channel_code).toBeNull();
       expect(view.order.channel_order_reference).toBeNull();
+      expect(view.order.primary_guest_snapshot).toEqual({ fullName: "Historical Null Guest" });
       expect(view.collectionFacts[0]).toMatchObject({
         amount_minor: 100,
         net_effect_minor: 90,
@@ -855,6 +980,7 @@ describe.sequential("booking channels and external transaction references on Pos
           order: { booking_channel_code: null, channel_order_reference: null },
           collectionFacts: [{ transaction_reference: null }]
         });
+        expect(Object.hasOwn(detail.json().order.primary_guest_snapshot, "nickname")).toBe(false);
         const fact = await app.inject({
           method: "GET",
           url: "/api/v1/facts/fact_historical_nulls",
@@ -869,7 +995,13 @@ describe.sequential("booking channels and external transaction references on Pos
           headers: { authorization: `Bearer ${demo.writeToken}` }
         });
         expect(historicalCreatePreview.statusCode, historicalCreatePreview.body).toBe(200);
-        expect(historicalCreatePreview.json().effect).toMatchObject({ bookingChannelCode: null, channelOrderReference: null });
+        const historicalCreateEffect = historicalCreatePreview.json().effect;
+        expect(historicalCreateEffect).toMatchObject({
+          primaryGuest: { fullName: "Historical Preview Guest" },
+          bookingChannelCode: null,
+          channelOrderReference: null
+        });
+        expect(Object.hasOwn(historicalCreateEffect.primaryGuest, "nickname")).toBe(false);
         const historicalCollectionPreview = await app.inject({
           method: "GET",
           url: "/api/v1/command-previews/preview_historical_collection",
@@ -883,7 +1015,39 @@ describe.sequential("booking channels and external transaction references on Pos
           headers: { authorization: `Bearer ${demo.writeToken}` }
         });
         expect(historicalCreatePreviewReceipt.statusCode, historicalCreatePreviewReceipt.body).toBe(200);
-        expect(historicalCreatePreviewReceipt.json().result.preview.effect).toMatchObject({ bookingChannelCode: null, channelOrderReference: null });
+        const historicalReceiptEffect = historicalCreatePreviewReceipt.json().result.preview.effect;
+        expect(historicalReceiptEffect).toMatchObject({
+          primaryGuest: { fullName: "Historical Preview Guest" },
+          bookingChannelCode: null,
+          channelOrderReference: null
+        });
+        expect(Object.hasOwn(historicalReceiptEffect.primaryGuest, "nickname")).toBe(false);
+
+        const explicitNullDetail = await app.inject({
+          method: "GET",
+          url: "/api/v1/orders/order_historical_explicit_null",
+          headers: { authorization: `Bearer ${demo.writeToken}` }
+        });
+        expect(explicitNullDetail.statusCode, explicitNullDetail.body).toBe(200);
+        expect(Object.hasOwn(explicitNullDetail.json().order.primary_guest_snapshot, "nickname")).toBe(true);
+        expect(explicitNullDetail.json().order.primary_guest_snapshot.nickname).toBeNull();
+        const explicitNullPreview = await app.inject({
+          method: "GET",
+          url: "/api/v1/command-previews/preview_historical_create_explicit_null",
+          headers: { authorization: `Bearer ${demo.writeToken}` }
+        });
+        expect(explicitNullPreview.statusCode, explicitNullPreview.body).toBe(200);
+        expect(Object.hasOwn(explicitNullPreview.json().effect.primaryGuest, "nickname")).toBe(true);
+        expect(explicitNullPreview.json().effect.primaryGuest.nickname).toBeNull();
+        const explicitNullPreviewReceipt = await app.inject({
+          method: "GET",
+          url: "/api/v1/receipts/receipt_historical_preview_create_explicit_null",
+          headers: { authorization: `Bearer ${demo.writeToken}` }
+        });
+        expect(explicitNullPreviewReceipt.statusCode, explicitNullPreviewReceipt.body).toBe(200);
+        expect(Object.hasOwn(explicitNullPreviewReceipt.json().result.preview.effect.primaryGuest, "nickname")).toBe(true);
+        expect(explicitNullPreviewReceipt.json().result.preview.effect.primaryGuest.nickname).toBeNull();
+
         const historicalCollectionPreviewReceipt = await app.inject({
           method: "GET",
           url: "/api/v1/receipts/receipt_historical_preview_collection",
@@ -893,7 +1057,7 @@ describe.sequential("booking channels and external transaction references on Pos
         expect(historicalCollectionPreviewReceipt.json().result.preview.effect).toMatchObject({ transactionReference: null });
 
         for (const [receiptId, expected] of [
-          ["receipt_historical_create", { bookingChannelCode: null, channelOrderReference: null }],
+          ["receipt_historical_create", { primaryGuest: null, bookingChannelCode: null, channelOrderReference: null }],
           ["receipt_historical_collection", { factType: "COLLECTION", transactionReference: null }],
           ["receipt_historical_refund", { factType: "REFUND", transactionReference: null }],
           ["receipt_historical_reversal", { factType: "REVERSAL", transactionReference: null }]
@@ -952,5 +1116,5 @@ describe.sequential("booking channels and external transaction references on Pos
       if (historicalDb) await historicalDb.destroy();
       await dropDatabase(historicalDatabaseUrl);
     }
-  }, 60_000);
+  }, 120_000);
 });

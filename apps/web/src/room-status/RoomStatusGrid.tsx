@@ -1,4 +1,5 @@
 import {
+  useCallback,
   useEffect,
   useMemo,
   useRef,
@@ -18,6 +19,7 @@ import {
   SearchX
 } from "lucide-react";
 import type {
+  RoomStatusBedOccupancyDto,
   RoomStatusBoardDto,
   RoomStatusDayDto,
   RoomStatusIntervalDto,
@@ -28,6 +30,7 @@ import {
   dateWindowStartForFocus,
   filterRoomStatusRooms,
   hasActiveRoomStatusFilters,
+  intervalsRenderedOnRoomStatusGrid,
   moveRoomStatusFocus,
   selectionFromCells,
   shiftDateWindowStart,
@@ -58,6 +61,16 @@ interface RenderedUnit {
   parent: RoomStatusUnitDto | null;
   depth: 0 | 1;
 }
+
+interface BedOccupancyTooltipState {
+  text: string;
+  left: number;
+  top: number;
+  maxHeight: number;
+  placement: "ABOVE" | "BELOW";
+}
+
+const roomStatusWeekdayFormatter = new Intl.DateTimeFormat("zh-CN", { weekday: "short", timeZone: "UTC" });
 
 export interface RoomStatusGridProps {
   board: RoomStatusBoardDto;
@@ -110,11 +123,30 @@ function intervalsForWindow(intervals: readonly RoomStatusIntervalDto[], dates: 
   });
 }
 
-function dayFor(unit: RoomStatusUnitDto, serviceDate: string): RoomStatusDayDto | null {
-  return unit.days.find((day) => day.serviceDate === serviceDate) ?? null;
+function bedOccupantLabel(occupant: RoomStatusBedOccupancyDto["occupants"][number]): string {
+  return occupant.primaryOccupantLabel?.trim() || "历史未记录";
 }
 
-function cellAccessibleName(unit: RoomStatusUnitDto, serviceDate: string, day: RoomStatusDayDto | null): string {
+function bedOccupancyDescription(occupancy: RoomStatusBedOccupancyDto): string {
+  const occupants = occupancy.occupants
+    .map((occupant) => `${occupant.inventoryUnitCode}：${bedOccupantLabel(occupant)}`)
+    .join("；");
+  return `已占 ${occupancy.occupiedBedCount}/${occupancy.totalBedCount}${occupants ? `；住宿人：${occupants}` : ""}`;
+}
+
+function compactBedOccupants(occupancy: RoomStatusBedOccupancyDto): string {
+  const firstOccupant = occupancy.occupants[0];
+  const first = firstOccupant ? bedOccupantLabel(firstOccupant) : "";
+  if (!first) return "";
+  return occupancy.occupants.length > 1 ? `${first} +${occupancy.occupants.length - 1}` : first;
+}
+
+function cellAccessibleName(
+  unit: RoomStatusUnitDto,
+  serviceDate: string,
+  day: RoomStatusDayDto | null,
+  bedOccupancy: RoomStatusBedOccupancyDto | null
+): string {
   if (!day) return `${unit.name}，${formatRoomStatusDate(serviceDate)}，状态未知，服务端未返回逐日事实`;
   const status = roomStatusPresentation[day.status].label;
   const intervals = unit.intervals.filter((interval) => day.intervalIds.includes(interval.id));
@@ -125,7 +157,10 @@ function cellAccessibleName(unit: RoomStatusUnitDto, serviceDate: string, day: R
   ].filter(Boolean).join(" "));
   const conflicts = day.conflicts.map((conflict) => `阻断冲突 ${conflict.reason}，${conflict.sourceReference.label}`);
   const availability = day.available ? "服务端标记可售" : "服务端标记不可售";
-  return [unit.name, formatRoomStatusDate(serviceDate), status, availability, ...sources, ...conflicts].join("，");
+  const occupancy = bedOccupancy ? bedOccupancyDescription(bedOccupancy) : null;
+  return [unit.name, formatRoomStatusDate(serviceDate), status, availability, occupancy, ...sources, ...conflicts]
+    .filter(Boolean)
+    .join("，");
 }
 
 function isCellSelected(selection: RoomStatusSelection | null, unitId: string, serviceDate: string): boolean {
@@ -139,6 +174,35 @@ function rowDescription(unit: RoomStatusUnitDto): string {
   const salesMode = unit.salesMode === "WHOLE_ROOM" ? "整房销售" : unit.salesMode === "BED_SPLIT" ? "拆床销售" : "不可售";
   const kind = unit.kind === "ROOM" ? "房间" : "床位";
   return `${kind}，${salesMode}，容纳 ${unit.capacity} 人`;
+}
+
+const tabbableSelector = [
+  "a[href]",
+  "area[href]",
+  "button",
+  "input",
+  "select",
+  "textarea",
+  "iframe",
+  "[contenteditable='true']",
+  "[tabindex]"
+].join(",");
+
+function isTabbable(element: HTMLElement): boolean {
+  if (element.tabIndex < 0 || element.matches(":disabled")) return false;
+  if (element.closest("[hidden], [inert]")) return false;
+  const style = window.getComputedStyle(element);
+  return style.display !== "none" && style.visibility !== "hidden" && element.getClientRects().length > 0;
+}
+
+function focusNextTabStop(trigger: HTMLElement, excludedRoot: HTMLElement | null): boolean {
+  const tabStops = [...document.querySelectorAll<HTMLElement>(tabbableSelector)]
+    .filter((element) => !excludedRoot?.contains(element) && isTabbable(element));
+  const triggerIndex = tabStops.indexOf(trigger);
+  const next = triggerIndex >= 0 ? tabStops[triggerIndex + 1] : null;
+  if (!next) return false;
+  next.focus({ preventScroll: false });
+  return document.activeElement === next;
 }
 
 export function RoomStatusGrid({
@@ -174,6 +238,22 @@ export function RoomStatusGrid({
   const lastFocusRequestToken = useRef(focusRequestToken);
   const pendingKeyboardFocus = useRef<RoomStatusCellFocus | null>(null);
   const [touchSelectionMode, setTouchSelectionMode] = useState(false);
+  const [bedOccupancyTooltip, setBedOccupancyTooltip] = useState<BedOccupancyTooltipState | null>(null);
+  const bedOccupancyTooltipDismissTimer = useRef<number | null>(null);
+  const bedOccupancyTooltipRef = useRef<HTMLDivElement>(null);
+  const bedOccupancyTooltipTriggerRef = useRef<HTMLDivElement | null>(null);
+  const suppressBedOccupancyTooltipFocusRef = useRef<HTMLDivElement | null>(null);
+  const cancelBedOccupancyTooltipDismiss = useCallback(() => {
+    if (bedOccupancyTooltipDismissTimer.current === null) return;
+    window.clearTimeout(bedOccupancyTooltipDismissTimer.current);
+    bedOccupancyTooltipDismissTimer.current = null;
+  }, []);
+  const closeBedOccupancyTooltip = useCallback(() => {
+    cancelBedOccupancyTooltipDismiss();
+    bedOccupancyTooltipTriggerRef.current = null;
+    suppressBedOccupancyTooltipFocusRef.current = null;
+    setBedOccupancyTooltip(null);
+  }, [cancelBedOccupancyTooltipDismiss]);
   const pageRooms = useMemo(() => board.rooms.slice(0, Math.max(0, board.page.size)), [board.page.size, board.rooms]);
   const filteredRooms = useMemo(() => filterRoomStatusRooms(pageRooms, filters), [filters, pageRooms]);
   const dates = useMemo(
@@ -187,8 +267,31 @@ export function RoomStatusGrid({
     }
     return rows;
   }), [expandedRoomIds, filteredRooms]);
-  const positionedByUnit = useMemo(() => new Map(renderedUnits.map(({ unit }) => [unit.id, intervalsForWindow(unit.intervals, dates)])), [dates, renderedUnits]);
-  const unitIds = renderedUnits.map(({ unit }) => unit.id);
+  const positionedByUnit = useMemo(() => new Map(renderedUnits.map(({ unit }) => [
+    unit.id,
+    intervalsForWindow(intervalsRenderedOnRoomStatusGrid(unit, dates), dates)
+  ])), [dates, renderedUnits]);
+  const dayByCell = useMemo(() => {
+    const visibleDates = new Set(dates);
+    return new Map(renderedUnits.flatMap(({ unit }) => unit.days
+      .filter((day) => visibleDates.has(day.serviceDate))
+      .map((day) => [`${unit.id}:${day.serviceDate}`, day] as const)));
+  }, [dates, renderedUnits]);
+  const bedOccupancyByCell = useMemo(() => {
+    const occupancyByCell = new Map<string, RoomStatusBedOccupancyDto>();
+    const visibleDates = new Set(dates);
+    for (const { unit } of renderedUnits) {
+      if (unit.kind !== "ROOM" || unit.salesMode !== "BED_SPLIT") continue;
+      for (const occupancy of unit.bedOccupancies) {
+        if (visibleDates.has(occupancy.serviceDate)) {
+          occupancyByCell.set(`${unit.id}:${occupancy.serviceDate}`, occupancy);
+        }
+      }
+    }
+    return occupancyByCell;
+  }, [dates, renderedUnits]);
+  const unitIds = useMemo(() => renderedUnits.map(({ unit }) => unit.id), [renderedUnits]);
+  const tooltipContextKey = `${dates.join(",")}|${unitIds.join(",")}`;
   const firstCell = unitIds[0] && dates[0] ? { unitId: unitIds[0], serviceDate: dates[0] } : null;
   const effectiveFocus = focusedCell && unitIds.includes(focusedCell.unitId) && dates.includes(focusedCell.serviceDate)
     ? focusedCell
@@ -287,7 +390,30 @@ export function RoomStatusGrid({
 
   useEffect(() => () => {
     if (scrollFrame.current !== null) cancelAnimationFrame(scrollFrame.current);
+    if (bedOccupancyTooltipDismissTimer.current !== null) {
+      window.clearTimeout(bedOccupancyTooltipDismissTimer.current);
+    }
   }, []);
+
+  useEffect(() => {
+    closeBedOccupancyTooltip();
+  }, [board.revision, closeBedOccupancyTooltip, tooltipContextKey]);
+
+  useEffect(() => {
+    const closeForDetachedPosition = (event: Event) => {
+      const eventTarget = event.target;
+      if (event.type === "scroll"
+        && eventTarget instanceof Node
+        && bedOccupancyTooltipRef.current?.contains(eventTarget)) return;
+      closeBedOccupancyTooltip();
+    };
+    window.addEventListener("scroll", closeForDetachedPosition, true);
+    window.addEventListener("resize", closeForDetachedPosition);
+    return () => {
+      window.removeEventListener("scroll", closeForDetachedPosition, true);
+      window.removeEventListener("resize", closeForDetachedPosition);
+    };
+  }, [closeBedOccupancyTooltip]);
 
   if (isMobile) return null;
 
@@ -311,12 +437,23 @@ export function RoomStatusGrid({
   };
 
   const handleCellKeyDown = (event: KeyboardEvent<HTMLDivElement>, unit: RoomStatusUnitDto, day: RoomStatusDayDto | null) => {
+    const ownsTooltip = Boolean(bedOccupancyTooltip
+      && bedOccupancyTooltipTriggerRef.current === event.currentTarget);
+    if (event.key === "Tab" && !event.shiftKey && ownsTooltip) {
+      event.preventDefault();
+      requestAnimationFrame(() => bedOccupancyTooltipRef.current?.focus({ preventScroll: true }));
+      return;
+    }
     if (event.key === "ArrowLeft") return moveFocus(event, 0, -1);
     if (event.key === "ArrowRight") return moveFocus(event, 0, 1);
     if (event.key === "ArrowUp") return moveFocus(event, -1, 0);
     if (event.key === "ArrowDown") return moveFocus(event, 1, 0);
     if (event.key === "Escape") {
       event.preventDefault();
+      if (ownsTooltip) {
+        closeBedOccupancyTooltip();
+        return;
+      }
       onSelectionChange(null);
       return;
     }
@@ -342,9 +479,51 @@ export function RoomStatusGrid({
     onFocusedCellChange({ unitId: unit.id, serviceDate });
     onSelectionChange(selectionFromCells(unit.id, serviceDate, serviceDate));
     event.currentTarget.focus();
+    closeBedOccupancyTooltip();
+  };
+
+  const scheduleBedOccupancyTooltipDismiss = () => {
+    cancelBedOccupancyTooltipDismiss();
+    bedOccupancyTooltipDismissTimer.current = window.setTimeout(() => {
+      bedOccupancyTooltipDismissTimer.current = null;
+      const activeElement = document.activeElement;
+      if (activeElement === bedOccupancyTooltipTriggerRef.current
+        || (activeElement instanceof Node && bedOccupancyTooltipRef.current?.contains(activeElement))) return;
+      closeBedOccupancyTooltip();
+    }, 180);
+  };
+
+  const showBedOccupancyTooltip = (target: HTMLElement, text: string) => {
+    cancelBedOccupancyTooltipDismiss();
+    bedOccupancyTooltipTriggerRef.current = target as HTMLDivElement;
+    const bounds = target.getBoundingClientRect();
+    const viewportMargin = 12;
+    const gap = 7;
+    const maximumWidth = Math.max(1, Math.min(320, window.innerWidth - viewportMargin * 2));
+    const halfWidth = maximumWidth / 2;
+    const left = Math.min(
+      window.innerWidth - viewportMargin - halfWidth,
+      Math.max(viewportMargin + halfWidth, bounds.left + bounds.width / 2)
+    );
+    const estimatedLines = Math.max(2, Math.ceil(text.length / 25));
+    const estimatedHeight = 30 + estimatedLines * 18;
+    const availableBelow = Math.max(1, window.innerHeight - bounds.bottom - gap - viewportMargin);
+    const availableAbove = Math.max(1, bounds.top - gap - viewportMargin);
+    const placement = estimatedHeight <= availableBelow
+      ? "BELOW"
+      : estimatedHeight <= availableAbove || availableAbove >= availableBelow ? "ABOVE" : "BELOW";
+    const maxHeight = Math.floor(placement === "BELOW" ? availableBelow : availableAbove);
+    setBedOccupancyTooltip({
+      text,
+      left,
+      top: placement === "BELOW" ? bounds.bottom + gap : bounds.top - gap,
+      maxHeight,
+      placement
+    });
   };
 
   const handleScroll = () => {
+    closeBedOccupancyTooltip();
     if (!scrollRef.current || !onScrollAnchorChange || scrollFrame.current !== null) return;
     scrollFrame.current = requestAnimationFrame(() => {
       scrollFrame.current = null;
@@ -457,7 +636,7 @@ export function RoomStatusGrid({
             <div className="room-status-date-header-track" role="presentation">
               {dates.map((date) => {
                 const parsed = new Date(`${date}T00:00:00Z`);
-                const weekDay = new Intl.DateTimeFormat("zh-CN", { weekday: "short", timeZone: "UTC" }).format(parsed);
+                const weekDay = roomStatusWeekdayFormatter.format(parsed);
                 return (
                   <div key={date} className={`room-status-date-header${date === todayDate ? " is-today" : ""}`} role="columnheader" aria-label={`${formatRoomStatusDate(date)} ${weekDay}`}>
                     <strong>{date.slice(5)}</strong>
@@ -509,8 +688,13 @@ export function RoomStatusGrid({
                 </div>
                 <div className="room-status-day-track" role="presentation">
                   {dates.map((date, columnIndex) => {
-                    const day = dayFor(unit, date);
+                    const day = dayByCell.get(`${unit.id}:${date}`) ?? null;
                     const status = day?.status ?? "UNKNOWN";
+                    const bedOccupancy = bedOccupancyByCell.get(`${unit.id}:${date}`) ?? null;
+                    const bedOccupancyRatio = bedOccupancy
+                      ? `${bedOccupancy.occupiedBedCount}/${bedOccupancy.totalBedCount}`
+                      : null;
+                    const bedOccupancyTooltipText = bedOccupancy ? bedOccupancyDescription(bedOccupancy) : undefined;
                     const selected = isCellSelected(selection, unit.id, date);
                     const focusable = effectiveFocus?.unitId === unit.id && effectiveFocus.serviceDate === date;
                     const startingIntervals = intervalsByStartColumn.get(columnIndex) ?? [];
@@ -520,25 +704,57 @@ export function RoomStatusGrid({
                         aria-rowindex={rowIndex + 2}
                         aria-colindex={columnIndex + 2}
                         aria-selected={selected}
-                        aria-label={cellAccessibleName(unit, date, day)}
+                        aria-label={cellAccessibleName(unit, date, day, bedOccupancy)}
                         tabIndex={focusable ? 0 : -1}
                         key={date}
                         data-room-status-cell="true"
                         data-unit-id={unit.id}
                         data-service-date={date}
-                        className={`room-status-day-cell room-status-day-${status.toLowerCase().replaceAll("_", "-")}${selected ? " is-selected" : ""}${date === todayDate ? " is-today" : ""}${!day?.available ? " is-authoritatively-unavailable" : ""}${day?.conflicts.length ? " has-blocking-conflict" : ""}${startingIntervals.length ? " has-source-interval" : ""}`}
+                        data-bed-occupancy-ratio={bedOccupancyRatio ?? undefined}
+                        className={`room-status-day-cell room-status-day-${status.toLowerCase().replaceAll("_", "-")}${selected ? " is-selected" : ""}${date === todayDate ? " is-today" : ""}${!day?.available ? " is-authoritatively-unavailable" : ""}${day?.conflicts.length ? " has-blocking-conflict" : ""}${startingIntervals.length ? " has-source-interval" : ""}${bedOccupancy ? " has-bed-occupancy" : ""}`}
                         ref={(node) => {
                           const key = `${unit.id}:${date}`;
                           if (node) cellRefs.current.set(key, node);
                           else cellRefs.current.delete(key);
                         }}
-                        onFocus={() => onFocusedCellChange({ unitId: unit.id, serviceDate: date })}
+                        onMouseEnter={bedOccupancyTooltipText
+                          ? (event) => showBedOccupancyTooltip(event.currentTarget, bedOccupancyTooltipText)
+                          : undefined}
+                        onMouseLeave={bedOccupancyTooltipText
+                          ? (event) => {
+                              if (event.currentTarget !== document.activeElement) scheduleBedOccupancyTooltipDismiss();
+                            }
+                          : undefined}
+                        onFocus={(event) => {
+                          if (event.target !== event.currentTarget) return;
+                          onFocusedCellChange({ unitId: unit.id, serviceDate: date });
+                          if (suppressBedOccupancyTooltipFocusRef.current === event.currentTarget) {
+                            suppressBedOccupancyTooltipFocusRef.current = null;
+                            closeBedOccupancyTooltip();
+                            return;
+                          }
+                          if (bedOccupancyTooltipText) showBedOccupancyTooltip(event.currentTarget, bedOccupancyTooltipText);
+                          else closeBedOccupancyTooltip();
+                        }}
+                        onBlur={bedOccupancyTooltipText
+                          ? (event) => {
+                              if (event.target !== event.currentTarget) return;
+                              const nextTarget = event.relatedTarget;
+                              if (nextTarget instanceof Node && bedOccupancyTooltipRef.current?.contains(nextTarget)) return;
+                              closeBedOccupancyTooltip();
+                            }
+                          : undefined}
                         onPointerDown={(event) => handlePointerDown(event, unit, date)}
                         onDoubleClick={() => onInspectDay(unit, day)}
                         onKeyDown={(event) => handleCellKeyDown(event, unit, day)}
                       >
-                        <RoomStatusMark status={status} compact />
-                        {day?.conflicts.length ? <span className="room-status-cell-conflict">{day.conflicts.length} 个阻断</span> : null}
+                        {bedOccupancy ? (
+                          <span className="room-status-bed-occupants" aria-hidden="true">{compactBedOccupants(bedOccupancy)}</span>
+                        ) : null}
+                        {bedOccupancyRatio ? (
+                          <span className="room-status-bed-occupancy" aria-hidden="true">{bedOccupancyRatio}</span>
+                        ) : <RoomStatusMark status={status} compact />}
+                        {day?.conflicts.length && !bedOccupancy ? <span className="room-status-cell-conflict">{day.conflicts.length} 个阻断</span> : null}
                         {startingIntervals.map(({ interval, startColumn, endColumn, lane }) => (
                           <button
                             key={interval.id}
@@ -546,7 +762,7 @@ export function RoomStatusGrid({
                             className={`room-status-interval room-status-interval-${interval.status.toLowerCase().replaceAll("_", "-")}${interval.blocking ? " is-blocking" : ""}${interval.conflicts.length ? " has-blocking-conflict" : ""}`}
                             style={{ left: 0, width: `${(endColumn - startColumn) * 100}%`, top: `calc(5px + ${lane} * 25px)` }}
                             aria-label={`${interval.label}，${roomStatusSourceLabels[interval.sourceKind]}${interval.primaryOccupantLabel ? `，主要居住人 ${interval.primaryOccupantLabel}` : ""}，${formatRoomStatusDate(interval.startDate)}至${formatRoomStatusDate(interval.endDate)}，${roomStatusPresentation[interval.status].label}${interval.blocking ? "，阻断库存" : "，不阻断库存"}${interval.conflicts.length ? `，${interval.conflicts.length} 个阻断冲突` : ""}`}
-                            title={`${roomStatusSourceLabels[interval.sourceKind]} · ${interval.label}`}
+                            title={`${roomStatusSourceLabels[interval.sourceKind]} · ${interval.primaryOccupantLabel ?? interval.label}`}
                             onPointerDown={(event) => event.stopPropagation()}
                             onDoubleClick={(event) => event.stopPropagation()}
                             onKeyDown={(event) => event.stopPropagation()}
@@ -587,6 +803,41 @@ export function RoomStatusGrid({
           </button>
         </div>
       </footer>
+      {bedOccupancyTooltip ? (
+        <div
+          ref={bedOccupancyTooltipRef}
+          className={`room-status-bed-occupancy-tooltip is-${bedOccupancyTooltip.placement.toLowerCase()}`}
+          role="tooltip"
+          tabIndex={0}
+          data-testid="bed-occupancy-tooltip"
+          style={{ left: bedOccupancyTooltip.left, top: bedOccupancyTooltip.top, maxHeight: bedOccupancyTooltip.maxHeight }}
+          onMouseEnter={cancelBedOccupancyTooltipDismiss}
+          onMouseLeave={scheduleBedOccupancyTooltipDismiss}
+          onBlur={(event) => {
+            if (event.relatedTarget === bedOccupancyTooltipTriggerRef.current) return;
+            closeBedOccupancyTooltip();
+          }}
+          onKeyDown={(event) => {
+            if (event.key !== "Escape" && event.key !== "Tab") return;
+            event.preventDefault();
+            event.stopPropagation();
+            const trigger = bedOccupancyTooltipTriggerRef.current;
+            const tooltip = bedOccupancyTooltipRef.current;
+            closeBedOccupancyTooltip();
+            if (event.key === "Tab" && !event.shiftKey) {
+              requestAnimationFrame(() => {
+                if (trigger && focusNextTabStop(trigger, tooltip)) return;
+                trigger?.focus({ preventScroll: true });
+              });
+              return;
+            }
+            suppressBedOccupancyTooltipFocusRef.current = trigger;
+            requestAnimationFrame(() => trigger?.focus({ preventScroll: true }));
+          }}
+        >
+          {bedOccupancyTooltip.text}
+        </div>
+      ) : null}
     </section>
   );
 }

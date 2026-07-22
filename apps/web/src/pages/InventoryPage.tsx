@@ -2,6 +2,7 @@ import { useEffect, useMemo, useReducer, useRef, useState, type FormEvent } from
 import { FilePlus2, RefreshCw, Search, ShieldCheck } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 import type {
+  CreateOrderPrimaryGuestInputDto,
   RoomStatusActionDto,
   RoomStatusBoardDto,
   RoomStatusBoardQueryDto,
@@ -424,6 +425,7 @@ function QuoteWorkbench({
   initialStayType,
   commandsBlocked,
   resetToken,
+  onRecoveryOutcome,
   onCommand
 }: {
   unit: InventoryActionUnit | undefined;
@@ -433,6 +435,7 @@ function QuoteWorkbench({
   initialStayType?: StayType;
   commandsBlocked: boolean;
   resetToken: number;
+  onRecoveryOutcome: (outcome: Error | undefined) => void;
   onCommand: (request: CommandRequest) => void;
 }) {
   const { meta, principal, propertyId } = useWorkspace();
@@ -457,6 +460,7 @@ function QuoteWorkbench({
     read: browserQuoteRecovery(principal.subjectId, propertyId).read
   }));
   const [guestName, setGuestName] = useState("");
+  const [guestNickname, setGuestNickname] = useState("");
   const [guestPhone, setGuestPhone] = useState("");
   const [guestDocument, setGuestDocument] = useState("");
   const [bookingChannelCode, setBookingChannelCode] = useState<BookingChannelCode | "">("");
@@ -495,6 +499,7 @@ function QuoteWorkbench({
     setQuote(undefined);
     setQuoteReceipt(undefined);
     setGuestName("");
+    setGuestNickname("");
     setGuestPhone("");
     setGuestDocument("");
     setBookingChannelCode("");
@@ -547,6 +552,7 @@ function QuoteWorkbench({
 
   async function createQuote() {
     if (!currentQuoteInput || quoteCommandsBlocked) return;
+    onRecoveryOutcome(undefined);
     const input = currentQuoteInput;
     const inputSignature = quoteInputSignature(input);
     const metadata = api.commandMetadata("create-quote");
@@ -619,6 +625,7 @@ function QuoteWorkbench({
 
   async function recoverQuote() {
     if (!pendingQuote) return;
+    onRecoveryOutcome(undefined);
     const requestLease = quoteRequestGuard.begin(quoteRecoveryScope);
     setBusy(true);
     setError(undefined);
@@ -651,12 +658,12 @@ function QuoteWorkbench({
       }
       setQuoteRecoverySnapshot({ scope: quoteRecoveryScope, read: { kind: "ABSENT" } });
       if (!receipt.businessCommitted) {
-        setError(new Error("服务端确认该报价命令未执行，可以重新报价。"));
+        onRecoveryOutcome(new Error("服务端确认该报价命令未执行，可以重新报价。"));
         return;
       }
       const recoveredQuote = quoteFromReceipt(receipt);
       if (latestQuoteSignature.current !== pendingQuote.inputSignature) {
-        setError(new Error("报价已恢复，但当前筛选条件已变化；旧结果未应用，请重新报价。"));
+        onRecoveryOutcome(new Error("报价已恢复，但当前筛选条件已变化；旧结果未应用，请重新报价。"));
         return;
       }
       setQuote(recoveredQuote);
@@ -672,8 +679,11 @@ function QuoteWorkbench({
   }
 
   function createOrder() {
-    if (quoteCommandsBlocked || !quote || !guestName.trim() || !bookingChannelCode || (quote.stayType === "FREE" && !freeStayReason.trim())) return;
-    const primaryGuest: Record<string, unknown> = { fullName: guestName.trim() };
+    if (quoteCommandsBlocked || !quote || !guestName.trim() || !guestNickname.trim() || !bookingChannelCode || (quote.stayType === "FREE" && !freeStayReason.trim())) return;
+    const primaryGuest: CreateOrderPrimaryGuestInputDto = {
+      fullName: guestName.trim(),
+      nickname: guestNickname.trim()
+    };
     if (guestPhone.trim()) primaryGuest.phone = guestPhone.trim();
     if (guestDocument.trim()) primaryGuest.documentNumber = guestDocument.trim();
     onCommand({
@@ -766,6 +776,7 @@ function QuoteWorkbench({
               <section className="guest-section" aria-labelledby="guest-heading">
                 <h3 id="guest-heading">主要居住人快照</h3>
                 <div className="form-grid">
+                  <label>昵称<input value={guestNickname} onChange={(event) => setGuestNickname(event.target.value)} required maxLength={200} data-testid="primary-guest-nickname" /></label>
                   <label>姓名<input value={guestName} onChange={(event) => setGuestName(event.target.value)} required maxLength={160} data-testid="primary-guest-name" /></label>
                   <label>联系电话<input value={guestPhone} onChange={(event) => setGuestPhone(event.target.value)} inputMode="tel" maxLength={80} /></label>
                   <label>证件号码<input value={guestDocument} onChange={(event) => setGuestDocument(event.target.value)} maxLength={120} /></label>
@@ -786,7 +797,7 @@ function QuoteWorkbench({
                   {bookingChannelCode && bookingChannelCode !== "WECOM" ? <label>渠道订单号（可选）<input value={channelOrderReference} onChange={(event) => setChannelOrderReference(event.target.value)} maxLength={200} data-testid="channel-order-reference" /></label> : null}
                   {quote.stayType === "FREE" ? <label className="span-two">免费入住原因<textarea rows={3} value={freeStayReason} onChange={(event) => setFreeStayReason(event.target.value)} required maxLength={1000} data-testid="free-stay-reason" /></label> : null}
                 </div>
-                <button className="button button-primary full-width" type="button" onClick={createOrder} disabled={quoteCommandsBlocked || !guestName.trim() || !bookingChannelCode || (quote.stayType === "FREE" && !freeStayReason.trim())} data-testid="create-order">
+                <button className="button button-primary full-width" type="button" onClick={createOrder} disabled={quoteCommandsBlocked || !guestName.trim() || !guestNickname.trim() || !bookingChannelCode || (quote.stayType === "FREE" && !freeStayReason.trim())} data-testid="create-order">
                   <FilePlus2 aria-hidden="true" size={17} />Preview 创建订单
                 </button>
               </section>
@@ -1007,12 +1018,14 @@ export function InventoryPage() {
   const pendingRestoration = useRef<RoomStatusRestorationSnapshot | undefined>(initialRestoration.current);
   const restorationPageAdjusted = useRef(false);
   const previousPropertyId = useRef(propertyId);
+  const [initializedPropertyId, setInitializedPropertyId] = useState(propertyId);
   const [queryPhase, setQueryPhase] = useState<"LOADING" | "RANGE_LOADING" | "READY" | "REFRESHING" | "ERROR" | "PERMISSION_DENIED">("LOADING");
   const [queryError, setQueryError] = useState<unknown>();
   const [rangeError, setRangeError] = useState<unknown>();
   const [restorationError, setRestorationError] = useState<unknown>();
   const [returnNotice, setReturnNotice] = useState<string>();
   const [actionError, setActionError] = useState<unknown>();
+  const [quoteRecoveryOutcome, setQuoteRecoveryOutcome] = useState<Error>();
   const [clock, setClock] = useState(() => Date.now());
   const [refreshToken, setRefreshToken] = useState(0);
   const [quoteResetToken, setQuoteResetToken] = useState(0);
@@ -1042,6 +1055,10 @@ export function InventoryPage() {
   const focusAfterNextBoard = useRef(false);
   const pendingMobileTaskFocus = useRef<PendingMobileTaskFocus | undefined>(undefined);
   const mobileFocusSequence = useRef(0);
+  const latestRestoration = useRef<{
+    subjectId: string;
+    snapshot: RoomStatusRestorationSnapshot;
+  } | undefined>(undefined);
 
   useEffect(() => {
     boardRef.current = board;
@@ -1116,9 +1133,12 @@ export function InventoryPage() {
     setQueryError(undefined);
     setReturnNotice(undefined);
     setActionError(undefined);
+    setQuoteRecoveryOutcome(undefined);
+    setInitializedPropertyId(propertyId);
   }, [principal.subjectId, propertyId, propertyTimezone]);
 
   useEffect(() => {
+    if (initializedPropertyId !== propertyId) return;
     const query = roomStatusQuery(range, viewState.roomPageIndex, viewState.filters);
     const requestQueryKey = roomStatusQueryKey(query);
     const requestId = queryAttemptGuard.begin();
@@ -1212,6 +1232,7 @@ export function InventoryPage() {
         setQueryError(error);
         if (error instanceof ApiError && (error.status === 401 || error.status === 403)) {
           permissionDeniedRef.current = true;
+          latestRestoration.current = undefined;
           setBoard(undefined);
           boardRef.current = undefined;
           setBoardQueryKey(undefined);
@@ -1255,6 +1276,7 @@ export function InventoryPage() {
       controller.abort();
     };
   }, [
+    initializedPropertyId,
     propertyId,
     range.arrivalDate,
     range.departureDate,
@@ -1270,20 +1292,31 @@ export function InventoryPage() {
 
   useEffect(() => {
     if (!board || !boardMatchesCurrentQuery) return;
+    const snapshot: RoomStatusRestorationSnapshot = {
+      version: 1,
+      propertyId,
+      revision: board.revision,
+      range,
+      savedAt: new Date().toISOString(),
+      state: viewState,
+      factFingerprint: roomStatusFactFingerprint(board.rooms, viewState)
+    };
+    latestRestoration.current = { subjectId: principal.subjectId, snapshot };
     const timer = window.setTimeout(() => {
-      const saved = writeRoomStatusRestoration(principal.subjectId, {
-        version: 1,
-        propertyId,
-        revision: board.revision,
-        range,
-        savedAt: new Date().toISOString(),
-        state: viewState,
-        factFingerprint: roomStatusFactFingerprint(board.rooms, viewState)
-      });
+      const saved = writeRoomStatusRestoration(principal.subjectId, snapshot);
       setRestorationError(saved ? undefined : new Error("浏览器无法保存房态返回位置；本次业务事实未受影响"));
     }, 150);
     return () => window.clearTimeout(timer);
   }, [board, boardMatchesCurrentQuery, principal.subjectId, propertyId, range, viewState]);
+
+  useEffect(() => () => {
+    const latest = latestRestoration.current;
+    if (latest
+      && latest.subjectId === principal.subjectId
+      && latest.snapshot.propertyId === propertyId) {
+      writeRoomStatusRestoration(latest.subjectId, latest.snapshot);
+    }
+  }, [principal.subjectId, propertyId]);
 
   const boardForCurrentProperty = boardMatchesCurrentProperty ? board : undefined;
   const boardExpired = Boolean(boardForCurrentProperty && clock > Date.parse(boardForCurrentProperty.freshUntil));
@@ -1374,6 +1407,7 @@ export function InventoryPage() {
     setInternalUseTarget(undefined);
     setMobileCreateOpen(false);
     setActionError(undefined);
+    setQuoteRecoveryOutcome(undefined);
   }
 
   function applyFilters(filters: typeof viewState.filters) {
@@ -1448,12 +1482,14 @@ export function InventoryPage() {
   }
 
   function inspectUnit(unit: RoomStatusUnitDto) {
+    setQuoteRecoveryOutcome(undefined);
     setSelectedUnitId(unit.id);
     setSelectedDayDate(undefined);
     setSelectedIntervalId(undefined);
   }
 
   function inspectDay(unit: RoomStatusUnitDto, day: RoomStatusDayDto | null) {
+    setQuoteRecoveryOutcome(undefined);
     setSelectedUnitId(unit.id);
     setSelectedDayDate(day?.serviceDate);
     setSelectedIntervalId(undefined);
@@ -1461,6 +1497,7 @@ export function InventoryPage() {
   }
 
   function inspectInterval(unit: RoomStatusUnitDto, interval: RoomStatusIntervalDto) {
+    setQuoteRecoveryOutcome(undefined);
     setSelectedUnitId(unit.id);
     setSelectedDayDate(undefined);
     setSelectedIntervalId(interval.id);
@@ -1477,6 +1514,7 @@ export function InventoryPage() {
   }
 
   function selectRange(selection: RoomStatusSelection | null) {
+    setQuoteRecoveryOutcome(undefined);
     dispatchView({ type: "SET_SELECTION", selection });
     if (selection) setSelectedUnitId(selection.unitId);
     setSelectedDayDate(undefined);
@@ -1531,6 +1569,7 @@ export function InventoryPage() {
       }
       const unit = actionUnit(actionSelectedUnit, true);
       if (action.code === "CREATE_ORDER" || action.code === "CREATE_FREE_STAY") {
+        setQuoteRecoveryOutcome(undefined);
         setQuoteTarget({
           unitId: unit.id,
           arrivalDate: selection.arrivalDate,
@@ -1683,6 +1722,7 @@ export function InventoryPage() {
       {queryPhase !== "PERMISSION_DENIED" ? <InlineError error={commandRecovery.error} title="本地命令恢复记录不可用" /> : null}
       <InlineError error={restorationError} title="房态位置未保存" />
       <InlineError error={actionError} title="动作未开始" />
+      <InlineError error={quoteRecoveryOutcome} title="报价恢复结果" />
       {queryPhase !== "PERMISSION_DENIED" && commandRecovery.pending ? <CommandRecoveryBar recovery={commandRecovery.pending} onOpen={openRecoveryDialog} testId="inventory-command-recovery" /> : null}
       {returnNotice ? <div className="room-status-return-notice" role="status">{returnNotice}</div> : null}
       {boardStale ? <div className="room-status-stale-notice" role="alert">当前房态已陈旧或刷新失败。页面保留最后一次来源事实，但所有依赖新鲜度的写动作已暂停。</div> : null}
@@ -1826,6 +1866,7 @@ export function InventoryPage() {
                 {...(quoteTarget ? { initialStayType: quoteTarget.initialStayType } : {})}
                 commandsBlocked={commandsBlocked}
                 resetToken={quoteResetToken}
+                onRecoveryOutcome={setQuoteRecoveryOutcome}
                 onCommand={startCommand}
               />
             </div>

@@ -1,11 +1,12 @@
 import { describe, expect, it } from "vitest";
-import type { RoomStatusDayDto, RoomStatusUnitDto } from "@qintopia/contracts";
+import type { RoomStatusDayDto, RoomStatusIntervalDto, RoomStatusUnitDto } from "@qintopia/contracts";
 import {
   DEFAULT_ROOM_STATUS_FILTERS,
   MAX_VISIBLE_DAYS,
   createRoomStatusViewState,
   dateWindowStartForFocus,
   filterRoomStatusRooms,
+  intervalsRenderedOnRoomStatusGrid,
   moveRoomStatusFocus,
   parseRoomStatusRestoration,
   reconcileRoomStatusRestoration,
@@ -17,6 +18,13 @@ import {
   shiftDateWindowStart,
   visibleDateWindow
 } from "./roomStatusState";
+
+const orderReference = {
+  type: "ORDER" as const,
+  id: "order_bed",
+  label: "Order order_bed",
+  href: "/orders/order_bed"
+};
 
 const day = (serviceDate: string, status: RoomStatusDayDto["status"] = "AVAILABLE"): RoomStatusDayDto => ({
   serviceDate,
@@ -43,6 +51,7 @@ function unit(overrides: Partial<RoomStatusUnitDto> = {}): RoomStatusUnitDto {
     capacity: 4,
     childUnitIds: [],
     children: [],
+    bedOccupancies: [],
     days: [day("2026-07-20"), day("2026-07-21")],
     intervals: [],
     conflicts: [],
@@ -50,6 +59,77 @@ function unit(overrides: Partial<RoomStatusUnitDto> = {}): RoomStatusUnitDto {
     ...overrides
   };
 }
+
+function lodgingInterval(overrides: Partial<RoomStatusIntervalDto> = {}): RoomStatusIntervalDto {
+  return {
+    id: "interval_bed_order",
+    displayInventoryUnitId: "unit_room_101",
+    sourceKind: "ORDER",
+    actualInventoryUnitId: "unit_bed_101_a",
+    roomId: "unit_room_101",
+    startDate: "2026-07-20",
+    endDate: "2026-07-21",
+    sourceStartDate: "2026-07-20",
+    sourceEndDate: "2026-07-21",
+    status: "RESERVED",
+    available: false,
+    blocking: true,
+    label: "order_bed",
+    primaryOccupantLabel: "山风",
+    reason: null,
+    claimIds: [],
+    references: [orderReference],
+    conflicts: [],
+    history: [],
+    allowedActions: [],
+    ...overrides
+  };
+}
+
+describe("RoomStatus grid intervals", () => {
+  it("replaces active child-bed lodging with occupancy while retaining real whole-room and unresolved intervals", () => {
+    const childBed = lodgingInterval();
+    const wholeRoom = lodgingInterval({
+      id: "interval_whole_room_order",
+      actualInventoryUnitId: "unit_room_101",
+      label: "order_whole_room",
+      primaryOccupantLabel: "北辰"
+    });
+    const unresolvedChild = lodgingInterval({ id: "interval_unknown", status: "UNKNOWN" });
+    const maintenance = lodgingInterval({ id: "interval_maintenance", sourceKind: "MAINTENANCE" });
+    const rendered = intervalsRenderedOnRoomStatusGrid(unit({
+      bedOccupancies: [{
+        serviceDate: "2026-07-20",
+        occupiedBedCount: 1,
+        totalBedCount: 4,
+        occupants: [{
+          inventoryUnitId: "unit_bed_101_a",
+          inventoryUnitCode: "101-A",
+          primaryOccupantLabel: "山风",
+          sourceReference: orderReference
+        }]
+      }],
+      intervals: [childBed, wholeRoom, unresolvedChild, maintenance]
+    }), ["2026-07-20"]);
+
+    expect(rendered.map((interval) => interval.id)).toEqual([
+      "interval_whole_room_order",
+      "interval_unknown",
+      "interval_maintenance"
+    ]);
+
+    const aggregationMissing = intervalsRenderedOnRoomStatusGrid(unit({
+      bedOccupancies: [],
+      intervals: [childBed, wholeRoom, unresolvedChild, maintenance]
+    }), ["2026-07-20"]);
+    expect(aggregationMissing.map((interval) => interval.id)).toEqual([
+      "interval_bed_order",
+      "interval_whole_room_order",
+      "interval_unknown",
+      "interval_maintenance"
+    ]);
+  });
+});
 
 describe("RoomStatus date window", () => {
   const dates = Array.from({ length: 90 }, (_, index) => {

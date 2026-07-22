@@ -8,6 +8,7 @@ import fastifyStatic from "@fastify/static";
 import swagger from "@fastify/swagger";
 import swaggerUi from "@fastify/swagger-ui";
 import { Type } from "@sinclair/typebox";
+import { Value } from "@sinclair/typebox/value";
 import Fastify from "fastify";
 import type { Kysely } from "kysely";
 import {
@@ -18,6 +19,7 @@ import {
   type RoomStatusBoardQueryDto,
   type RecoverableCommandType
 } from "@qintopia/contracts";
+import { stableHash } from "@qintopia/domain";
 import {
   createCommandPreview,
   databaseReady,
@@ -45,6 +47,7 @@ import {
   ConfirmSchema,
   ErrorResponse,
   FactResponseSchema,
+  HistoricalCreateOrderReplayEnvelopeSchema,
   Id,
   IdParams,
   LocalDate,
@@ -75,6 +78,7 @@ import {
 } from "./schemas.ts";
 
 const InternalErrorResponses = { 500: ErrorResponse } as const;
+const commandPreviewRequestBodies = new WeakMap<object, unknown>();
 
 function correlationId(request: { headers: Record<string, unknown>; id: string }): string {
   const header = request.headers["x-correlation-id"];
@@ -92,6 +96,57 @@ function missingWriteHeaderError(error: unknown): { code: "IDEMPOTENCY_KEY_REQUI
   if (missing === "idempotency-key") return { code: "IDEMPOTENCY_KEY_REQUIRED", message: "Idempotency-Key header is required" };
   if (missing === "x-correlation-id") return { code: "CORRELATION_ID_REQUIRED", message: "X-Correlation-ID header is required" };
   return undefined;
+}
+
+function record(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+async function replayHistoricalCreateOrderPreview(
+  db: Kysely<Database>,
+  principal: Awaited<ReturnType<typeof requirePrincipal>>,
+  envelope: unknown,
+  headers: Record<string, unknown>
+) {
+  if (!Value.Check(HistoricalCreateOrderReplayEnvelopeSchema, envelope)
+    || !Value.Check(WriteHeaders, headers)) return undefined;
+
+  const idempotencyKey = typeof headers["idempotency-key"] === "string"
+    ? headers["idempotency-key"].trim()
+    : "";
+  const correlation = typeof headers["x-correlation-id"] === "string"
+    ? headers["x-correlation-id"].trim()
+    : "";
+  if (!idempotencyKey) throw new DomainError("IDEMPOTENCY_KEY_REQUIRED", "Idempotency-Key header is required", 400);
+  if (!correlation) throw new DomainError("CORRELATION_ID_REQUIRED", "X-Correlation-ID header is required", 400);
+
+  const propertyId = envelope.input.propertyId;
+  requirePropertyAccess(principal, propertyId, "WRITE");
+  const execution = await db.selectFrom("command_executions as execution")
+    .leftJoin("command_receipts as receipt", "receipt.command_id", "execution.id")
+    .select(["execution.id", "execution.request_hash", "receipt.id as receipt_id"])
+    .where("execution.subject_id", "=", principal.subjectId)
+    .where("execution.property_id", "=", propertyId)
+    .where("execution.command_type", "=", "PREVIEW:CREATE_ORDER")
+    .where("execution.idempotency_key", "=", idempotencyKey)
+    .executeTakeFirst();
+  if (!execution || execution.request_hash !== stableHash(envelope)) return undefined;
+  if (!execution.receipt_id) {
+    throw new DomainError(
+      "COMMAND_STATUS_UNKNOWN",
+      "The historical Preview command is still executing or its final state is unknown",
+      409,
+      true,
+      { commandId: execution.id }
+    );
+  }
+
+  const receipt = await getReceipt(db, principal, execution.receipt_id);
+  const preview = record(receipt.result)?.preview;
+  if (!record(preview)) throw new DomainError("INTERNAL_ERROR", "Historical Preview receipt is malformed", 500);
+  return { preview, receipt };
 }
 
 export async function buildServer(db: Kysely<Database>) {
@@ -391,9 +446,29 @@ export async function buildServer(db: Kysely<Database>) {
   });
 
   app.post("/api/v1/command-previews", {
+    attachValidation: true,
+    preValidation: async (request) => {
+      commandPreviewRequestBodies.set(request, structuredClone(request.body));
+    },
     config: { rateLimit: { max: positiveIntegerEnv("COMMAND_PREVIEW_RATE_LIMIT_MAX", 120), timeWindow: "1 minute", groupId: "command-previews" } },
     schema: { tags: ["commands"], headers: WriteHeaders, body: CommandEnvelopeSchema, response: { 200: Type.Object({ preview: PreviewSchema, receipt: ReceiptSchema }, { additionalProperties: false }), 400: ErrorResponse, 401: ErrorResponse, 403: ErrorResponse, 404: ErrorResponse, 409: ErrorResponse, 422: ErrorResponse, 429: ErrorResponse, ...InternalErrorResponses } }
   }, async (request) => {
+    if (request.validationError) {
+      const historicalEnvelope = commandPreviewRequestBodies.get(request);
+      if (!Value.Check(HistoricalCreateOrderReplayEnvelopeSchema, historicalEnvelope)
+        || !Value.Check(WriteHeaders, request.headers)) {
+        throw request.validationError;
+      }
+      const principal = await requirePrincipal(db, request);
+      const replay = await replayHistoricalCreateOrderPreview(
+        db,
+        principal,
+        historicalEnvelope,
+        request.headers
+      );
+      if (replay) return replay;
+      throw request.validationError;
+    }
     const principal = await requirePrincipal(db, request);
     const envelope = request.body as CommandEnvelope;
     return createCommandPreview(db, principal, envelope, {

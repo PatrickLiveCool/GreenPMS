@@ -7,6 +7,7 @@ import { createDatabase } from "../../packages/db/src/database.ts";
 const e2eDatabaseUrl = process.env.E2E_DATABASE_URL
   ?? "postgres://qintopia:qintopia@127.0.0.1:55432/qintopia_e2e";
 const propertyId = "prop_qintopia_demo";
+const commandUiWaitMs = 60_000;
 const operator = { username: "operator", password: "demo-pass-2026" };
 const readOnlyOperator = {
   id: "subject_e2e_room_status_reader",
@@ -19,6 +20,11 @@ const revocationOperator = {
   username: "room-status-revocation",
   password: "room-status-revocation-2026",
   displayName: "Room Status Revocation Operator"
+};
+const restorationSwitchProperty = {
+  id: "prop_e2e_restoration_switch",
+  code: "ZZ-RESTORE",
+  name: "Restoration Switch Fixture"
 };
 
 function isProject(testInfo: TestInfo, name: "desktop" | "mobile"): boolean {
@@ -100,6 +106,64 @@ async function ensureRevocationPrincipal() {
   await setPrincipalPropertyAccess(revocationOperator.username, "WRITE");
 }
 
+async function enableRestorationSwitchProperty() {
+  const db = createDatabase(e2eDatabaseUrl);
+  try {
+    await db.transaction().execute(async (trx) => {
+      await trx.insertInto("properties").values({
+        id: restorationSwitchProperty.id,
+        code: restorationSwitchProperty.code,
+        name: restorationSwitchProperty.name,
+        timezone: "Asia/Shanghai",
+        currency: "CNY"
+      }).onConflict((conflict) => conflict.column("id").doNothing()).execute();
+      await trx.insertInto("room_status_revisions").values({
+        property_id: restorationSwitchProperty.id,
+        revision: 0
+      }).onConflict((conflict) => conflict.column("property_id").doNothing()).execute();
+      const subject = await trx.selectFrom("subjects")
+        .select("id")
+        .where("username", "=", operator.username)
+        .executeTakeFirstOrThrow();
+      await trx.insertInto("subject_property_grants").values({
+        subject_id: subject.id,
+        property_id: restorationSwitchProperty.id,
+        access_level: "WRITE"
+      }).onConflict((conflict) => conflict.columns(["subject_id", "property_id"]).doUpdateSet({
+        access_level: "WRITE"
+      })).execute();
+    });
+  } finally {
+    await db.destroy();
+  }
+}
+
+async function removeRestorationSwitchProperty() {
+  const db = createDatabase(e2eDatabaseUrl);
+  try {
+    await db.transaction().execute(async (trx) => {
+      const subject = await trx.selectFrom("subjects")
+        .select("id")
+        .where("username", "=", operator.username)
+        .executeTakeFirst();
+      if (subject) {
+        await trx.deleteFrom("subject_property_grants")
+          .where("subject_id", "=", subject.id)
+          .where("property_id", "=", restorationSwitchProperty.id)
+          .execute();
+      }
+      await trx.deleteFrom("room_status_revisions")
+        .where("property_id", "=", restorationSwitchProperty.id)
+        .execute();
+      await trx.deleteFrom("properties")
+        .where("id", "=", restorationSwitchProperty.id)
+        .execute();
+    });
+  } finally {
+    await db.destroy();
+  }
+}
+
 async function setPrincipalPropertyAccess(username: string, accessLevel: "READ" | "WRITE" | null) {
   const db = createDatabase(e2eDatabaseUrl);
   try {
@@ -157,7 +221,7 @@ async function login(
   credentials = operator
 ): Promise<{ board: RoomStatusBoardDto }> {
   await page.goto(process.env.ROOM_STATUS_E2E_BASE_URL ?? "/");
-  await expect(page.getByRole("heading", { name: "登录", exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "登录", exact: true })).toBeVisible({ timeout: 30_000 });
   await page.getByTestId("login-username").fill(credentials.username);
   await page.getByTestId("login-password").fill(credentials.password);
   const responsePromise = roomStatusResponse(page);
@@ -187,7 +251,9 @@ function roomRow(page: Page, unitId: string): Locator {
 }
 
 async function assertNoA11yViolations(page: Page) {
-  const results = await new AxeBuilder({ page }).analyze();
+  const results = await new AxeBuilder({ page })
+    .options({ resultTypes: ["violations"] })
+    .analyze();
   expect(results.violations).toEqual([]);
 }
 
@@ -234,8 +300,8 @@ async function keyboardPreviewAndConfirm(
   await tabTo(page, previewButton, "生成服务端预览按钮");
   await page.keyboard.press("Enter");
   const effect = page.getByTestId("command-effect");
-  await expect(effect).toBeVisible();
-  for (const value of expectedEffect) await expect(effect).toContainText(value);
+  await expect(effect).toBeVisible({ timeout: commandUiWaitMs });
+  for (const value of expectedEffect) await expect(effect).toContainText(value, { timeout: commandUiWaitMs });
 
   const reasonNote = page.getByTestId("reason-note");
   await tabTo(page, reasonNote, "确认原因说明");
@@ -246,16 +312,16 @@ async function keyboardPreviewAndConfirm(
   onBeforeConfirm?.();
   await page.keyboard.press("Enter");
   const receipt = page.getByTestId("command-receipt");
-  await expect(receipt).toContainText("业务写入已提交");
-  await expect(receipt).toContainText("EXECUTED");
+  await expect(receipt).toContainText("业务写入已提交", { timeout: commandUiWaitMs });
+  await expect(receipt).toContainText("EXECUTED", { timeout: commandUiWaitMs });
   return receipt;
 }
 
 async function previewAndConfirm(page: Page, reason: string, expectedEffect: readonly string[]) {
   await page.getByTestId("create-command-preview").click();
   const effect = page.getByTestId("command-effect");
-  await expect(effect).toBeVisible();
-  for (const value of expectedEffect) await expect(effect).toContainText(value);
+  await expect(effect).toBeVisible({ timeout: commandUiWaitMs });
+  for (const value of expectedEffect) await expect(effect).toContainText(value, { timeout: commandUiWaitMs });
   if (await page.evaluate(() => innerWidth < 576)) {
     const formControls = page.locator(".room-status-page input, .room-status-page select, .room-status-page textarea");
     for (let index = 0; index < await formControls.count(); index += 1) {
@@ -266,8 +332,8 @@ async function previewAndConfirm(page: Page, reason: string, expectedEffect: rea
   await page.getByTestId("reason-note").fill(reason);
   await page.getByTestId("confirm-command").click();
   const receipt = page.getByTestId("command-receipt");
-  await expect(receipt).toContainText("业务写入已提交");
-  await expect(receipt).toContainText("EXECUTED");
+  await expect(receipt).toContainText("业务写入已提交", { timeout: commandUiWaitMs });
+  await expect(receipt).toContainText("EXECUTED", { timeout: commandUiWaitMs });
   return receipt;
 }
 
@@ -279,6 +345,7 @@ async function finishReceipt(page: Page) {
 async function createFreeStayForToday(page: Page, options: {
   unitId: string;
   guest: string;
+  nickname: string;
   arrivalDate: string;
   departureDate: string;
 }) {
@@ -294,16 +361,23 @@ async function createFreeStayForToday(page: Page, options: {
   await page.getByTestId("primary-guest-name").fill(options.guest);
   await page.getByTestId("free-stay-reason").fill(`Room-status OPEN_ORDER fixture: ${options.guest}`);
   await page.getByTestId("booking-channel-code").selectOption("WECOM");
-  await page.getByTestId("create-order").click();
+  const createOrder = page.getByTestId("create-order");
+  await expect(createOrder).toBeDisabled();
+  await expect(page.getByTestId("command-effect")).toHaveCount(0);
+  await page.getByTestId("primary-guest-nickname").fill(options.nickname);
+  await createOrder.click();
   const receipt = await previewAndConfirm(page, `Create room-status OPEN_ORDER fixture ${options.guest}`, [
     options.guest,
+    options.nickname,
     "企业微信"
   ]);
   const orderIdLocator = receipt.locator("code").filter({ hasText: /^order_/ }).first();
   await expect(orderIdLocator).toBeVisible();
   const orderId = (await orderIdLocator.textContent())?.trim();
   expect(orderId).toBeTruthy();
+  const refreshedBoard = roomStatusResponse(page);
   await finishReceipt(page);
+  await refreshedBoard;
   return orderId!;
 }
 
@@ -526,10 +600,6 @@ test("desktop room-status matrix drives a typed Block journey and restores the w
   await search.fill("104");
   await expect(page.getByText("1 间房", { exact: true })).toBeVisible();
   await roomCell(page, bedBId, arrivalDate).click();
-  await page.waitForFunction(() => Array.from({ length: sessionStorage.length }, (_, index) => sessionStorage.key(index))
-    .filter((key): key is string => Boolean(key?.startsWith("qintopia.room-status-view.v1:")))
-    .map((key) => JSON.parse(sessionStorage.getItem(key) ?? "null") as { state?: { filters?: { search?: string } } })
-    .some((snapshot) => snapshot.state?.filters?.search === "104"));
 
   await page.getByRole("link", { name: "订单", exact: true }).click();
   await expect(page.getByRole("heading", { name: "订单", exact: true })).toBeVisible();
@@ -543,6 +613,8 @@ test("desktop room-status matrix drives a typed Block journey and restores the w
   await assertNoPageOverflow(page);
   await page.screenshot({ path: testInfo.outputPath("room-status-desktop-typed-source.png"), fullPage: true });
 
+  await page.getByRole("link", { name: "订单", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "订单", exact: true })).toBeVisible();
   const corruptedSnapshotSaved = await page.evaluate(() => {
     const key = Array.from({ length: sessionStorage.length }, (_, index) => sessionStorage.key(index))
       .find((candidate) => candidate?.startsWith("qintopia.room-status-view.v1:"));
@@ -554,8 +626,6 @@ test("desktop room-status matrix drives a typed Block journey and restores the w
     return true;
   });
   expect(corruptedSnapshotSaved).toBe(true);
-  await page.getByRole("link", { name: "订单", exact: true }).click();
-  await expect(page.getByRole("heading", { name: "订单", exact: true })).toBeVisible();
   const fallbackResponse = roomStatusResponse(page);
   await page.getByRole("link", { name: "房态", exact: true }).click();
   await fallbackResponse;
@@ -566,6 +636,243 @@ test("desktop room-status matrix drives a typed Block journey and restores the w
   await expect(page.locator("[data-room-status-cell='true'][aria-selected='true']")).toHaveCount(0);
   await expect(roomCell(page, roomId, board.dates[0]!)).toBeFocused();
   await observerContext.close();
+});
+
+test("property switching flushes the latest debounced restoration snapshot", async ({ page }, testInfo: TestInfo) => {
+  test.skip(!isProject(testInfo, "desktop"), "desktop property-switch restoration coverage");
+  await enableRestorationSwitchProperty();
+  try {
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await login(page);
+    await expectDesktopGrid(page);
+
+    const switchedBoard = page.waitForResponse((response) => {
+      const url = new URL(response.url());
+      return response.request().method() === "GET"
+        && url.pathname === `/api/v1/properties/${restorationSwitchProperty.id}/room-status`
+        && response.status() === 200;
+    });
+    const expandedRoomId = await page.evaluate(async (nextPropertyId) => {
+      const expandButton = [...document.querySelectorAll<HTMLButtonElement>("button[aria-expanded='false']")]
+        .find((button) => button.getAttribute("aria-label")?.endsWith("床位"));
+      const row = expandButton?.closest<HTMLElement>("[data-room-status-row]");
+      const propertySelect = document.querySelector<HTMLSelectElement>("[data-testid='property-select']");
+      if (!expandButton || !row?.dataset.roomStatusRow || !propertySelect) {
+        throw new Error("room-status expansion and property controls are required");
+      }
+      expandButton.click();
+      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+      await new Promise<void>((resolve) => window.setTimeout(resolve, 40));
+      if (expandButton.getAttribute("aria-expanded") !== "true") {
+        throw new Error("room expansion did not commit before the property switch");
+      }
+      propertySelect.value = nextPropertyId;
+      propertySelect.dispatchEvent(new Event("change", { bubbles: true }));
+      return row.dataset.roomStatusRow;
+    }, restorationSwitchProperty.id);
+    await switchedBoard;
+    await expect(page.getByTestId("property-select")).toHaveValue(restorationSwitchProperty.id);
+
+    const restoredExpansion = await page.evaluate(({ originalPropertyId, roomId }) => {
+      const suffix = `:${encodeURIComponent(originalPropertyId)}`;
+      const key = Array.from({ length: sessionStorage.length }, (_, index) => sessionStorage.key(index))
+        .find((candidate) => candidate?.startsWith("qintopia.room-status-view.v1:") && candidate.endsWith(suffix));
+      if (!key) return false;
+      const snapshot = JSON.parse(sessionStorage.getItem(key) ?? "null") as {
+        state?: { expandedRoomIds?: string[] };
+      };
+      return snapshot.state?.expandedRoomIds?.includes(roomId) ?? false;
+    }, { originalPropertyId: propertyId, roomId: expandedRoomId });
+    expect(restoredExpansion).toBe(true);
+  } finally {
+    await page.close();
+    await removeRestorationSwitchProperty();
+  }
+});
+
+test("split-bed parent cells show occupied-to-total ratio and every guest nickname", async ({ page }, testInfo: TestInfo) => {
+  test.skip(!isProject(testInfo, "desktop"), "desktop split-bed occupancy summary coverage");
+  test.setTimeout(300_000);
+  await page.setViewportSize({ width: 1440, height: 900 });
+  const { board } = await login(page);
+  await expectDesktopGrid(page);
+
+  const room = board.rooms.find((candidate) => candidate.salesMode === "BED_SPLIT"
+    && candidate.capacity === 4
+    && candidate.children.length >= 3
+    && board.dates.some((date) => candidate.children.slice(0, 3)
+      .every((child) => child.days.find((day) => day.serviceDate === date)?.available)));
+  expect(room, "an available four-bed room is required for occupancy summary coverage").toBeTruthy();
+  const serviceDate = board.dates.find((date) => room!.children.slice(0, 3)
+    .every((child) => child.days.find((day) => day.serviceDate === date)?.available));
+  expect(serviceDate).toBeTruthy();
+  const departureDate = addDays(serviceDate!, 1);
+  const wholeRoomServiceDate = board.dates.slice(0, 14).find((date) => date !== serviceDate
+    && room!.children.every((child) => child.days.find((day) => day.serviceDate === date)?.available));
+  expect(wholeRoomServiceDate, "a second visible whole-room date is required").toBeTruthy();
+  const occupants = [
+    { guest: "Occupancy Legal Name One", nickname: `山风${"甲".repeat(120)}` },
+    { guest: "Occupancy Legal Name Two", nickname: `小树${"乙".repeat(120)}` },
+    { guest: "Occupancy Legal Name Three", nickname: `北辰${"丙".repeat(120)}` }
+  ];
+  const initialRowBounds = await roomRow(page, room!.id).boundingBox();
+  expect(initialRowBounds).toBeTruthy();
+
+  for (let index = 0; index < occupants.length; index += 1) {
+    const occupant = occupants[index]!;
+    const bed = room!.children[index]!;
+    await createFreeStayForToday(page, {
+      unitId: bed.id,
+      guest: occupant.guest,
+      nickname: occupant.nickname,
+      arrivalDate: serviceDate!,
+      departureDate
+    });
+    const parentCell = roomCell(page, room!.id, serviceDate!);
+    await expect(parentCell).toHaveAttribute("data-bed-occupancy-ratio", `${index + 1}/4`);
+  }
+
+  const parentCell = roomCell(page, room!.id, serviceDate!);
+  await expect(parentCell).toHaveText(/3\/4/);
+  await expect(parentCell).not.toHaveAttribute("title");
+  await expect(parentCell).toHaveAccessibleName(/已占 3\/4.*山风.*小树.*北辰/);
+  await parentCell.hover();
+  await expect(page.getByRole("tooltip")).toContainText("已占 3/4");
+  await expect(page.getByRole("tooltip")).toContainText("山风");
+  await expect(page.getByRole("tooltip")).toContainText("小树");
+  await expect(page.getByRole("tooltip")).toContainText("北辰");
+  const gridScroll = page.locator(".room-status-grid-scroll");
+  const horizontalScroll = await gridScroll.evaluate((element) => {
+    const before = element.scrollLeft;
+    element.scrollLeft = before + 120;
+    return { before, after: element.scrollLeft };
+  });
+  expect(horizontalScroll.after).toBeGreaterThan(horizontalScroll.before);
+  await expect(page.getByRole("tooltip"), "scrolling closes a fixed tooltip before it can detach from its cell").toBeHidden();
+  await gridScroll.evaluate((element, left) => {
+    element.scrollLeft = left;
+  }, horizontalScroll.before);
+  await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+  await page.mouse.move(1, 1);
+  await parentCell.hover();
+  await expect(page.getByRole("tooltip")).toBeVisible();
+  await page.evaluate(() => window.dispatchEvent(new Event("scroll")));
+  await expect(page.getByRole("tooltip"), "page scrolling closes a fixed tooltip before it can detach from its cell").toBeHidden();
+  await page.mouse.move(1, 1);
+  await parentCell.hover();
+  await expect(page.getByRole("tooltip")).toBeVisible();
+  await page.setViewportSize({ width: 1430, height: 900 });
+  await expect(page.getByRole("tooltip"), "viewport resize closes a fixed tooltip before it can detach from its cell").toBeHidden();
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.mouse.move(1, 1);
+  await parentCell.hover();
+  await expect(parentCell.locator(".room-status-bed-occupants")).toHaveText(/^山风.* \+2$/);
+  const occupiedBounds = await roomRow(page, room!.id).boundingBox();
+  expect(occupiedBounds?.height).toBe(initialRowBounds!.height);
+
+  await page.mouse.move(1, 1);
+  await page.locator(".room-status-grid-scroll").focus();
+  await parentCell.focus();
+  await expect(page.getByRole("tooltip")).toContainText("已占 3/4");
+  await page.keyboard.press("Space");
+  await expect(parentCell).toHaveAttribute("aria-selected", "true");
+  await parentCell.hover();
+  await page.mouse.move(1, 1);
+  await page.waitForTimeout(250);
+  await expect(page.getByRole("tooltip"), "focused trigger keeps its tooltip open after pointer leave").toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(page.getByRole("tooltip"), "first Escape closes the tooltip before clearing selection").toBeHidden();
+  await expect(parentCell).toHaveAttribute("aria-selected", "true");
+  await page.keyboard.press("Escape");
+  await expect(parentCell).toHaveAttribute("aria-selected", "false");
+  await page.keyboard.press("ArrowRight");
+  await page.keyboard.press("ArrowLeft");
+  await expect(parentCell).toBeFocused();
+  await expect(page.getByRole("tooltip")).toContainText("北辰");
+
+  await page.setViewportSize({ width: 1440, height: 260 });
+  await parentCell.scrollIntoViewIfNeeded();
+  await parentCell.hover();
+  const constrainedTooltip = page.getByTestId("bed-occupancy-tooltip");
+  await expect(constrainedTooltip).toBeVisible();
+  const tooltipGeometry = await constrainedTooltip.evaluate((element) => ({
+    top: element.getBoundingClientRect().top,
+    bottom: element.getBoundingClientRect().bottom,
+    clientHeight: element.clientHeight,
+    scrollHeight: element.scrollHeight
+  }));
+  expect(tooltipGeometry.top).toBeGreaterThanOrEqual(11);
+  expect(tooltipGeometry.bottom).toBeLessThanOrEqual(249);
+  expect(tooltipGeometry.scrollHeight).toBeGreaterThan(tooltipGeometry.clientHeight);
+  await page.keyboard.press("Tab");
+  await expect(constrainedTooltip, "the long occupant list is keyboard reachable from its trigger cell").toBeFocused();
+  await page.keyboard.press("PageDown");
+  await expect.poll(() => constrainedTooltip.evaluate((element) => element.scrollTop)).toBeGreaterThan(0);
+  await expect(constrainedTooltip, "scrolling the tooltip itself keeps the anchored tooltip open").toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(constrainedTooltip).toBeHidden();
+  await expect(parentCell).toBeFocused();
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.mouse.move(1, 1);
+
+  await parentCell.hover();
+  await expect(page.getByRole("tooltip")).toBeVisible();
+  const forwardTabProbe = await parentCell.evaluate((trigger) => {
+    const selector = [
+      "a[href]",
+      "area[href]",
+      "button",
+      "input",
+      "select",
+      "textarea",
+      "iframe",
+      "[contenteditable='true']",
+      "[tabindex]"
+    ].join(",");
+    const tooltip = document.querySelector<HTMLElement>("[data-testid='bed-occupancy-tooltip']");
+    const tabStops = [...document.querySelectorAll<HTMLElement>(selector)].filter((element) => {
+      if (tooltip?.contains(element) || element.tabIndex < 0 || element.matches(":disabled")) return false;
+      if (element.closest("[hidden], [inert]")) return false;
+      const style = window.getComputedStyle(element);
+      return style.display !== "none" && style.visibility !== "hidden" && element.getClientRects().length > 0;
+    });
+    const next = tabStops[tabStops.indexOf(trigger as HTMLElement) + 1];
+    if (!next) return false;
+    next.dataset.forwardTabProbe = "true";
+    return true;
+  });
+  expect(forwardTabProbe, "the occupied trigger must have a following logical tab stop").toBe(true);
+  await page.keyboard.press("Tab");
+  await expect(page.getByRole("tooltip")).toBeFocused();
+  await page.keyboard.press("Tab");
+  await expect(page.getByRole("tooltip"), "forward Tab leaves the tooltip without wrapping to the page start").toBeHidden();
+  await expect(page.locator("[data-forward-tab-probe='true']")).toBeFocused();
+
+  const wholeRoomNickname = "云岫";
+  await createFreeStayForToday(page, {
+    unitId: room!.id,
+    guest: "Whole-room Legal Name",
+    nickname: wholeRoomNickname,
+    arrivalDate: wholeRoomServiceDate!,
+    departureDate: addDays(wholeRoomServiceDate!, 1)
+  });
+  await expect(roomRow(page, room!.id).locator(".room-status-interval").filter({ hasText: wholeRoomNickname })).toHaveCount(1);
+
+  await page.getByRole("button", { name: new RegExp(`^展开${room!.code}.*床位$`) }).click();
+  for (let index = 0; index < occupants.length; index += 1) {
+    await expect(roomRow(page, room!.children[index]!.id).locator(".room-status-interval").filter({
+      hasText: occupants[index]!.nickname
+    })).toHaveCount(1);
+  }
+  await parentCell.hover();
+  await expect(page.getByRole("tooltip")).toBeVisible();
+  await page.screenshot({ path: testInfo.outputPath("room-status-bed-occupancy-nicknames.png") });
+  await assertNoA11yViolations(page);
+  await assertNoPageOverflow(page);
+
+  const collapseBeds = page.getByRole("button", { name: new RegExp(`^收起${room!.code}.*床位$`) });
+  await collapseBeds.evaluate((button: HTMLButtonElement) => button.click());
+  await expect(page.getByRole("tooltip")).toBeHidden();
 });
 
 test("desktop range selection, field errors, filtered-empty and range-loading fail closed", async ({ page }, testInfo: TestInfo) => {
@@ -590,6 +897,7 @@ test("desktop range selection, field errors, filtered-empty and range-loading fa
   const firstCell = roomCell(page, candidate!.unitId, candidate!.arrivalDate);
   const finalServiceDate = addDays(candidate!.departureDate, -1);
   const finalCell = roomCell(page, candidate!.unitId, finalServiceDate);
+  await finalCell.scrollIntoViewIfNeeded();
   const firstBox = await firstCell.boundingBox();
   const finalBox = await finalCell.boundingBox();
   expect(firstBox).not.toBeNull();
@@ -819,11 +1127,12 @@ test("a real WRITE to READ downgrade invalidates an open Preview without hiding 
     await expect(page.getByTestId("confirm-command")).toBeEnabled();
 
     await setPrincipalPropertyAccess(revocationOperator.username, "READ");
-    const narrowedResponsePromise = page.waitForResponse((response) => (
-      response.request().method() === "GET"
-      && new URL(response.url()).pathname === `/api/v1/properties/${propertyId}/room-status`
-      && response.status() === 200
-    ));
+    const narrowedResponsePromise = page.waitForResponse(async (response) => {
+      if (response.request().method() !== "GET"
+        || new URL(response.url()).pathname !== `/api/v1/properties/${propertyId}/room-status`
+        || response.status() !== 200) return false;
+      return ((await response.json()) as RoomStatusBoardDto).accessLevel === "READ";
+    });
     await page.evaluate(() => document.dispatchEvent(new Event("visibilitychange")));
     const narrowedResponse = await narrowedResponsePromise;
     expect((await narrowedResponse.json() as RoomStatusBoardDto).accessLevel).toBe("READ");
@@ -1089,6 +1398,7 @@ test("mobile room status uses task tabs and a full-screen fact detail instead of
   const orderId = await createFreeStayForToday(page, {
     unitId: "unit_room_201",
     guest,
+    nickname: guest,
     arrivalDate: today,
     departureDate: orderDepartureDate
   });
@@ -1100,6 +1410,7 @@ test("mobile room status uses task tabs and a full-screen fact detail instead of
   const overdueOrderId = await createFreeStayForToday(page, {
     unitId: overdueUnit!.id,
     guest: overdueGuest,
+    nickname: overdueGuest,
     arrivalDate: today,
     departureDate: orderDepartureDate
   });

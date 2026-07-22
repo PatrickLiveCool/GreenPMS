@@ -398,6 +398,20 @@ export interface RoomStatusOperationalTaskDto extends RoomStatusIntervalDto {
   businessDate: string;
 }
 
+export interface RoomStatusBedOccupantDto {
+  inventoryUnitId: string;
+  inventoryUnitCode: string;
+  primaryOccupantLabel: string | null;
+  sourceReference: RoomStatusReferenceDto & { type: "ORDER" };
+}
+
+export interface RoomStatusBedOccupancyDto {
+  serviceDate: string;
+  occupiedBedCount: number;
+  totalBedCount: number;
+  occupants: RoomStatusBedOccupantDto[];
+}
+
 export interface RoomStatusUnitDto {
   id: string;
   propertyId: string;
@@ -414,6 +428,7 @@ export interface RoomStatusUnitDto {
   capacity: number;
   childUnitIds: string[];
   children: RoomStatusUnitDto[];
+  bedOccupancies: RoomStatusBedOccupancyDto[];
   days: RoomStatusDayDto[];
   intervals: RoomStatusIntervalDto[];
   conflicts: RoomStatusConflictDto[];
@@ -535,6 +550,28 @@ export interface AuthPrincipal {
 export interface CommandEnvelope {
   commandType: CommandType;
   input: Record<string, unknown>;
+}
+
+export interface PrimaryGuestSnapshotDto {
+  fullName: string;
+  nickname?: string | null;
+  phone?: string;
+  documentNumber?: string;
+}
+
+export interface CreateOrderPrimaryGuestInputDto extends PrimaryGuestSnapshotDto {
+  nickname: string;
+}
+
+export interface CreateOrderResultDto {
+  orderId: string;
+  stayId: string;
+  segmentId: string;
+  pricingRevisionId: string;
+  primaryGuest: PrimaryGuestSnapshotDto | null;
+  bookingChannelCode: BookingChannelCode | null;
+  channelOrderReference: string | null;
+  freeStayReason: string | null;
 }
 
 export interface CreateMemberInput {

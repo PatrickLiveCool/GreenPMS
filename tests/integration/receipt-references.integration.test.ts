@@ -62,7 +62,7 @@ async function createMemberOrder(prefix: string, arrivalDate: string, departureD
     input: {
       propertyId: demo.propertyId,
       quoteId: quote.quoteId,
-      primaryGuest: { fullName: `Receipt reference guest ${prefix}` },
+      primaryGuest: { fullName: `Receipt reference guest ${prefix}`, nickname: `Receipt ${prefix}` },
       bookingChannelCode: "MEITUAN",
       channelOrderReference: `TEST-RECEIPT-ORDER-${prefix}`
     }

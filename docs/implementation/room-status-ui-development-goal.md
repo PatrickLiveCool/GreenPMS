@@ -96,9 +96,9 @@ companions:
 
 ### RS-UI-002: Room And Bed Hierarchy
 
-**Requirement:** 房间父行始终存在。整房销售期间不显示可选择床位；拆床销售期间可展开具有稳定 ID 的床位子行。父行明确显示整房、拆床、不可售或锁定销售模式。
+**Requirement:** 房间父行始终存在。整房销售期间不显示可选择床位；拆床销售期间可展开具有稳定 ID 的床位子行。父行明确显示整房、拆床、不可售或锁定销售模式。拆床销售房间的逐日父格显示由服务端提供的 `已占床位数/实体床位总数`；分子是当天被有效正常订单或 `FREE_STAY` 住宿事实占用的不同子床，不包含维修/锁房、`INTERNAL_USE`、清洁或其他无居住人来源。
 
-**Acceptance:** 整房占用与所有子床位双向互斥；单个床位占用只占用该床位，但会阻断父房间的整房销售；不同兄弟床位可以同时占用。UI 仅渲染服务端 availability/conflict 结果。
+**Acceptance:** 整房占用与所有子床位双向互斥；单个床位占用只占用该床位，但会阻断父房间的整房销售；不同兄弟床位可以同时占用。四人间三个子床存在有效住宿事实时父格显示 `3/4`，其中分子统一表示“已占”；维修或内部占用不得把比例增加为住客占用。UI 仅渲染服务端 availability/conflict 和 occupancy aggregation 结果。
 
 ### RS-UI-003: Read-Only Composite Projection
 
@@ -144,6 +144,8 @@ companions:
 **Requirement:** 打开单元、条带或选区后，显示目标单元、半开日期、availability、typed source、Order/Stay 引用、`asOf`、freshness、精确冲突、历史、actor/source/time 和 Receipt 链接。
 
 **Acceptance:** 无权读取的来源使用安全 redaction，不泄露对象存在性或个人信息；页面不得根据当前可见条带自行补算冲突或可售。
+
+父房格空间允许时优先直接显示主要居住人快照昵称；空间不足时至少保留 `已占/总床数`。鼠标悬停和键盘聚焦必须以 Tooltip 或等价可访问详情展示该格全部有权查看的居住人昵称，不能只依赖视觉截断文本或鼠标。
 
 ### RS-UI-008: Action Routing
 
@@ -257,7 +259,7 @@ Draft + Reason
 - 页面有唯一 H1、landmark、skip link 和逻辑标题层级；
 - 房态、筛选、选区、详情、Preview、Confirm 和 Receipt 可以只用键盘完成；
 - `focus-visible` 不被 sticky、overflow、抽屉或固定栏裁切；
-- 房态格 accessible name 包含房间/床位、日期、状态和获权对象；
+- 房态格 accessible name 包含房间/床位、日期、状态和获权对象；拆床父房格还包含 `已占/总床数` 及全部有权查看的居住人昵称；
 - 行、列和父子层级具有正确的语义或等价说明；
 - 拖选有房源和日期输入替代；
 - 表单 Label、错误摘要和字段错误正确关联；

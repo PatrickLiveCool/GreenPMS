@@ -132,13 +132,40 @@ export const WriteHeaders = Type.Object({
   "x-correlation-id": Type.String({ minLength: 1, maxLength: 160 })
 }, { additionalProperties: true });
 
-const PrimaryGuestSchema = strictObject({
+const Nickname = Type.String({ minLength: 1, maxLength: 200, pattern: "\\S" });
+const PrimaryGuestInputSchema = strictObject({
   fullName: Type.String({ minLength: 1, maxLength: 200 }),
+  nickname: Nickname,
+  phone: Type.Optional(Type.String({ minLength: 1, maxLength: 80 })),
+  documentNumber: Type.Optional(Type.String({ minLength: 1, maxLength: 120 }))
+});
+const PrimaryGuestSnapshotSchema = strictObject({
+  fullName: Type.String({ minLength: 1, maxLength: 200 }),
+  nickname: Type.Optional(nullable(Nickname)),
   phone: Type.Optional(Type.String({ minLength: 1, maxLength: 80 })),
   documentNumber: Type.Optional(Type.String({ minLength: 1, maxLength: 120 }))
 });
 const PropertyInput = { propertyId: Id };
 const OrderInput = { ...PropertyInput, orderId: Id };
+
+// Read-only compatibility gate for exact replays persisted before nickname became required.
+// This schema is never published as the command input contract.
+export const HistoricalCreateOrderReplayEnvelopeSchema = strictObject({
+  commandType: Type.Literal("CREATE_ORDER"),
+  input: strictObject({
+    ...PropertyInput,
+    quoteId: Id,
+    primaryGuest: strictObject({
+      fullName: Type.String({ minLength: 1, maxLength: 200 }),
+      phone: Type.Optional(Type.String({ minLength: 1, maxLength: 80 })),
+      documentNumber: Type.Optional(Type.String({ minLength: 1, maxLength: 120 }))
+    }),
+    bookingChannelCode: BookingChannelCodeSchema,
+    channelOrderReference: Type.Optional(nullable(ShortText)),
+    freeStayReason: Type.Optional(Note)
+  })
+});
+
 export const CommandEnvelopeSchema = Type.Union([
   commandEnvelope("CREATE_MEMBER", strictObject({
     ...PropertyInput,
@@ -154,7 +181,7 @@ export const CommandEnvelopeSchema = Type.Union([
   commandEnvelope("CREATE_ORDER", strictObject({
     ...PropertyInput,
     quoteId: Id,
-    primaryGuest: PrimaryGuestSchema,
+    primaryGuest: PrimaryGuestInputSchema,
     bookingChannelCode: BookingChannelCodeSchema,
     channelOrderReference: Type.Optional(nullable(ShortText)),
     freeStayReason: Type.Optional(Note)
@@ -294,7 +321,7 @@ export const CommandEffectSchema = Type.Union([
   }),
   strictObject({
     quoteId: Id,
-    primaryGuest: PrimaryGuestSchema,
+    primaryGuest: PrimaryGuestSnapshotSchema,
     bookingChannelCode: nullable(BookingChannelCodeSchema),
     channelOrderReference: nullable(ShortText),
     freeStayReason: nullable(Note),
@@ -424,6 +451,7 @@ const CreateOrderResultSchema = strictObject({
   stayId: Id,
   segmentId: Id,
   pricingRevisionId: Id,
+  primaryGuest: nullable(PrimaryGuestSnapshotSchema),
   bookingChannelCode: nullable(BookingChannelCodeSchema),
   channelOrderReference: nullable(ShortText),
   freeStayReason: nullable(Note)
@@ -689,6 +717,23 @@ export const RoomStatusDaySchema = strictObject({
   intervalIds: Type.Array(Id),
   conflicts: Type.Array(RoomStatusConflictSchema)
 });
+export const RoomStatusBedOccupantSchema = strictObject({
+  inventoryUnitId: Id,
+  inventoryUnitCode: RoomStatusDisplayText,
+  primaryOccupantLabel: nullable(ShortText),
+  sourceReference: strictObject({
+    type: Type.Literal("ORDER"),
+    id: Id,
+    label: RoomStatusDisplayText,
+    href: nullable(Type.String({ minLength: 1, maxLength: 500 }))
+  })
+});
+export const RoomStatusBedOccupancySchema = strictObject({
+  serviceDate: LocalDate,
+  occupiedBedCount: Type.Integer({ minimum: 1 }),
+  totalBedCount: Type.Integer({ minimum: 1 }),
+  occupants: Type.Array(RoomStatusBedOccupantSchema, { minItems: 1 })
+});
 const RoomStatusUnitBase = {
   id: Id,
   propertyId: Id,
@@ -702,6 +747,7 @@ const RoomStatusUnitBase = {
   pricingProductCode: nullable(ShortText),
   capacity: Type.Integer({ minimum: 1 }),
   childUnitIds: Type.Array(Id),
+  bedOccupancies: Type.Array(RoomStatusBedOccupancySchema),
   days: Type.Array(RoomStatusDaySchema),
   intervals: Type.Array(RoomStatusIntervalSchema),
   conflicts: Type.Array(RoomStatusConflictSchema),
@@ -935,7 +981,7 @@ export const OrderRowSchema = strictObject({
   stay_type: StayTypeSchema,
   arrival_date: LocalDate,
   departure_date: LocalDate,
-  primary_guest_snapshot: PrimaryGuestSchema,
+  primary_guest_snapshot: PrimaryGuestSnapshotSchema,
   booking_channel_code: nullable(BookingChannelCodeSchema),
   channel_order_reference: nullable(ShortText),
   free_stay_reason: nullable(Note),
@@ -958,6 +1004,7 @@ const CreateOrderAmendmentPayloadSchema = strictObject({
   inventoryUnitId: Id,
   arrivalDate: LocalDate,
   departureDate: LocalDate,
+  primaryGuest: Type.Optional(PrimaryGuestSnapshotSchema),
   bookingChannelCode: Type.Optional(BookingChannelCodeSchema),
   channelOrderReference: Type.Optional(nullable(ShortText)),
   freeStayReason: Type.Optional(nullable(Note))

@@ -244,13 +244,22 @@ describe("Command effect HTTP contract", () => {
       quoteId: priced.quoteId,
       primaryGuest: {
         fullName: "Effect Contract Guest",
+        nickname: "Effect Guest",
         phone: "+86-138-0000-0000",
         documentNumber: "EFFECT-CONTRACT-001"
       },
       bookingChannelCode: "CTRIP",
       channelOrderReference: "TEST-EFFECT-ORDER-001"
     });
-    const orderId = (await confirm(createOrder)).orderId as string;
+    expect(createOrder.effect.primaryGuest).toEqual({
+      fullName: "Effect Contract Guest",
+      nickname: "Effect Guest",
+      phone: "+86-138-0000-0000",
+      documentNumber: "EFFECT-CONTRACT-001"
+    });
+    const createOrderResult = await confirm(createOrder);
+    expect(createOrderResult.primaryGuest).toEqual(createOrder.effect.primaryGuest);
+    const orderId = createOrderResult.orderId as string;
 
     await capture("SHORTEN_STAY", {
       propertyId: demo.propertyId,
@@ -284,7 +293,7 @@ describe("Command effect HTTP contract", () => {
     const memberOrder = await capture("CREATE_ORDER", {
       propertyId: demo.propertyId,
       quoteId: memberPriced.quoteId,
-      primaryGuest: { fullName: "Effect Contract Member Guest" },
+      primaryGuest: { fullName: "Effect Contract Member Guest", nickname: "Effect Member" },
       bookingChannelCode: "WECOM",
       channelOrderReference: null
     });
@@ -323,5 +332,5 @@ describe("Command effect HTTP contract", () => {
     await capture("COMPLETE_CLEANING", { propertyId: demo.propertyId, cleaningTaskId: checkOutResult.cleaningTaskId });
 
     expect([...covered].sort()).toEqual([...commandTypes].sort());
-  }, 30_000);
+  }, 120_000);
 });

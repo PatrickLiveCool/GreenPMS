@@ -65,9 +65,9 @@ if [[ ! "$target_oid" =~ ^[0-9]+$ ]]; then
   false
 fi
 docker exec -i "$container" pg_restore -U "$user" -d "$target" --no-owner --no-privileges < "$backup"
-required_migrations="$(docker exec "$container" psql -U "$user" -d "$target" -At -v ON_ERROR_STOP=1 -c "SELECT count(*) FROM schema_migrations WHERE name IN ('001_initial.sql','002_immutability.sql','003_active_coverage_uniqueness.sql','004_security_identity_guards.sql','005_core_identity_and_entitlement_guards.sql','006_property_scoped_idempotency.sql','007_reference_catalog.sql','008_reference_catalog_sealing.sql','009_booking_channels_and_transaction_references.sql','010_qintopia_2026_catalog_pricing_and_free_stays.sql','011_core_fact_shape_guards.sql','012_legacy_demo_inventory_catalog_backfill.sql','013_room_status_operations.sql')")"
-if [[ "$required_migrations" != "13" ]]; then
-  printf 'Restore target %s is missing required migrations (found %s of 13).\n' "$target" "$required_migrations" >&2
+required_migrations="$(docker exec "$container" psql -U "$user" -d "$target" -At -v ON_ERROR_STOP=1 -c "SELECT count(*) FROM schema_migrations WHERE name IN ('001_initial.sql','002_immutability.sql','003_active_coverage_uniqueness.sql','004_security_identity_guards.sql','005_core_identity_and_entitlement_guards.sql','006_property_scoped_idempotency.sql','007_reference_catalog.sql','008_reference_catalog_sealing.sql','009_booking_channels_and_transaction_references.sql','010_qintopia_2026_catalog_pricing_and_free_stays.sql','011_core_fact_shape_guards.sql','012_legacy_demo_inventory_catalog_backfill.sql','013_room_status_operations.sql','014_new_order_primary_guest_nickname.sql')")"
+if [[ "$required_migrations" != "14" ]]; then
+  printf 'Restore target %s is missing required migrations (found %s of 14).\n' "$target" "$required_migrations" >&2
   cleanup_partial_target
   exit 1
 fi

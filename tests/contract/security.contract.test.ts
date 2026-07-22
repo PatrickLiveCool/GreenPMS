@@ -426,7 +426,7 @@ describe("HTTP security contract", () => {
     const flow = await executeCommand(demo.writeToken, "CREATE_ORDER", {
       propertyId: demo.propertyId,
       quoteId: quote.json().quote.quoteId,
-      primaryGuest: { fullName: "Security Recovery Guest" },
+      primaryGuest: { fullName: "Security Recovery Guest", nickname: "Security Recovery" },
       bookingChannelCode: "WECOM",
       channelOrderReference: null
     }, "recovery-order");
@@ -710,7 +710,7 @@ describe("HTTP security contract", () => {
       const created = await executeCommand(options.token, "CREATE_ORDER", {
         propertyId: options.propertyId,
         quoteId: quote.json().quote.quoteId,
-        primaryGuest: { fullName: `Cross-property probe ${options.propertyId}` },
+        primaryGuest: { fullName: `Cross-property probe ${options.propertyId}`, nickname: `Cross ${options.propertyId}` },
         bookingChannelCode: "YOUMUDAO",
         channelOrderReference: `TEST-SECURITY-ORDER-${options.prefix}`
       }, options.prefix);
@@ -1107,7 +1107,7 @@ describe("HTTP security contract", () => {
     const created = await executeCommand(demo.writeToken, "CREATE_ORDER", {
       propertyId: demo.propertyId,
       quoteId: quote.json().quote.quoteId,
-      primaryGuest: { fullName: "Timeline Contract Guest" },
+      primaryGuest: { fullName: "Timeline Contract Guest", nickname: "Timeline Guest" },
       bookingChannelCode: "CTRIP",
       channelOrderReference: "TEST-SECURITY-ORDER-TIMELINE"
     }, "timeline-order");
@@ -1164,7 +1164,7 @@ describe("HTTP security contract", () => {
     const created = await executeCommand(demo.writeToken, "CREATE_ORDER", {
       propertyId: demo.propertyId,
       quoteId: quote.json().quote.quoteId,
-      primaryGuest: { fullName: "Internal Error Contract Guest" },
+      primaryGuest: { fullName: "Internal Error Contract Guest", nickname: "Internal Error" },
       bookingChannelCode: "MEITUAN",
       channelOrderReference: "TEST-SECURITY-ORDER-INTERNAL-ERROR"
     }, "internal-error-order");

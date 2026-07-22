@@ -403,8 +403,15 @@ export async function buildCommandEffect(db: DbExecutor, commandType: CommandTyp
 
   if (commandType === "CREATE_ORDER") {
     const quoteId = requireString(input, "quoteId");
-    const guest = requireObject(input.primaryGuest, "primaryGuest");
-    requireString(guest, "fullName");
+    const submittedGuest = requireObject(input.primaryGuest, "primaryGuest");
+    const phone = optionalString(submittedGuest, "phone");
+    const documentNumber = optionalString(submittedGuest, "documentNumber");
+    const guest = {
+      fullName: requireString(submittedGuest, "fullName"),
+      nickname: requireString(submittedGuest, "nickname"),
+      ...(phone ? { phone } : {}),
+      ...(documentNumber ? { documentNumber } : {})
+    };
     const { bookingChannelCode, channelOrderReference } = validateBookingChannel(
       input.bookingChannelCode,
       input.channelOrderReference
@@ -946,10 +953,16 @@ export function inventoryKindFromEffect(effect: Record<string, unknown>): Invent
   return kind === "ROOM" || kind === "BED" ? kind : undefined;
 }
 
+export function projectPrimaryGuestForRead(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  return { ...(value as Record<string, unknown>) };
+}
+
 export function projectCommandEffectForRead(commandType: string, effect: Record<string, unknown>): Record<string, unknown> {
   if (commandType === "CREATE_ORDER") {
     return {
       ...effect,
+      primaryGuest: projectPrimaryGuestForRead(effect.primaryGuest),
       bookingChannelCode: Object.hasOwn(effect, "bookingChannelCode") ? effect.bookingChannelCode : null,
       channelOrderReference: Object.hasOwn(effect, "channelOrderReference") ? effect.channelOrderReference : null,
       freeStayReason: Object.hasOwn(effect, "freeStayReason") ? effect.freeStayReason : null

@@ -1,13 +1,15 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
+import type { Kysely } from "kysely";
 import { commandTypes, recoverableCommandTypes } from "@qintopia/contracts";
-import { newOpaqueSecret } from "@qintopia/domain";
+import { newId, newOpaqueSecret, stableHash } from "@qintopia/domain";
 import { buildServer } from "../../apps/api/src/server.ts";
-import { importQintopia2026ReferenceCatalog } from "@qintopia/db";
+import { importQintopia2026ReferenceCatalog, type Database } from "@qintopia/db";
 import { demo } from "../../packages/db/src/seed.ts";
 import { resetTestDatabase } from "../helpers/database.ts";
 
 let app: FastifyInstance;
+let database: Kysely<Database>;
 const catalogWithoutImportPropertyId = "prop_contract_catalog_without_import";
 
 type JsonSchema = Record<string, unknown>;
@@ -63,21 +65,21 @@ function arbitraryRecordLocations(schema: unknown, path = "schema"): string[] {
 }
 
 beforeAll(async () => {
-  const db = await resetTestDatabase();
-  await db.insertInto("properties").values({
+  database = await resetTestDatabase();
+  await database.insertInto("properties").values({
     id: catalogWithoutImportPropertyId,
     code: "QTP-NO-CATALOG",
     name: "Property without reference import",
     timezone: "Asia/Shanghai",
     currency: "CNY"
   }).execute();
-  await db.insertInto("subject_property_grants").values({
+  await database.insertInto("subject_property_grants").values({
     subject_id: demo.operatorSubjectId,
     property_id: catalogWithoutImportPropertyId,
     access_level: "READ"
   }).execute();
-  await importQintopia2026ReferenceCatalog(db);
-  app = await buildServer(db);
+  await importQintopia2026ReferenceCatalog(database);
+  app = await buildServer(database);
   await app.ready();
 });
 
@@ -176,12 +178,27 @@ describe("OpenAPI 3.1 command contract", () => {
     }
     const createInput = (variants.get("CREATE_ORDER")!.properties as Record<string, JsonSchema>).input!;
     const createGuest = ((createInput.properties as Record<string, JsonSchema>).primaryGuest)!;
-    expect(createGuest).toMatchObject({ additionalProperties: false, required: ["fullName"] });
+    expect(createGuest).toMatchObject({ additionalProperties: false, required: ["fullName", "nickname"] });
+    expect((createGuest.properties as Record<string, JsonSchema>).nickname).toMatchObject({
+      type: "string",
+      minLength: 1,
+      maxLength: 200,
+      pattern: "\\S"
+    });
     const createChannel = ((createInput.properties as Record<string, JsonSchema>).bookingChannelCode)!;
     const createChannelVariants = createChannel.anyOf as Array<{ enum: string[] }>;
     expect(createChannelVariants.map((variant) => variant.enum[0])).toEqual(["YOUMUDAO", "CTRIP", "MEITUAN", "WECOM"]);
     expect(JSON.stringify((createInput.properties as Record<string, JsonSchema>).channelOrderReference)).toContain('"type":"null"');
     expect((createInput.properties as Record<string, JsonSchema>).freeStayReason).toMatchObject({ minLength: 1, maxLength: 1000 });
+    const previewSchema = document.paths["/api/v1/command-previews"].post.responses["200"].content["application/json"].schema;
+    const previewProperties = (previewSchema.properties as Record<string, JsonSchema>).preview!.properties as Record<string, JsonSchema>;
+    const createEffect = (previewProperties.effect!.anyOf as JsonSchema[]).find((variant) => {
+      const properties = variant.properties as Record<string, JsonSchema> | undefined;
+      return properties?.quoteId !== undefined && properties?.primaryGuest !== undefined;
+    })!;
+    const effectGuest = (createEffect.properties as Record<string, JsonSchema>).primaryGuest!;
+    expect(effectGuest.required).toEqual(["fullName"]);
+    expect(JSON.stringify((effectGuest.properties as Record<string, JsonSchema>).nickname)).toContain('"type":"null"');
     const createMemberInput = (variants.get("CREATE_MEMBER")!.properties as Record<string, JsonSchema>).input!;
     expect((createMemberInput.properties as Record<string, JsonSchema>).identityCardNumber).toMatchObject({ minLength: 1, maxLength: 200 });
     expect((createMemberInput.properties as Record<string, JsonSchema>).validFrom).toMatchObject({ pattern: "^\\d{4}-\\d{2}-\\d{2}$" });
@@ -205,6 +222,297 @@ describe("OpenAPI 3.1 command contract", () => {
       maximum: Number.MAX_SAFE_INTEGER,
       multipleOf: 100
     });
+  });
+
+  it("rejects missing or blank guest nicknames at the HTTP contract without creating an order", async () => {
+    const orders = async () => {
+      const response = await app.inject({
+        method: "GET",
+        url: `/api/v1/orders?propertyId=${demo.propertyId}`,
+        headers: { authorization: `Bearer ${demo.writeToken}` }
+      });
+      expect(response.statusCode, response.body).toBe(200);
+      return response.json().orders as Array<{ id: string }>;
+    };
+    const quoteResponse = await app.inject({
+      method: "POST",
+      url: "/api/v1/quotes",
+      headers: {
+        authorization: `Bearer ${demo.writeToken}`,
+        "content-type": "application/json",
+        "idempotency-key": "contract-nickname-quote",
+        "x-correlation-id": "contract-nickname-quote"
+      },
+      payload: {
+        propertyId: demo.propertyId,
+        inventoryUnitId: demo.roomId,
+        stayType: "TRANSIENT",
+        arrivalDate: "2030-04-20",
+        departureDate: "2030-04-21",
+        pricingPolicyVersionId: demo.transientPolicyId
+      }
+    });
+    expect(quoteResponse.statusCode, quoteResponse.body).toBe(200);
+    const quoteId = quoteResponse.json().quote.quoteId as string;
+    const before = await orders();
+
+    for (const [label, primaryGuest] of [
+      ["missing", { fullName: "Missing nickname contract guest" }],
+      ["blank", { fullName: "Blank nickname contract guest", nickname: "   " }]
+    ] as const) {
+      const response = await app.inject({
+        method: "POST",
+        url: "/api/v1/command-previews",
+        headers: {
+          authorization: `Bearer ${demo.writeToken}`,
+          "content-type": "application/json",
+          "idempotency-key": `contract-nickname-${label}`,
+          "x-correlation-id": `contract-nickname-${label}`
+        },
+        payload: {
+          commandType: "CREATE_ORDER",
+          input: {
+            propertyId: demo.propertyId,
+            quoteId,
+            primaryGuest,
+            bookingChannelCode: "WECOM",
+            channelOrderReference: null
+          }
+        }
+      });
+      expect(response.statusCode, response.body).toBe(400);
+      expect(response.json()).toMatchObject({ code: "VALIDATION_ERROR", retryable: false });
+    }
+
+    const unrelatedUnauthenticatedInvalid = await app.inject({
+      method: "POST",
+      url: "/api/v1/command-previews",
+      headers: {
+        "content-type": "application/json",
+        "idempotency-key": "contract-nickname-invalid-unauthenticated",
+        "x-correlation-id": "contract-nickname-invalid-unauthenticated"
+      },
+      payload: {
+        commandType: "CREATE_ORDER",
+        input: {
+          propertyId: demo.propertyId,
+          quoteId,
+          primaryGuest: { fullName: "Invalid unauthenticated guest", nickname: null },
+          bookingChannelCode: "WECOM",
+          channelOrderReference: null
+        }
+      }
+    });
+    expect(unrelatedUnauthenticatedInvalid.statusCode, unrelatedUnauthenticatedInvalid.body).toBe(400);
+    expect(unrelatedUnauthenticatedInvalid.json()).toMatchObject({ code: "VALIDATION_ERROR", retryable: false });
+
+    expect(await orders()).toEqual(before);
+  });
+
+  it("replays an exact pre-nickname CREATE_ORDER Preview without weakening new command validation", async () => {
+    const quoteResponse = await app.inject({
+      method: "POST",
+      url: "/api/v1/quotes",
+      headers: {
+        authorization: `Bearer ${demo.writeToken}`,
+        "content-type": "application/json",
+        "idempotency-key": "contract-historical-nickname-quote",
+        "x-correlation-id": "contract-historical-nickname-quote"
+      },
+      payload: {
+        propertyId: demo.propertyId,
+        inventoryUnitId: demo.roomId,
+        stayType: "TRANSIENT",
+        arrivalDate: "2030-04-22",
+        departureDate: "2030-04-23",
+        pricingPolicyVersionId: demo.transientPolicyId
+      }
+    });
+    expect(quoteResponse.statusCode, quoteResponse.body).toBe(200);
+    const quoteId = quoteResponse.json().quote.quoteId as string;
+    const historicalKey = "contract-historical-nickname-preview";
+    const preparedResponse = await app.inject({
+      method: "POST",
+      url: "/api/v1/command-previews",
+      headers: {
+        authorization: `Bearer ${demo.writeToken}`,
+        "content-type": "application/json",
+        "idempotency-key": "contract-historical-nickname-fixture-source",
+        "x-correlation-id": "contract-historical-nickname-original"
+      },
+      payload: {
+        commandType: "CREATE_ORDER",
+        input: {
+          propertyId: demo.propertyId,
+          quoteId,
+          primaryGuest: { fullName: "Historical Replay Guest", nickname: "Historical Replay" },
+          bookingChannelCode: "WECOM",
+          channelOrderReference: null
+        }
+      }
+    });
+    expect(preparedResponse.statusCode, preparedResponse.body).toBe(200);
+    const prepared = preparedResponse.json();
+    const storedPreview = await database.selectFrom("command_previews")
+      .select(["basis_versions", "expires_at"])
+      .where("id", "=", prepared.preview.previewId)
+      .executeTakeFirstOrThrow();
+    const storedExecution = await database.selectFrom("command_executions")
+      .select(["subject_id", "credential_id"])
+      .where("id", "=", prepared.receipt.commandId)
+      .executeTakeFirstOrThrow();
+    const historicalEnvelope = {
+      commandType: "CREATE_ORDER" as const,
+      input: {
+        propertyId: demo.propertyId,
+        quoteId,
+        primaryGuest: { fullName: "Historical Replay Guest" },
+        bookingChannelCode: "WECOM" as const,
+        channelOrderReference: null
+      }
+    };
+    const historicalEffect = {
+      ...prepared.preview.effect,
+      primaryGuest: { fullName: "Historical Replay Guest" }
+    };
+    const historicalEffectHash = stableHash({
+      effect: historicalEffect,
+      basisVersions: storedPreview.basis_versions
+    });
+    const historicalPreviewId = newId("preview");
+    const historicalCommandId = newId("command");
+    const historicalReceiptId = newId("receipt");
+    const historicalPreview = {
+      ...prepared.preview,
+      previewId: historicalPreviewId,
+      effectHash: historicalEffectHash,
+      effect: historicalEffect
+    };
+    await database.transaction().execute(async (trx) => {
+      const committedAt = new Date();
+      await trx.insertInto("command_executions").values({
+        id: historicalCommandId,
+        subject_id: storedExecution.subject_id,
+        credential_id: storedExecution.credential_id,
+        property_id: demo.propertyId,
+        command_type: "PREVIEW:CREATE_ORDER",
+        idempotency_key: historicalKey,
+        request_hash: stableHash(historicalEnvelope),
+        correlation_id: "contract-historical-nickname-original",
+        state: "APPLIED",
+        completed_at: committedAt
+      }).execute();
+      await trx.insertInto("command_previews").values({
+          id: historicalPreviewId,
+          subject_id: storedExecution.subject_id,
+          property_id: demo.propertyId,
+          command_type: "CREATE_ORDER",
+          normalized_input: historicalEnvelope.input,
+          input_hash: stableHash(historicalEnvelope.input),
+          effect: historicalEffect,
+          effect_hash: historicalEffectHash,
+          basis_versions: storedPreview.basis_versions,
+          expires_at: storedPreview.expires_at,
+          status: "OPEN",
+          used_at: null
+        }).execute();
+      await trx.insertInto("command_receipts").values({
+        id: historicalReceiptId,
+        command_id: historicalCommandId,
+        execution_status: "EXECUTED",
+        business_committed: true,
+        result: { preview: historicalPreview },
+        error: null,
+        resource_refs: JSON.stringify([historicalPreviewId]),
+        fact_refs: JSON.stringify([]),
+        committed_at: committedAt
+      }).execute();
+      await trx.insertInto("audit_entries").values({
+        id: newId("audit"),
+        subject_id: storedExecution.subject_id,
+        credential_id: storedExecution.credential_id,
+        action: "PREVIEW:CREATE_ORDER",
+        decision: "ALLOWED",
+        command_id: historicalCommandId,
+        correlation_id: "contract-historical-nickname-original",
+        reason: null,
+        target_refs: JSON.stringify([historicalPreviewId]),
+        metadata: { effectHash: historicalEffectHash }
+      }).execute();
+    });
+
+    const replay = await app.inject({
+      method: "POST",
+      url: "/api/v1/command-previews",
+      headers: {
+        authorization: `Bearer ${demo.writeToken}`,
+        "content-type": "application/json",
+        "idempotency-key": historicalKey,
+        "x-correlation-id": "contract-historical-nickname-replay"
+      },
+      payload: historicalEnvelope
+    });
+    expect(replay.statusCode, replay.body).toBe(200);
+    expect(replay.json()).toMatchObject({
+      preview: {
+        previewId: historicalPreviewId,
+        effectHash: historicalEffectHash,
+        effect: { primaryGuest: { fullName: "Historical Replay Guest" } }
+      },
+      receipt: {
+        receiptId: historicalReceiptId,
+        commandId: historicalCommandId,
+        correlationId: "contract-historical-nickname-original"
+      }
+    });
+    expect(Object.hasOwn(replay.json().preview.effect.primaryGuest, "nickname")).toBe(false);
+
+    const readOnlyReplay = await app.inject({
+      method: "POST",
+      url: "/api/v1/command-previews",
+      headers: {
+        authorization: `Bearer ${demo.readToken}`,
+        "content-type": "application/json",
+        "idempotency-key": historicalKey,
+        "x-correlation-id": "contract-historical-nickname-read"
+      },
+      payload: historicalEnvelope
+    });
+    expect(readOnlyReplay.statusCode, readOnlyReplay.body).toBe(403);
+    expect(readOnlyReplay.json()).toMatchObject({ code: "INSUFFICIENT_ACCESS" });
+
+    for (const [idempotencyKey, payload] of [
+      [historicalKey, {
+        ...historicalEnvelope,
+        input: { ...historicalEnvelope.input, primaryGuest: { fullName: "Different Historical Guest" } }
+      }],
+      ["contract-historical-nickname-new-key", historicalEnvelope],
+      [historicalKey, {
+        ...historicalEnvelope,
+        input: { ...historicalEnvelope.input, primaryGuest: { fullName: "Historical Replay Guest", nickname: null } }
+      }]
+    ] as const) {
+      const rejected = await app.inject({
+        method: "POST",
+        url: "/api/v1/command-previews",
+        headers: {
+          authorization: `Bearer ${demo.writeToken}`,
+          "content-type": "application/json",
+          "idempotency-key": idempotencyKey,
+          "x-correlation-id": `reject-${idempotencyKey}`
+        },
+        payload
+      });
+      expect(rejected.statusCode, rejected.body).toBe(400);
+      expect(rejected.json()).toMatchObject({ code: "VALIDATION_ERROR", retryable: false });
+    }
+
+    const executions = await database.selectFrom("command_executions")
+      .select(["idempotency_key", "request_hash"])
+      .where("command_type", "=", "PREVIEW:CREATE_ORDER")
+      .where("idempotency_key", "in", [historicalKey, "contract-historical-nickname-new-key"])
+      .execute();
+    expect(executions).toEqual([{ idempotency_key: historicalKey, request_hash: stableHash(historicalEnvelope) }]);
   });
 
   it("publishes every documented error status for the query and recovery surfaces", async () => {
@@ -259,12 +567,23 @@ describe("OpenAPI 3.1 command contract", () => {
       ["/api/v1/receipts/{id}", "get"],
       ["/api/v1/audit", "get"],
       ["/api/v1/command-previews", "post"],
-      ["/api/v1/command-previews/{previewId}/confirm", "post"]
+      ["/api/v1/command-previews/{previewId}/confirm", "post"],
+      ["/api/v1/properties/{id}/room-status", "get"]
     ];
     for (const [path, method] of coreResponses) {
       const schema = document.paths[path][method].responses["200"].content["application/json"].schema;
       expect(arbitraryRecordLocations(schema), `${method.toUpperCase()} ${path}`).toEqual([]);
     }
+    const roomStatusSchema = document.paths["/api/v1/properties/{id}/room-status"].get.responses["200"].content["application/json"].schema;
+    const roomProperties = (((roomStatusSchema.properties as Record<string, JsonSchema>).rooms!.items as JsonSchema).properties) as Record<string, JsonSchema>;
+    expect(roomProperties).toHaveProperty("bedOccupancies");
+    const occupancyProperties = ((roomProperties.bedOccupancies!.items as JsonSchema).properties) as Record<string, JsonSchema>;
+    expect(Object.keys(occupancyProperties).sort()).toEqual(["occupants", "occupiedBedCount", "serviceDate", "totalBedCount"]);
+    const occupantProperties = ((occupancyProperties.occupants!.items as JsonSchema).properties) as Record<string, JsonSchema>;
+    expect(Object.keys(occupantProperties).sort()).toEqual([
+      "inventoryUnitCode", "inventoryUnitId", "primaryOccupantLabel", "sourceReference"
+    ]);
+    expect((occupantProperties.sourceReference!.properties as Record<string, JsonSchema>).type).toMatchObject({ enum: ["ORDER"] });
     const confirmConflictSchema = document.paths["/api/v1/command-previews/{previewId}/confirm"].post.responses["409"].content["application/json"].schema;
     expect(confirmConflictSchema.anyOf).toHaveLength(2);
     expect(arbitraryRecordLocations(confirmConflictSchema)).toEqual([]);
@@ -559,9 +878,15 @@ describe("OpenAPI 3.1 command contract", () => {
     const created = await command(demo.writeToken, "CREATE_ORDER", {
       propertyId: demo.propertyId,
       quoteId: quoteResponse.json().quote.quoteId,
-      primaryGuest: { fullName: "Contract View Guest", phone: "13800000000", documentNumber: "DOC-CONTRACT-1" },
+      primaryGuest: { fullName: "Contract View Guest", nickname: "Contract Guest", phone: "13800000000", documentNumber: "DOC-CONTRACT-1" },
       bookingChannelCode: "CTRIP",
       channelOrderReference: "TEST-CONTRACT-ORDER-1"
+    });
+    expect(created.result.primaryGuest).toEqual({
+      fullName: "Contract View Guest",
+      nickname: "Contract Guest",
+      phone: "13800000000",
+      documentNumber: "DOC-CONTRACT-1"
     });
     const orderId = created.result.orderId as string;
     const listed = await app.inject({
@@ -576,7 +901,7 @@ describe("OpenAPI 3.1 command contract", () => {
     });
     expect(detail.statusCode).toBe(200);
     expect(detail.json()).toMatchObject({
-      order: { id: orderId, primary_guest_snapshot: { fullName: "Contract View Guest" }, booking_channel_code: "CTRIP", channel_order_reference: "TEST-CONTRACT-ORDER-1" },
+      order: { id: orderId, primary_guest_snapshot: { fullName: "Contract View Guest", nickname: "Contract Guest" }, booking_channel_code: "CTRIP", channel_order_reference: "TEST-CONTRACT-ORDER-1" },
       stay: { status: "PLANNED" },
       pricingRevisions: [{ revision_no: 1 }]
     });

@@ -65,6 +65,27 @@ const bookingChannelLabels = {
   WECOM: "企业微信"
 } as const;
 
+const primaryGuestFieldLabels: Record<string, string> = {
+  nickname: "昵称",
+  fullName: "姓名",
+  phone: "联系电话",
+  documentNumber: "证件号码"
+};
+
+function primaryGuestSnapshotEntries(snapshot: Record<string, unknown>): Array<[string, unknown]> {
+  const canonicalKeys = ["nickname", "fullName", "phone", "documentNumber"];
+  const canonical = canonicalKeys.map((key): [string, unknown] => [
+    primaryGuestFieldLabels[key]!,
+    key === "nickname" && (typeof snapshot[key] !== "string" || !snapshot[key].trim())
+      ? "历史未记录"
+      : snapshot[key] ?? "-"
+  ]);
+  const extra = Object.entries(snapshot)
+    .filter(([key]) => !canonicalKeys.includes(key))
+    .map(([key, value]): [string, unknown] => [key, value]);
+  return [...canonical, ...extra];
+}
+
 function ActionFormDialog({ action, view, initialFactId, onClose, onSubmit }: {
   action: FormAction;
   view: OrderViewDto;
@@ -325,7 +346,7 @@ export function OrderDetailPage() {
       </section>
 
       <div className="detail-grid">
-        <section className="detail-section" aria-labelledby="guest-snapshot-heading"><div className="section-title-row"><h2 id="guest-snapshot-heading">主要居住人快照</h2><span>不可变快照</span></div><dl className="detail-list">{Object.entries(view.order.primary_guest_snapshot).map(([key, value]) => <div key={key}><dt>{key}</dt><dd>{String(value)}</dd></div>)}</dl></section>
+        <section className="detail-section" aria-labelledby="guest-snapshot-heading"><div className="section-title-row"><h2 id="guest-snapshot-heading">主要居住人快照</h2><span>不可变快照</span></div><dl className="detail-list">{primaryGuestSnapshotEntries(view.order.primary_guest_snapshot).map(([label, value]) => <div key={label}><dt>{label}</dt><dd>{String(value)}</dd></div>)}</dl></section>
         <section className="detail-section" aria-labelledby="stay-heading"><div className="section-title-row"><h2 id="stay-heading">Stay</h2><StatusBadge value={view.stay.status} /></div><dl className="detail-list"><div><dt>Stay ID</dt><dd><code>{view.stay.id}</code></dd></div><div><dt>住宿周期</dt><dd>{formatDate(view.order.arrival_date)} 至 {formatDate(view.order.departure_date)}</dd></div><div><dt>住宿类型</dt><dd>{view.order.stay_type}</dd></div>{view.order.stay_type === "FREE" ? <div><dt>免费入住原因</dt><dd>{view.order.free_stay_reason}</dd></div> : null}<div><dt>订单来源渠道</dt><dd>{view.order.booking_channel_code ? bookingChannelLabels[view.order.booking_channel_code] : "历史未记录"}</dd></div><div><dt>渠道订单号</dt><dd><code>{view.order.booking_channel_code === null ? "历史未记录" : view.order.booking_channel_code === "WECOM" ? "不适用" : view.order.channel_order_reference ?? "未填写"}</code></dd></div><div><dt>政策版本</dt><dd><code>{view.order.pricing_policy_version_id}</code></dd></div><div><dt>会员合同</dt><dd><code>{view.order.member_contract_id ?? "-"}</code></dd></div></dl></section>
       </div>
 

@@ -18,7 +18,7 @@ import { createQuoteInTransaction } from "../pricing-service.ts";
 import { bumpRoomStatusRevision } from "../room-status.ts";
 import type { Database } from "../schema.ts";
 import { applyCommand, lockCommandResources } from "./apply.ts";
-import { buildCommandEffect, projectCommandEffectForRead } from "./effects.ts";
+import { buildCommandEffect, projectCommandEffectForRead, projectPrimaryGuestForRead } from "./effects.ts";
 
 export interface ConfirmRequest {
   propertyId: string;
@@ -198,6 +198,19 @@ async function revalidateQuoteReadAccess(
 const opaqueTokenSecret = /^qtp_[A-Za-z0-9_-]{43}$/;
 
 function normalizeCommandEnvelope(envelope: CommandEnvelope): CommandEnvelope {
+  if (envelope.commandType === "CREATE_ORDER") {
+    const primaryGuest = envelope.input.primaryGuest;
+    if (!primaryGuest || typeof primaryGuest !== "object" || Array.isArray(primaryGuest)) return envelope;
+    const normalizedGuest = { ...(primaryGuest as Record<string, unknown>) };
+    for (const field of ["fullName", "nickname", "phone", "documentNumber"] as const) {
+      const value = normalizedGuest[field];
+      if (typeof value === "string") normalizedGuest[field] = value.trim();
+    }
+    return {
+      commandType: envelope.commandType,
+      input: { ...envelope.input, primaryGuest: normalizedGuest }
+    };
+  }
   if (envelope.commandType === "CREATE_MEMBER") {
     const trim = (field: string, uppercase = false) => {
       const value = envelope.input[field];
@@ -336,6 +349,7 @@ function projectReceiptResultForRead(commandType: string, result: Record<string,
   if (commandType === "CREATE_ORDER") {
     return {
       ...result,
+      primaryGuest: Object.hasOwn(result, "primaryGuest") ? projectPrimaryGuestForRead(result.primaryGuest) : null,
       bookingChannelCode: Object.hasOwn(result, "bookingChannelCode") ? result.bookingChannelCode : null,
       channelOrderReference: Object.hasOwn(result, "channelOrderReference") ? result.channelOrderReference : null,
       freeStayReason: Object.hasOwn(result, "freeStayReason") ? result.freeStayReason : null

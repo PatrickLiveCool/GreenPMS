@@ -30,6 +30,9 @@ async function confirmCommand(page: Page, reason: string, expectedFactTexts: str
 async function closeReceipt(page: Page) {
   await page.getByRole("button", { name: "完成" }).click();
   await expect(page.getByTestId("command-receipt")).toBeHidden();
+  if (/\/orders\/order_[^/?#]+$/.test(new URL(page.url()).pathname)) {
+    await expect(page.getByText("正在载入订单详情", { exact: true })).toBeHidden({ timeout: 15_000 });
+  }
 }
 
 async function selectRoomStatusRange(
@@ -74,6 +77,7 @@ async function chooseDatesAndUnit(
 async function createOrder(page: Page, options: {
   unitCode: string;
   guest: string;
+  nickname?: string;
   departureDate: string;
   arrivalDate?: string;
   transientMember?: boolean;
@@ -133,9 +137,12 @@ async function createOrder(page: Page, options: {
   } else {
     await page.getByTestId("channel-order-reference").fill(options.channelOrderReference ?? `TEST-E2E-ORDER-${options.guest.replaceAll(" ", "-")}`);
   }
+  const nickname = options.nickname ?? options.guest;
+  await expect(page.getByTestId("create-order")).toBeDisabled();
+  await page.getByTestId("primary-guest-nickname").fill(nickname);
   await page.getByTestId("create-order").click();
   const channelLabel = { YOUMUDAO: "游牧岛", CTRIP: "携程", MEITUAN: "美团", WECOM: "企业微信" }[bookingChannelCode];
-  await confirmCommand(page, `Create ${options.guest}`, [channelLabel, bookingChannelCode === "WECOM" ? "不适用" : options.channelOrderReference ?? `TEST-E2E-ORDER-${options.guest.replaceAll(" ", "-")}`]);
+  await confirmCommand(page, `Create ${options.guest}`, [nickname, channelLabel, bookingChannelCode === "WECOM" ? "不适用" : options.channelOrderReference ?? `TEST-E2E-ORDER-${options.guest.replaceAll(" ", "-")}`]);
 }
 
 async function openFactFormAndSubmit(
@@ -184,7 +191,9 @@ async function submitMemberRegistration(page: Page, options: {
 }
 
 async function assertNoA11yViolations(page: Page) {
-  const results = await new AxeBuilder({ page }).analyze();
+  const results = await new AxeBuilder({ page })
+    .options({ resultTypes: ["violations"] })
+    .analyze();
   expect(results.violations).toEqual([]);
 }
 
@@ -194,6 +203,7 @@ async function assertNoPageOverflow(page: Page) {
 }
 
 async function tabTo(page: Page, target: Locator, options: { reverse?: boolean; limit?: number } = {}) {
+  await expect(target).toBeVisible({ timeout: 5_000 });
   const key = options.reverse ? "Shift+Tab" : "Tab";
   for (let index = 0; index < (options.limit ?? 60); index += 1) {
     if (await target.evaluate((element) => document.activeElement === element)) return;
@@ -424,6 +434,7 @@ test("desktop core operating journey", async ({ page }, testInfo: TestInfo) => {
   await createOrder(page, {
     unitCode: "101",
     guest: "E2E Member Guest",
+    nickname: "风铃",
     departureDate: "2026-07-24",
     transientMember: true,
     expectedCoverageNights: 2,
@@ -433,8 +444,11 @@ test("desktop core operating journey", async ({ page }, testInfo: TestInfo) => {
   });
   const quoteReceipt = page.getByTestId("command-receipt");
   await expect(quoteReceipt).toContainText("order_");
+  await expect(quoteReceipt).toContainText("风铃");
   await page.getByRole("link", { name: /查看订单/ }).click();
-  await expect(page.getByRole("heading", { name: "E2E Member Guest" })).toBeVisible();
+  await expect(page).toHaveURL(/\/orders\/order_[^/?#]+$/, { timeout: 15_000 });
+  await expect(page.getByText("正在载入订单详情", { exact: true })).toBeHidden({ timeout: 15_000 });
+  await expect(page.getByRole("heading", { name: "风铃" })).toBeVisible({ timeout: 15_000 });
   await expect(page.getByText("携程", { exact: true })).toBeVisible();
   await expect(page.getByText("TEST-E2E-CTRIP-001", { exact: true })).toBeVisible();
   await expect(page.getByTestId("order-amounts")).toContainText("¥232.00");
@@ -1263,6 +1277,21 @@ test("keyboard-only navigation reaches a business Preview and cancels without co
 
   const firstCell = page.getByRole("gridcell").first();
   await tabTo(page, firstCell);
+  const availableCell = page.getByRole("gridcell", { name: /服务端标记可售/ }).first();
+  await expect(availableCell).toBeVisible({ timeout: 5_000 });
+  const currentPosition = await firstCell.evaluate((element) => ({
+    row: Number(element.getAttribute("aria-rowindex")),
+    column: Number(element.getAttribute("aria-colindex"))
+  }));
+  const targetPosition = await availableCell.evaluate((element) => ({
+    row: Number(element.getAttribute("aria-rowindex")),
+    column: Number(element.getAttribute("aria-colindex"))
+  }));
+  const rowKey = targetPosition.row >= currentPosition.row ? "ArrowDown" : "ArrowUp";
+  const columnKey = targetPosition.column >= currentPosition.column ? "ArrowRight" : "ArrowLeft";
+  for (let index = 0; index < Math.abs(targetPosition.row - currentPosition.row); index += 1) await page.keyboard.press(rowKey);
+  for (let index = 0; index < Math.abs(targetPosition.column - currentPosition.column); index += 1) await page.keyboard.press(columnKey);
+  await expect(availableCell).toBeFocused();
   await page.keyboard.press("Space");
   const maintenanceButton = page.getByRole("button", { name: "放置维修锁房", exact: true });
   await tabTo(page, maintenanceButton, { limit: 120 });

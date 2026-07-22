@@ -8,6 +8,7 @@ import {
   type AccessLevel,
   type RoomStatusActionCode,
   type RoomStatusActionDto,
+  type RoomStatusBedOccupancyDto,
   type RoomStatusBoardDto,
   type RoomStatusBoardQueryDto,
   type RoomStatusBlockingFactKind,
@@ -82,6 +83,16 @@ interface BuiltIntervals {
   claimIdsByIntervalAndDate: Map<string, Map<string, string[]>>;
 }
 
+interface BuiltBedOccupancies {
+  byRoom: Map<string, RoomStatusBedOccupancyDto[]>;
+  partial: boolean;
+}
+
+interface FilteredRoomSelection {
+  room: RoomStatusUnitDto;
+  childUnitIds: string[];
+}
+
 type RoomStatusFilters = Pick<RoomStatusBoardQueryDto,
   "search" | "roomType" | "salesMode" | "status" | "minCapacity" | "unitKind">;
 
@@ -97,7 +108,10 @@ function iso(value: Date | string): string {
 
 function primaryOccupantLabel(snapshot: unknown): string | null {
   if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot)) return null;
-  const fullName = (snapshot as Record<string, unknown>).fullName;
+  const guest = snapshot as Record<string, unknown>;
+  const nickname = guest.nickname;
+  if (typeof nickname === "string" && nickname.trim()) return nickname.trim();
+  const fullName = guest.fullName;
   return typeof fullName === "string" && fullName.trim() ? fullName.trim() : null;
 }
 
@@ -319,9 +333,9 @@ function intervalGroupKey(event: ProjectionEvent, displayInventoryUnitId: string
 function addBuilderItem(builder: IntervalBuilder, event: ProjectionEvent): void {
   builder.lastDate = event.serviceDate;
   if (event.claimId) {
-    builder.claimIds.push(event.claimId);
+    if (!builder.claimIds.includes(event.claimId)) builder.claimIds.push(event.claimId);
     const dayClaims = builder.claimIdsByServiceDate.get(event.serviceDate) ?? [];
-    dayClaims.push(event.claimId);
+    if (!dayClaims.includes(event.claimId)) dayClaims.push(event.claimId);
     builder.claimIdsByServiceDate.set(event.serviceDate, dayClaims);
   }
   builder.references.push(...event.references);
@@ -408,7 +422,8 @@ function buildIntervals(
     const current = builders.at(-1);
     if (current
       && intervalGroupKey(current.event, current.displayInventoryUnitId) === key
-      && dateAfter(current.lastDate) === item.event.serviceDate) {
+      && (current.lastDate === item.event.serviceDate
+        || dateAfter(current.lastDate) === item.event.serviceDate)) {
       addBuilderItem(current, item.event);
       continue;
     }
@@ -467,12 +482,145 @@ function buildIntervals(
   return { byUnit, claimIdsByIntervalAndDate };
 }
 
+function buildBedOccupancies(
+  events: ProjectionEvent[],
+  unitsById: Map<string, RoomStatusUnitDto>,
+  dates: string[]
+): BuiltBedOccupancies {
+  const dateSet = new Set(dates);
+  const eventsByRoomAndDate = new Map<string, ProjectionEvent[]>();
+  for (const event of events) {
+    if (!dateSet.has(event.serviceDate)) continue;
+    const actualUnit = unitsById.get(event.actualInventoryUnitId);
+    const roomId = actualUnit?.kind === "BED"
+      ? actualUnit.parentRoomId
+      : actualUnit?.kind === "ROOM"
+        ? actualUnit.id
+        : event.roomId;
+    if (!roomId) continue;
+    const key = `${roomId}:${event.serviceDate}`;
+    const dayEvents = eventsByRoomAndDate.get(key) ?? [];
+    dayEvents.push(event);
+    eventsByRoomAndDate.set(key, dayEvents);
+  }
+
+  const byRoom = new Map<string, RoomStatusBedOccupancyDto[]>();
+  let partial = false;
+  for (const room of unitsById.values()) {
+    if (room.kind !== "ROOM" || room.salesMode !== "BED_SPLIT") continue;
+    const uniqueChildIds = [...new Set(room.childUnitIds)];
+    const children = uniqueChildIds.map((id) => unitsById.get(id));
+    const catalogClosed = uniqueChildIds.length > 0
+      && uniqueChildIds.length === room.childUnitIds.length
+      && uniqueChildIds.length === room.capacity
+      && children.every((child) => child?.kind === "BED"
+        && child.parentRoomId === room.id
+        && child.roomId === room.id);
+    if (!catalogClosed) {
+      partial = true;
+      byRoom.set(room.id, []);
+      continue;
+    }
+
+    const childIds = new Set(uniqueChildIds);
+    const occupancies: RoomStatusBedOccupancyDto[] = [];
+    for (const serviceDate of dates) {
+      const dayEvents = eventsByRoomAndDate.get(`${room.id}:${serviceDate}`) ?? [];
+      const childEvents = dayEvents.filter((event) => childIds.has(event.actualInventoryUnitId));
+      const hasAmbiguousUnknownFact = dayEvents.some((event) => event.blocking && event.status === "UNKNOWN");
+      const parentLodgingEvents = dayEvents.filter((event) => event.actualInventoryUnitId === room.id
+        && event.blocking
+        && (event.sourceKind === "ORDER" || event.sourceKind === "FREE_STAY")
+        && (event.status === "RESERVED" || event.status === "IN_HOUSE"));
+      const validChildLodgingEvents = childEvents.filter((event) => event.blocking
+        && (event.sourceKind === "ORDER" || event.sourceKind === "FREE_STAY")
+        && (event.status === "RESERVED" || event.status === "IN_HOUSE"));
+
+      if (hasAmbiguousUnknownFact) {
+        partial = true;
+        continue;
+      }
+      if (parentLodgingEvents.length > 0) {
+        if (parentLodgingEvents.length > 1 || validChildLodgingEvents.length > 0) partial = true;
+        continue;
+      }
+
+      const eventsByBed = new Map<string, ProjectionEvent[]>();
+      for (const event of validChildLodgingEvents) {
+        const bedEvents = eventsByBed.get(event.actualInventoryUnitId) ?? [];
+        bedEvents.push(event);
+        eventsByBed.set(event.actualInventoryUnitId, bedEvents);
+      }
+      if ([...eventsByBed.values()].some((bedEvents) => bedEvents.length !== 1)) {
+        partial = true;
+        continue;
+      }
+
+      let invalidReference = false;
+      const occupants = [...eventsByBed.entries()].map(([inventoryUnitId, [event]]) => {
+        const unit = unitsById.get(inventoryUnitId)!;
+        const sourceReference = event!.references.find(
+          (item): item is RoomStatusReferenceDto & { type: "ORDER" } => item.type === "ORDER"
+        );
+        if (!sourceReference) invalidReference = true;
+        return sourceReference ? {
+          inventoryUnitId,
+          inventoryUnitCode: unit.code,
+          primaryOccupantLabel: event!.primaryOccupantLabel,
+          sourceReference
+        } : null;
+      }).filter((occupant): occupant is NonNullable<typeof occupant> => occupant !== null)
+        .sort((left, right) => left.inventoryUnitCode.localeCompare(right.inventoryUnitCode)
+          || left.inventoryUnitId.localeCompare(right.inventoryUnitId));
+      if (invalidReference) {
+        partial = true;
+        continue;
+      }
+      const occupiedOrderIds = occupants.map((occupant) => occupant.sourceReference.id);
+      if (new Set(occupiedOrderIds).size !== occupiedOrderIds.length) {
+        partial = true;
+        continue;
+      }
+      if (occupants.length > 0) {
+        occupancies.push({
+          serviceDate,
+          occupiedBedCount: occupants.length,
+          totalBedCount: uniqueChildIds.length,
+          occupants
+        });
+      }
+    }
+    byRoom.set(room.id, occupancies);
+  }
+  return { byRoom, partial };
+}
+
 function dayStatus(intervals: RoomStatusIntervalDto[], unitActive: boolean): RoomStatusStatus {
   if (!unitActive) return "UNAVAILABLE";
   const current = intervals.filter((interval) => interval.blocking || interval.sourceKind === "CLEANING");
   if (current.some((interval) => interval.status === "UNKNOWN")) return "UNKNOWN";
   const priority: RoomStatusStatus[] = ["UNAVAILABLE", "IN_HOUSE", "RESERVED", "MAINTENANCE", "INTERNAL_USE", "CLEANING"];
   return priority.find((status) => current.some((interval) => interval.status === status)) ?? "AVAILABLE";
+}
+
+function buildUnitStatuses(
+  unitsById: Map<string, RoomStatusUnitDto>,
+  dates: string[],
+  intervalsByUnit: Map<string, RoomStatusIntervalDto[]>
+): Map<string, Set<RoomStatusStatus>> {
+  const statusesByUnit = new Map<string, Set<RoomStatusStatus>>();
+  for (const unit of unitsById.values()) {
+    const intervals = intervalsByUnit.get(unit.id) ?? [];
+    const statuses = new Set<RoomStatusStatus>();
+    for (const serviceDate of dates) {
+      statuses.add(dayStatus(
+        intervals.filter((interval) => interval.startDate <= serviceDate && serviceDate < interval.endDate),
+        unit.active
+      ));
+    }
+    statusesByUnit.set(unit.id, statuses);
+  }
+  return statusesByUnit;
 }
 
 function assembleUnit(
@@ -518,7 +666,12 @@ function normalizedSearchText(value: string): string {
   return value.toLocaleUpperCase("zh-CN");
 }
 
-function unitMatchesFilters(unit: RoomStatusUnitDto, room: RoomStatusUnitDto, filters: RoomStatusFilters): boolean {
+function unitMatchesFilters(
+  unit: RoomStatusUnitDto,
+  room: RoomStatusUnitDto,
+  filters: RoomStatusFilters,
+  statusesByUnit: Map<string, Set<RoomStatusStatus>>
+): boolean {
   if (filters.search) {
     const searchText = [
       room.code,
@@ -536,27 +689,39 @@ function unitMatchesFilters(unit: RoomStatusUnitDto, room: RoomStatusUnitDto, fi
   }
   if (filters.roomType && (unit.roomTypeCode ?? room.roomTypeCode) !== filters.roomType) return false;
   if (filters.salesMode && room.salesMode !== filters.salesMode) return false;
-  if (filters.status && !unit.days.some((day) => day.status === filters.status)) return false;
+  if (filters.status && !statusesByUnit.get(unit.id)?.has(filters.status)) return false;
   if (filters.minCapacity !== undefined && room.capacity < filters.minCapacity) return false;
   if (filters.unitKind && unit.kind !== filters.unitKind) return false;
   return true;
 }
 
-function filterRooms(rooms: RoomStatusUnitDto[], filters: RoomStatusFilters): RoomStatusUnitDto[] {
+function filterRoomSelections(
+  rooms: RoomStatusUnitDto[],
+  unitsById: Map<string, RoomStatusUnitDto>,
+  filters: RoomStatusFilters,
+  statusesByUnit: Map<string, Set<RoomStatusStatus>>
+): FilteredRoomSelection[] {
   return rooms.flatMap((room) => {
-    const children = room.children.filter((child) => unitMatchesFilters(child, room, filters));
-    if (!unitMatchesFilters(room, room, filters) && children.length === 0) return [];
-    return [{ ...room, childUnitIds: children.map((child) => child.id), children }];
+    const childUnitIds = room.childUnitIds.filter((childId) => {
+      const child = unitsById.get(childId);
+      return child ? unitMatchesFilters(child, room, filters, statusesByUnit) : false;
+    });
+    if (!unitMatchesFilters(room, room, filters, statusesByUnit) && childUnitIds.length === 0) return [];
+    return [{ room, childUnitIds }];
   });
 }
 
-function roomStatusFilterOptions(rooms: RoomStatusUnitDto[]): RoomStatusFilterOptionsDto {
-  const units = rooms.flatMap((room) => [room, ...room.children]);
+function roomStatusFilterOptions(
+  rooms: RoomStatusUnitDto[],
+  unitsById: Map<string, RoomStatusUnitDto>,
+  statusesByUnit: Map<string, Set<RoomStatusStatus>>
+): RoomStatusFilterOptionsDto {
+  const units = [...unitsById.values()];
   const salesModeOrder: RoomStatusUnitDto["salesMode"][] = ["WHOLE_ROOM", "BED_SPLIT", "UNAVAILABLE"];
   return {
     roomTypeCodes: [...new Set(rooms.flatMap((room) => room.roomTypeCode ? [room.roomTypeCode] : []))].sort(),
     salesModes: salesModeOrder.filter((salesMode) => rooms.some((room) => room.salesMode === salesMode)),
-    statuses: roomStatusStatuses.filter((status) => units.some((unit) => unit.days.some((day) => day.status === status))),
+    statuses: roomStatusStatuses.filter((status) => units.some((unit) => statusesByUnit.get(unit.id)?.has(status))),
     capacities: [...new Set(rooms.map((room) => room.capacity).filter((capacity) => capacity > 0))]
       .sort((left, right) => left - right),
     unitKinds: inventoryUnitKinds.filter((kind) => units.some((unit) => unit.kind === kind))
@@ -601,30 +766,29 @@ export async function getRoomStatusBoard(db: Kysely<Database>, options: {
 
   return db.transaction().setIsolationLevel("repeatable read").execute(async (trx) => {
     await sql`set transaction read only`.execute(trx);
-    const property = await trx.selectFrom("properties").select(["id", "timezone"]).where("id", "=", options.propertyId).executeTakeFirst();
+    const property = await trx.selectFrom("properties as property")
+      .leftJoin("room_status_revisions as room_status_revision", "room_status_revision.property_id", "property.id")
+      .select([
+        "property.id",
+        "property.timezone",
+        "room_status_revision.revision",
+        sql<Date>`transaction_timestamp()`.as("as_of")
+      ])
+      .where("property.id", "=", options.propertyId)
+      .executeTakeFirst();
     if (!property) throw new DomainError("NOT_FOUND", "Property not found", 404);
-    const clock = await sql<{ as_of: Date }>`select transaction_timestamp() as as_of`.execute(trx);
-    const asOf = iso(clock.rows[0]!.as_of);
+    const asOf = iso(property.as_of);
     const freshUntil = new Date(new Date(asOf).getTime() + 5_000).toISOString();
     const businessDate = todayInTimeZone(property.timezone, new Date(asOf));
-    const revisionRow = await trx.selectFrom("room_status_revisions")
-      .select("revision")
-      .where("property_id", "=", options.propertyId)
-      .executeTakeFirst();
 
-    const roomRows = await trx.selectFrom("inventory_units")
+    const inventoryRows = await trx.selectFrom("inventory_units")
       .selectAll()
       .where("property_id", "=", options.propertyId)
-      .where("kind", "=", "ROOM")
+      .where("kind", "in", ["ROOM", "BED"])
       .orderBy("code")
       .execute();
-    const roomIds = roomRows.map((room) => room.id);
-    const bedRows = await trx.selectFrom("inventory_units")
-      .selectAll()
-      .where("property_id", "=", options.propertyId)
-      .where("kind", "=", "BED")
-      .orderBy("code")
-      .execute();
+    const roomRows = inventoryRows.filter((unit) => unit.kind === "ROOM");
+    const bedRows = inventoryRows.filter((unit) => unit.kind === "BED");
 
     const operationalOrderCandidates = await trx.selectFrom("orders as order")
       .select("order.id")
@@ -680,6 +844,7 @@ export async function getRoomStatusBoard(db: Kysely<Database>, options: {
     const operationalTaskSeeds: OperationalTaskSeed[] = [];
     const syntheticOccupancyEvents: ProjectionEvent[] = [];
     let missingOperationalClaim = false;
+    let inconsistentOperationalLifecycle = false;
     for (const rows of operationalOrderGroups.values()) {
       const order = rows[0]!;
       let taskKind: RoomStatusOperationalTaskKind | null = null;
@@ -697,6 +862,13 @@ export async function getRoomStatusBoard(db: Kysely<Database>, options: {
       }
       else if (order.order_status === "CHECKED_IN" && order.order_arrival_date <= businessDate && businessDate < order.order_departure_date) taskKind = "IN_HOUSE";
       if (!taskKind) continue;
+      const lifecycleConsistent = order.order_status === "RESERVED" && order.stay_status === "PLANNED"
+        || order.order_status === "CHECKED_IN" && order.stay_status === "IN_HOUSE";
+      if (!lifecycleConsistent) {
+        taskKind = "EXCEPTION";
+        exceptionReason = `订单状态 ${order.order_status} 与 Stay 状态 ${order.stay_status} 不一致`;
+        inconsistentOperationalLifecycle = true;
+      }
       const segment = [...rows].reverse().find((row) => row.segment_arrival_date <= businessDate && businessDate < row.segment_departure_date)
         ?? rows.at(-1)!;
       const overdueInHouse = order.order_status === "CHECKED_IN" && order.order_departure_date < businessDate;
@@ -724,9 +896,9 @@ export async function getRoomStatusBoard(db: Kysely<Database>, options: {
         sourceEndDate: order.order_departure_date,
         sourceKey: `order-task:${order.order_id}:${taskKind}`,
         sourceKind,
-        status: missingCurrentClaim ? "UNKNOWN" : order.order_status === "RESERVED" ? "RESERVED" : "IN_HOUSE",
+        status: missingCurrentClaim || !lifecycleConsistent ? "UNKNOWN" : order.order_status === "RESERVED" ? "RESERVED" : "IN_HOUSE",
         label: `${sourceKind === "FREE_STAY" ? "免费入住" : "订单"} ${order.order_id}`,
-        primaryOccupantLabel: primaryOccupantLabel(order.primary_guest_snapshot),
+        primaryOccupantLabel: lifecycleConsistent ? primaryOccupantLabel(order.primary_guest_snapshot) : null,
         reason: taskReason,
         blocking,
         current: true,
@@ -757,7 +929,7 @@ export async function getRoomStatusBoard(db: Kysely<Database>, options: {
         targetReference: orderRef,
         orderId: order.order_id
       };
-      if (!missingCurrentClaim) {
+      if (!missingCurrentClaim && lifecycleConsistent) {
         operationalTaskSeeds.push({
           taskKind,
           businessDate,
@@ -851,6 +1023,7 @@ export async function getRoomStatusBoard(db: Kysely<Database>, options: {
         capacity: room.physical_bed_count ?? Math.max(children.length, 1),
         childUnitIds: children.map((bed) => bed.id),
         children: [],
+        bedOccupancies: [],
         days: [],
         intervals: [],
         conflicts: [],
@@ -874,6 +1047,7 @@ export async function getRoomStatusBoard(db: Kysely<Database>, options: {
           capacity: 1,
           childUnitIds: [],
           children: [],
+          bedOccupancies: [],
           days: [],
           intervals: [],
           conflicts: [],
@@ -916,11 +1090,10 @@ export async function getRoomStatusBoard(db: Kysely<Database>, options: {
       .where("claim.property_id", "=", options.propertyId)
       .where((expression) => expression.or([
         expression("claim.service_date", "=", businessDate),
-        ...(roomIds.length > 0 ? [expression.and([
-          expression("claim.room_id", "in", roomIds),
+        expression.and([
           expression("claim.service_date", ">=", options.arrivalDate),
           expression("claim.service_date", "<", options.departureDate)
-        ])] : [])
+        ])
       ]))
       .orderBy("claim.service_date")
       .orderBy("claim.id")
@@ -1046,7 +1219,7 @@ export async function getRoomStatusBoard(db: Kysely<Database>, options: {
     }
 
     const events: ProjectionEvent[] = [...syntheticOccupancyEvents];
-    let partial = missingOperationalClaim || operationalOrdersTruncated || inactiveUnitsTruncated;
+    let partial = missingOperationalClaim || inconsistentOperationalLifecycle || operationalOrdersTruncated || inactiveUnitsTruncated;
     for (const row of claimRows) {
       const claimRef = reference("CLAIM", row.claim_id, `Claim ${row.claim_id}`);
       const fallbackHistory: RoomStatusHistoryDto = {
@@ -1089,11 +1262,10 @@ export async function getRoomStatusBoard(db: Kysely<Database>, options: {
         const historicalCompleted = !row.active
           && completedLatestByOrderDate.get(`${row.order_id}:${row.service_date}`)?.claim_id === row.claim_id;
         if (!row.active && !historicalCompleted) continue;
-        const invalidActiveTerminal = row.active
-          && (row.order_status === "CANCELLED" || row.order_status === "NO_SHOW" || row.order_status === "CHECKED_OUT");
-        if (invalidActiveTerminal) {
-          partial = true;
-        }
+        const activeLifecycleConsistent = !row.active
+          || row.order_status === "RESERVED" && row.stay_status === "PLANNED"
+          || row.order_status === "CHECKED_IN" && row.stay_status === "IN_HOUSE";
+        if (!activeLifecycleConsistent) partial = true;
         const orderRef = reference("ORDER", row.order_id!, `Order ${row.order_id}`, `/orders/${row.order_id}`);
         const stayRef = reference("STAY", row.stay_id!, `Stay ${row.stay_id}`);
         const sourceKind: RoomStatusSourceKind = row.stay_type === "FREE" ? "FREE_STAY" : "ORDER";
@@ -1111,10 +1283,12 @@ export async function getRoomStatusBoard(db: Kysely<Database>, options: {
           sourceEndDate: projectedRun?.endDate ?? row.segment_departure_date!,
           sourceKey: projectedRun?.sourceKey ?? `segment:${row.segment_id}`,
           sourceKind,
-          status: invalidActiveTerminal ? "UNKNOWN" : status,
+          status: activeLifecycleConsistent ? status : "UNKNOWN",
           label: `${sourceKind === "FREE_STAY" ? "免费入住" : "订单"} ${row.order_id}`,
-          primaryOccupantLabel: occupantLabel,
-          reason: sourceKind === "FREE_STAY" ? row.free_stay_reason : null,
+          primaryOccupantLabel: activeLifecycleConsistent ? occupantLabel : null,
+          reason: activeLifecycleConsistent
+            ? sourceKind === "FREE_STAY" ? row.free_stay_reason : null
+            : `订单状态 ${row.order_status} 与 Stay 状态 ${row.stay_status} 不一致`,
           blocking: row.active,
           current: row.active,
           blockingFactKind: row.active ? "CLAIM" : null,
@@ -1237,11 +1411,10 @@ export async function getRoomStatusBoard(db: Kysely<Database>, options: {
       .where("property_id", "=", options.propertyId)
       .where((expression) => expression.or([
         expression("service_date", "<=", businessDate),
-        ...(roomIds.length > 0 ? [expression.and([
-          expression("room_id", "in", roomIds),
+        expression.and([
           expression("service_date", ">=", options.arrivalDate),
           expression("service_date", "<", options.departureDate)
-        ])] : [])
+        ])
       ]))
       .where("status", "=", "PENDING")
       .orderBy("service_date")
@@ -1342,6 +1515,8 @@ export async function getRoomStatusBoard(db: Kysely<Database>, options: {
       && event.sourceKind !== "UNIT_UNSELLABLE"
       && (event.sourceKind !== "ORDER" && event.sourceKind !== "FREE_STAY" || event.status === "UNKNOWN"));
     const builtIntervals = buildIntervals(gridEvents, unitsById, options.accessLevel);
+    const builtBedOccupancies = buildBedOccupancies(gridEvents, unitsById, dates);
+    if (builtBedOccupancies.partial) partial = true;
     const uniqueTaskExceptionEvents = [...new Map(taskExceptionEvents.map((event) => [
       `${event.sourceKey}:${event.actualInventoryUnitId}`,
       event
@@ -1361,17 +1536,17 @@ export async function getRoomStatusBoard(db: Kysely<Database>, options: {
     if (sortedOperationalTasks.length > ROOM_STATUS_OPERATIONAL_TASK_LIMIT) partial = true;
     const operationalTasks = sortedOperationalTasks.slice(0, ROOM_STATUS_OPERATIONAL_TASK_LIMIT);
 
-    const allRooms = roomRows.map((roomRow) => {
-      const baseRoom = unitsById.get(roomRow.id)!;
-      const children = baseRoom.childUnitIds.map((childId) => {
+    const baseRooms = roomRows.map((roomRow) => unitsById.get(roomRow.id)!);
+    const statusesByUnit = buildUnitStatuses(unitsById, dates, builtIntervals.byUnit);
+    const filterOptions = roomStatusFilterOptions(baseRooms, unitsById, statusesByUnit);
+    const filteredRooms = filterRoomSelections(baseRooms, unitsById, filters, statusesByUnit);
+    const totalRooms = filteredRooms.length;
+    const pageSelections = filteredRooms.slice(page * pageSize, (page + 1) * pageSize);
+    const rooms = pageSelections.map(({ room: baseRoom, childUnitIds }) => {
+      const children = childUnitIds.map((childId) => {
         const child = unitsById.get(childId)!;
-        return assembleUnit(
-          child,
-          dates,
-          builtIntervals.byUnit.get(child.id) ?? [],
-          builtIntervals.claimIdsByIntervalAndDate,
-          options.accessLevel
-        );
+        return assembleUnit(child, dates, builtIntervals.byUnit.get(child.id) ?? [],
+          builtIntervals.claimIdsByIntervalAndDate, options.accessLevel);
       });
       return {
         ...assembleUnit(
@@ -1381,13 +1556,10 @@ export async function getRoomStatusBoard(db: Kysely<Database>, options: {
           builtIntervals.claimIdsByIntervalAndDate,
           options.accessLevel
         ),
+        bedOccupancies: builtBedOccupancies.byRoom.get(baseRoom.id) ?? [],
         children
       };
     });
-    const filterOptions = roomStatusFilterOptions(allRooms);
-    const filteredRooms = filterRooms(allRooms, filters);
-    const totalRooms = filteredRooms.length;
-    const rooms = filteredRooms.slice(page * pageSize, (page + 1) * pageSize);
 
     return {
       propertyId: options.propertyId,
@@ -1396,7 +1568,7 @@ export async function getRoomStatusBoard(db: Kysely<Database>, options: {
       dates,
       asOf,
       freshUntil,
-      revision: String(revisionRow?.revision ?? "0"),
+      revision: String(property.revision ?? "0"),
       accessLevel: options.accessLevel,
       projectionState: partial ? "PARTIAL" : "READY",
       filterOptions,

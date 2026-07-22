@@ -344,14 +344,23 @@ describe("scoped agent HTTP core journey", () => {
       quoteId: quote.quoteId,
       primaryGuest: {
         fullName: "Scoped Agent Journey Guest",
+        nickname: "Scoped Guest",
         phone: "13800000000",
         documentNumber: "AGENT-HTTP-2028"
       },
       bookingChannelCode: "MEITUAN",
       channelOrderReference: "TEST-AGENT-ORDER-2028"
     }, "create-order");
-    expect(created.preview.effect).toMatchObject({ bookingChannelCode: "MEITUAN", channelOrderReference: "TEST-AGENT-ORDER-2028" });
-    expect(created.receipt.result).toMatchObject({ bookingChannelCode: "MEITUAN", channelOrderReference: "TEST-AGENT-ORDER-2028" });
+    expect(created.preview.effect).toMatchObject({
+      primaryGuest: { fullName: "Scoped Agent Journey Guest", nickname: "Scoped Guest" },
+      bookingChannelCode: "MEITUAN",
+      channelOrderReference: "TEST-AGENT-ORDER-2028"
+    });
+    expect(created.receipt.result).toMatchObject({
+      primaryGuest: { fullName: "Scoped Agent Journey Guest", nickname: "Scoped Guest" },
+      bookingChannelCode: "MEITUAN",
+      channelOrderReference: "TEST-AGENT-ORDER-2028"
+    });
     const orderId = created.receipt.result?.orderId as string;
     expect(orderId).toMatch(/^order_/);
     expect(created.receipt.resourceRefs).toContain(orderId);

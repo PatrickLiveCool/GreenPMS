@@ -59,7 +59,7 @@ async function createOrder(prefix: string, options: { member?: boolean; arrival?
     input: {
       propertyId: demo.propertyId,
       quoteId: quote.quoteId,
-      primaryGuest: { fullName: `Invariant Guest ${prefix}` },
+      primaryGuest: { fullName: `Invariant Guest ${prefix}`, nickname: `Invariant ${prefix}` },
       bookingChannelCode: "YOUMUDAO",
       channelOrderReference: `TEST-INVARIANT-ORDER-${prefix}`
     }
@@ -550,13 +550,13 @@ describe.sequential("database-owned invariants on PostgreSQL", () => {
       .toEqual({ fact_id: result.factIds[0], coverage_id: coverage.id, entry_type: "RELEASE" });
   });
 
-  it("requires the current room-status migration for readiness", async () => {
+  it("requires the current nickname migration for readiness", async () => {
     expect(await databaseReady(db)).toBe(true);
-    await db.deleteFrom("schema_migrations").where("name", "=", "013_room_status_operations.sql").execute();
+    await db.deleteFrom("schema_migrations").where("name", "=", "014_new_order_primary_guest_nickname.sql").execute();
     try {
       expect(await databaseReady(db)).toBe(false);
     } finally {
-      await db.insertInto("schema_migrations").values({ name: "013_room_status_operations.sql" }).execute();
+      await db.insertInto("schema_migrations").values({ name: "014_new_order_primary_guest_nickname.sql" }).execute();
     }
     expect(await databaseReady(db)).toBe(true);
   });

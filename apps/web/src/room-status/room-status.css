@@ -428,6 +428,7 @@
 }
 
 .room-status-grid-row {
+  height: var(--room-status-row-height);
   min-height: var(--room-status-row-height);
 }
 
@@ -438,6 +439,7 @@
 .room-status-resource-cell {
   z-index: 4;
   display: flex;
+  height: var(--room-status-row-height);
   min-width: 0;
   min-height: var(--room-status-row-height);
   align-items: stretch;
@@ -509,12 +511,14 @@
 
 .room-status-day-track {
   position: relative;
+  height: var(--room-status-row-height);
   min-height: var(--room-status-row-height);
 }
 
 .room-status-day-cell {
   position: relative;
   display: flex;
+  height: var(--room-status-row-height);
   min-width: 0;
   min-height: var(--room-status-row-height);
   align-items: flex-end;
@@ -622,6 +626,74 @@
 .room-status-mark-compact {
   gap: 3px;
   font-size: 11px;
+}
+
+.room-status-bed-occupancy {
+  position: absolute;
+  z-index: 6;
+  right: 4px;
+  bottom: 5px;
+  min-width: 30px;
+  padding-left: 3px;
+  background: color-mix(in srgb, var(--surface) 88%, transparent);
+  color: var(--text);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 760;
+  line-height: 1.2;
+  text-align: center;
+  pointer-events: none;
+}
+
+.room-status-bed-occupants {
+  position: absolute;
+  z-index: 6;
+  right: 38px;
+  bottom: 4px;
+  left: 4px;
+  overflow: hidden;
+  color: var(--text);
+  font-size: 11px;
+  font-weight: 680;
+  line-height: 20px;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+.room-status-bed-occupancy-tooltip {
+  position: fixed;
+  z-index: 80;
+  width: max-content;
+  max-width: min(320px, calc(100vw - 24px));
+  max-height: calc(100vh - 24px);
+  overflow-y: auto;
+  border: 1px solid #2f443c;
+  border-radius: 4px;
+  padding: 7px 9px;
+  background: #17231f;
+  box-shadow: 0 8px 22px rgb(17 35 29 / 18%);
+  color: #fff;
+  font-size: 12px;
+  line-height: 1.45;
+  overscroll-behavior: contain;
+  overflow-wrap: anywhere;
+  pointer-events: auto;
+  scrollbar-gutter: stable;
+}
+
+.room-status-bed-occupancy-tooltip:focus-visible {
+  outline: 3px solid #fff;
+  outline-offset: -4px;
+}
+
+.room-status-bed-occupancy-tooltip.is-below {
+  transform: translateX(-50%);
+}
+
+.room-status-bed-occupancy-tooltip.is-above {
+  transform: translate(-50%, -100%);
 }
 
 .room-status-mark-available { color: var(--success); }

@@ -32,7 +32,8 @@ export async function databaseReady(db: Kysely<Database>): Promise<boolean> {
       && applied.has("010_qintopia_2026_catalog_pricing_and_free_stays.sql")
       && applied.has("011_core_fact_shape_guards.sql")
       && applied.has("012_legacy_demo_inventory_catalog_backfill.sql")
-      && applied.has("013_room_status_operations.sql");
+      && applied.has("013_room_status_operations.sql")
+      && applied.has("014_new_order_primary_guest_nickname.sql");
   } catch {
     return false;
   }

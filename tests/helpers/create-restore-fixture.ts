@@ -69,7 +69,7 @@ export async function createRestoreFixture(reference: string): Promise<void> {
     const created = await runCommand(db, principal, "CREATE_ORDER", {
       propertyId: demo.propertyId,
       quoteId: quote.quote.quoteId,
-      primaryGuest: { fullName: "Restore Verification Guest", documentNumber: reference },
+      primaryGuest: { fullName: "Restore Verification Guest", nickname: "Restore Guest", documentNumber: reference },
       bookingChannelCode: "CTRIP",
       channelOrderReference: reference,
       freeStayReason: "Backup and restore verification fixture"

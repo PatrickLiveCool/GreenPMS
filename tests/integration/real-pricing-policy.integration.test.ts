@@ -63,7 +63,7 @@ async function createOrder(options: {
     input: {
       propertyId: demo.propertyId,
       quoteId: quote.quoteId,
-      primaryGuest: { fullName: `Pricing Guest ${options.prefix}` },
+      primaryGuest: { fullName: `Pricing Guest ${options.prefix}`, nickname: `Pricing ${options.prefix}` },
       bookingChannelCode: "YOUMUDAO",
       channelOrderReference: `REAL-PRICE-${options.prefix}`,
       ...(stayType === "FREE" ? { freeStayReason: options.freeStayReason ?? "Confirmed complimentary stay" } : {})

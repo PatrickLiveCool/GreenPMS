@@ -45,8 +45,16 @@ export function formatDateTime(value: string | undefined): string {
 }
 
 export function guestName(snapshot: Record<string, unknown>): string {
-  const value = snapshot.fullName;
-  return typeof value === "string" && value ? value : "未命名住客";
+  const nickname = snapshot.nickname;
+  if (typeof nickname === "string" && nickname.trim()) return nickname;
+  const fullName = snapshot.fullName;
+  return typeof fullName === "string" && fullName.trim() ? fullName : "未命名住客";
+}
+
+export function guestSearchText(snapshot: Record<string, unknown>): string {
+  return [snapshot.nickname, snapshot.fullName, snapshot.phone, snapshot.documentNumber]
+    .filter((value): value is string => typeof value === "string")
+    .join(" ");
 }
 
 export function errorMessage(error: unknown): string {
@@ -185,6 +193,11 @@ function scalar(value: unknown): string {
   return JSON.stringify(value);
 }
 
+export function guestNicknameLabel(snapshot: Record<string, unknown>): string {
+  const nickname = snapshot.nickname;
+  return typeof nickname === "string" && nickname.trim() ? nickname : "历史未记录";
+}
+
 const bookingChannelLabels: Record<string, string> = {
   YOUMUDAO: "游牧岛",
   CTRIP: "携程",
@@ -237,7 +250,7 @@ function EffectSummary({ preview }: { preview: PreviewDto }) {
       <section className="effect-section" aria-labelledby="effect-difference-heading">
         <h3 id="effect-difference-heading">服务端变更差异</h3>
         <dl className="difference-grid">
-          {guest ? <><dt>主要居住人</dt><dd>{scalar(guest.fullName)}</dd></> : null}
+          {guest ? <><dt>居住人昵称</dt><dd>{guestNicknameLabel(guest)}</dd><dt>主要居住人姓名</dt><dd>{scalar(guest.fullName)}</dd></> : null}
           {member ? <><dt>会员档案动作</dt><dd>{scalar(effect.operation)}</dd><dt>会员姓名 / 身份证</dt><dd>{scalar(member.fullName)} · <code>{scalar(member.identityCardNumber)}</code></dd><dt>手机号 / 微信号</dt><dd>{scalar(member.phone)} · {scalar(member.wechat)}</dd></> : null}
           {submittedProfile && effect.profileMatch === false ? <><dt>申请资料差异</dt><dd>申请资料与现有档案不一致；本命令保留现有档案，仅关联申请记录。</dd></> : null}
           {memberContract ? <><dt>会员合同动作</dt><dd>{scalar(memberContract.operation)}</dd><dt>合同周期</dt><dd>{scalar(memberContract.validFrom)} 至 {scalar(memberContract.validUntil)}</dd></> : null}
@@ -300,6 +313,7 @@ function copyText(value: string) {
 function ReceiptPanel({ receipt, onNavigateToResource }: { receipt: ReceiptDto; onNavigateToResource?: () => void }) {
   const result = isRecord(receipt.result) ? receipt.result : undefined;
   const orderId = result && typeof result.orderId === "string" ? result.orderId : undefined;
+  const primaryGuest = result && isRecord(result.primaryGuest) ? result.primaryGuest : undefined;
   const hasBookingChannel = Boolean(result && Object.hasOwn(result, "bookingChannelCode"));
   const bookingChannelCode = result && typeof result.bookingChannelCode === "string" ? result.bookingChannelCode : null;
   const channelOrderReference = result && typeof result.channelOrderReference === "string" ? result.channelOrderReference : null;
@@ -327,6 +341,7 @@ function ReceiptPanel({ receipt, onNavigateToResource }: { receipt: ReceiptDto; 
         <dt>Correlation ID</dt><dd><code>{receipt.correlationId || "-"}</code></dd>
         <dt>资源引用</dt><dd className="code-list">{receipt.resourceRefs.length ? receipt.resourceRefs.map((ref) => <code key={ref}>{ref}</code>) : "-"}</dd>
         <dt>事实引用</dt><dd className="code-list">{receipt.factRefs.length ? receipt.factRefs.map((ref) => <code key={ref}>{ref}</code>) : "-"}</dd>
+        {primaryGuest ? <><dt>居住人昵称</dt><dd>{guestNicknameLabel(primaryGuest)}</dd><dt>主要居住人姓名</dt><dd>{scalar(primaryGuest.fullName)}</dd></> : null}
         {hasBookingChannel ? <><dt>订单来源渠道</dt><dd>{bookingChannelCode ? bookingChannelLabels[bookingChannelCode] ?? bookingChannelCode : "历史未记录"}</dd><dt>渠道订单号</dt><dd><code>{bookingChannelCode === "WECOM" ? "不适用" : channelOrderReference ?? (bookingChannelCode ? "未填写" : "历史未记录")}</code></dd></> : null}
         {hasTransactionReference && result ? <><dt>外部交易单号</dt><dd><code>{receiptTransactionReferenceLabel(result)}</code></dd></> : null}
         {memberId ? <><dt>Member ID</dt><dd><code>{memberId}</code></dd><dt>Member Contract ID</dt><dd><code>{memberContractId ?? "未选择"}</code></dd><dt>外部申请引用</dt><dd><code>{memberExternalReferenceId ?? "未关联"}</code></dd></> : null}

@@ -53,7 +53,7 @@ async function createOrder(unitId: string, prefix: string, options: { member?: b
     input: {
       propertyId: demo.propertyId,
       quoteId: priced.quoteId,
-      primaryGuest: { fullName: `Guest ${prefix}` },
+      primaryGuest: { fullName: `Guest ${prefix}`, nickname: `Guest ${prefix}` },
       bookingChannelCode: "YOUMUDAO",
       channelOrderReference: `TEST-ORDER-${prefix}`,
       ...(options.stayType === "FREE" ? { freeStayReason: `Automated FREE stay fixture: ${prefix}` } : {})
@@ -84,6 +84,118 @@ afterEach(async () => {
 });
 
 describe("PostgreSQL core operations", () => {
+  it("requires a nonblank guest nickname before Preview and produces zero command or business writes", async () => {
+    const priced = await quote(demo.roomId, { arrival: "2026-08-01", departure: "2026-08-02" });
+    const artifactCounts = async () => Promise.all([
+      db.selectFrom("orders").select(({ fn }) => fn.countAll<number>().as("count")).executeTakeFirstOrThrow(),
+      db.selectFrom("stays").select(({ fn }) => fn.countAll<number>().as("count")).executeTakeFirstOrThrow(),
+      db.selectFrom("amendments").select(({ fn }) => fn.countAll<number>().as("count")).executeTakeFirstOrThrow(),
+      db.selectFrom("command_previews").select(({ fn }) => fn.countAll<number>().as("count")).executeTakeFirstOrThrow(),
+      db.selectFrom("command_executions").select(({ fn }) => fn.countAll<number>().as("count")).executeTakeFirstOrThrow(),
+      db.selectFrom("command_receipts").select(({ fn }) => fn.countAll<number>().as("count")).executeTakeFirstOrThrow(),
+      db.selectFrom("audit_entries").select(({ fn }) => fn.countAll<number>().as("count")).executeTakeFirstOrThrow()
+    ]).then((rows) => rows.map((row) => Number(row.count)));
+    const before = await artifactCounts();
+
+    for (const [label, primaryGuest] of [
+      ["missing", { fullName: "Missing nickname" }],
+      ["blank", { fullName: "Blank nickname", nickname: "   " }]
+    ] as const) {
+      await expect(createCommandPreview(db, principal, {
+        commandType: "CREATE_ORDER",
+        input: {
+          propertyId: demo.propertyId,
+          quoteId: priced.quoteId,
+          primaryGuest,
+          bookingChannelCode: "WECOM",
+          channelOrderReference: null
+        }
+      }, metadata(`nickname-${label}`))).rejects.toMatchObject({ code: "VALIDATION_ERROR", message: "nickname is required" });
+    }
+
+    expect(await artifactCounts()).toEqual(before);
+  });
+
+  it("requires a nonblank guest nickname for FREE stays before Preview and produces zero command or business writes", async () => {
+    const priced = await quote(demo.roomId, { stayType: "FREE", arrival: "2026-08-01", departure: "2026-08-02" });
+    const artifactCounts = async () => Promise.all([
+      db.selectFrom("orders").select(({ fn }) => fn.countAll<number>().as("count")).executeTakeFirstOrThrow(),
+      db.selectFrom("stays").select(({ fn }) => fn.countAll<number>().as("count")).executeTakeFirstOrThrow(),
+      db.selectFrom("amendments").select(({ fn }) => fn.countAll<number>().as("count")).executeTakeFirstOrThrow(),
+      db.selectFrom("command_previews").select(({ fn }) => fn.countAll<number>().as("count")).executeTakeFirstOrThrow(),
+      db.selectFrom("command_executions").select(({ fn }) => fn.countAll<number>().as("count")).executeTakeFirstOrThrow(),
+      db.selectFrom("command_receipts").select(({ fn }) => fn.countAll<number>().as("count")).executeTakeFirstOrThrow(),
+      db.selectFrom("audit_entries").select(({ fn }) => fn.countAll<number>().as("count")).executeTakeFirstOrThrow()
+    ]).then((rows) => rows.map((row) => Number(row.count)));
+    const before = await artifactCounts();
+
+    for (const [label, primaryGuest] of [
+      ["missing", { fullName: "Missing FREE nickname" }],
+      ["blank", { fullName: "Blank FREE nickname", nickname: "   " }]
+    ] as const) {
+      await expect(createCommandPreview(db, principal, {
+        commandType: "CREATE_ORDER",
+        input: {
+          propertyId: demo.propertyId,
+          quoteId: priced.quoteId,
+          primaryGuest,
+          bookingChannelCode: "WECOM",
+          channelOrderReference: null,
+          freeStayReason: "Volunteer accommodation fixture"
+        }
+      }, metadata(`free-nickname-${label}`))).rejects.toMatchObject({ code: "VALIDATION_ERROR", message: "nickname is required" });
+    }
+
+    expect(await artifactCounts()).toEqual(before);
+  });
+
+  it("trims and traces the guest nickname through Preview, Receipt, order query, and amendment", async () => {
+    const priced = await quote(demo.roomId, { arrival: "2026-08-03", departure: "2026-08-04" });
+    const previewMetadata = metadata("nickname-trace-preview");
+    const prepared = await createCommandPreview(db, principal, {
+      commandType: "CREATE_ORDER",
+      input: {
+        propertyId: demo.propertyId,
+        quoteId: priced.quoteId,
+        primaryGuest: { fullName: "  林晓  ", nickname: "  小林  " },
+        bookingChannelCode: "WECOM",
+        channelOrderReference: null
+      }
+    }, previewMetadata);
+    expect(prepared.preview.effect.primaryGuest).toEqual({ fullName: "林晓", nickname: "小林" });
+    expect((await db.selectFrom("command_previews")
+      .select("normalized_input")
+      .where("id", "=", prepared.preview.previewId)
+      .executeTakeFirstOrThrow()).normalized_input).toMatchObject({
+      primaryGuest: { fullName: "林晓", nickname: "小林" }
+    });
+    const replay = await createCommandPreview(db, principal, {
+      commandType: "CREATE_ORDER",
+      input: {
+        propertyId: demo.propertyId,
+        quoteId: priced.quoteId,
+        primaryGuest: { fullName: "林晓", nickname: "小林" },
+        bookingChannelCode: "WECOM",
+        channelOrderReference: null
+      }
+    }, previewMetadata);
+    expect(replay.receipt.receiptId).toBe(prepared.receipt.receiptId);
+    expect(replay.preview.previewId).toBe(prepared.preview.previewId);
+
+    const receipt = await confirmCommandPreview(db, principal, prepared.preview.previewId, {
+      propertyId: demo.propertyId,
+      commandType: "CREATE_ORDER",
+      confirmation: true,
+      expectedEffectHash: prepared.preview.effectHash,
+      reason: { code: "NICKNAME_TRACE", note: "Verify immutable guest nickname trace" }
+    }, metadata("nickname-trace-confirm"));
+    expect(receipt.result?.primaryGuest).toEqual({ fullName: "林晓", nickname: "小林" });
+
+    const view = await getOrderView(db, receipt.result!.orderId as string);
+    expect(view.order.primary_guest_snapshot).toEqual({ fullName: "林晓", nickname: "小林" });
+    expect(view.amendments[0]?.payload).toMatchObject({ primaryGuest: { fullName: "林晓", nickname: "小林" } });
+  });
+
   it("forms coverage before cash and locks policy/versioned order history", async () => {
     const priced = await quote(demo.roomId, { member: true });
     expect(priced.coverageSet).toHaveLength(2);
@@ -91,7 +203,7 @@ describe("PostgreSQL core operations", () => {
     expect(priced.cashRemainder.minorUnits).toBe(12_000);
     const receipt = await previewAndConfirm({
       commandType: "CREATE_ORDER",
-      input: { propertyId: demo.propertyId, quoteId: priced.quoteId, primaryGuest: { fullName: "Member Guest" }, bookingChannelCode: "CTRIP", channelOrderReference: "TEST-ORDER-MEMBER" }
+      input: { propertyId: demo.propertyId, quoteId: priced.quoteId, primaryGuest: { fullName: "Member Guest", nickname: "Member Guest" }, bookingChannelCode: "CTRIP", channelOrderReference: "TEST-ORDER-MEMBER" }
     }, "member-order");
     expect(receipt.businessCommitted).toBe(true);
     const view = await getOrderView(db, receipt.result!.orderId as string);
@@ -203,7 +315,7 @@ describe("PostgreSQL core operations", () => {
     await db.updateTable("quotes").set({ member_contract_id: demo.memberContractId }).where("id", "=", forged.quoteId).execute();
     await expect(createCommandPreview(db, principal, {
       commandType: "CREATE_ORDER",
-      input: { propertyId: demo.propertyId, quoteId: forged.quoteId, primaryGuest: { fullName: "No entitlement debit" }, bookingChannelCode: "MEITUAN", channelOrderReference: "TEST-ORDER-FORGED-FREE", freeStayReason: "Defensive FREE membership rejection fixture" }
+      input: { propertyId: demo.propertyId, quoteId: forged.quoteId, primaryGuest: { fullName: "No entitlement debit", nickname: "No Debit" }, bookingChannelCode: "MEITUAN", channelOrderReference: "TEST-ORDER-FORGED-FREE", freeStayReason: "Defensive FREE membership rejection fixture" }
     }, metadata("free-member-command-denied"))).rejects.toMatchObject({ code: "PRICING_POLICY_UNCONFIGURED" });
     expect(await db.selectFrom("orders").select("id").execute()).toHaveLength(0);
     expect(await db.selectFrom("entitlement_ledger").select("fact_id").execute()).toHaveLength(0);
@@ -247,8 +359,8 @@ describe("PostgreSQL core operations", () => {
     const roomQuote = await quote(demo.roomId, { stayType: "FREE" });
     const bedQuote = await quote(demo.bedAId, { stayType: "FREE" });
     const [roomPreview, bedPreview] = await Promise.all([
-      createCommandPreview(db, principal, { commandType: "CREATE_ORDER", input: { propertyId: demo.propertyId, quoteId: roomQuote.quoteId, primaryGuest: { fullName: "Room Guest" }, bookingChannelCode: "WECOM", channelOrderReference: null, freeStayReason: "Whole-room mutex fixture" } }, metadata("room-preview")),
-      createCommandPreview(db, principal, { commandType: "CREATE_ORDER", input: { propertyId: demo.propertyId, quoteId: bedQuote.quoteId, primaryGuest: { fullName: "Bed Guest" }, bookingChannelCode: "WECOM", channelOrderReference: null, freeStayReason: "Bed mutex fixture" } }, metadata("bed-preview"))
+      createCommandPreview(db, principal, { commandType: "CREATE_ORDER", input: { propertyId: demo.propertyId, quoteId: roomQuote.quoteId, primaryGuest: { fullName: "Room Guest", nickname: "Room Guest" }, bookingChannelCode: "WECOM", channelOrderReference: null, freeStayReason: "Whole-room mutex fixture" } }, metadata("room-preview")),
+      createCommandPreview(db, principal, { commandType: "CREATE_ORDER", input: { propertyId: demo.propertyId, quoteId: bedQuote.quoteId, primaryGuest: { fullName: "Bed Guest", nickname: "Bed Guest" }, bookingChannelCode: "WECOM", channelOrderReference: null, freeStayReason: "Bed mutex fixture" } }, metadata("bed-preview"))
     ]);
     const [roomResult, bedResult] = await Promise.all([
       confirmCommandPreview(db, principal, roomPreview.preview.previewId, { propertyId: demo.propertyId, commandType: "CREATE_ORDER", confirmation: true, expectedEffectHash: roomPreview.preview.effectHash, reason: { code: "TEST", note: "race" } }, metadata("room-confirm")),
@@ -269,7 +381,7 @@ describe("PostgreSQL core operations", () => {
     const priced = await quote(demo.secondRoomId, { member: true, arrival: "2026-08-01", departure: "2026-08-02" });
     const createPreview = await createCommandPreview(db, principal, {
       commandType: "CREATE_ORDER",
-      input: { propertyId: demo.propertyId, quoteId: priced.quoteId, primaryGuest: { fullName: "Lock Order Guest" }, bookingChannelCode: "CTRIP", channelOrderReference: "TEST-ORDER-LOCK" }
+      input: { propertyId: demo.propertyId, quoteId: priced.quoteId, primaryGuest: { fullName: "Lock Order Guest", nickname: "Lock Guest" }, bookingChannelCode: "CTRIP", channelOrderReference: "TEST-ORDER-LOCK" }
     }, metadata("lock-order-create-preview"));
     const adjustPreview = await createCommandPreview(db, principal, {
       commandType: "ADJUST_MEMBER_ENTITLEMENT",
@@ -295,7 +407,7 @@ describe("PostgreSQL core operations", () => {
 
   it("rejects a stale preview with zero domain writes and preserves a durable rejection receipt", async () => {
     const firstQuote = await quote(demo.secondRoomId, { stayType: "FREE" });
-    const stale = await createCommandPreview(db, principal, { commandType: "CREATE_ORDER", input: { propertyId: demo.propertyId, quoteId: firstQuote.quoteId, primaryGuest: { fullName: "Stale Guest" }, bookingChannelCode: "MEITUAN", channelOrderReference: "TEST-ORDER-STALE", freeStayReason: "Stale Preview fixture" } }, metadata("stale-preview"));
+    const stale = await createCommandPreview(db, principal, { commandType: "CREATE_ORDER", input: { propertyId: demo.propertyId, quoteId: firstQuote.quoteId, primaryGuest: { fullName: "Stale Guest", nickname: "Stale Guest" }, bookingChannelCode: "MEITUAN", channelOrderReference: "TEST-ORDER-STALE", freeStayReason: "Stale Preview fixture" } }, metadata("stale-preview"));
     await createOrder(demo.secondRoomId, "winner", { stayType: "FREE" });
     const countBefore = await db.selectFrom("orders").select(({ fn }) => fn.countAll<number>().as("count")).executeTakeFirstOrThrow();
     const rejected = await confirmCommandPreview(db, principal, stale.preview.previewId, { propertyId: demo.propertyId, commandType: "CREATE_ORDER", confirmation: true, expectedEffectHash: stale.preview.effectHash, reason: { code: "TEST", note: "stale" } }, metadata("stale-confirm"));
@@ -338,7 +450,7 @@ describe("PostgreSQL core operations", () => {
 
   it("rolls back domain facts when receipt persistence fails", async () => {
     const priced = await quote(demo.roomId, { stayType: "FREE" });
-    const preview = await createCommandPreview(db, principal, { commandType: "CREATE_ORDER", input: { propertyId: demo.propertyId, quoteId: priced.quoteId, primaryGuest: { fullName: "Rollback Guest" }, bookingChannelCode: "YOUMUDAO", channelOrderReference: "TEST-ORDER-ROLLBACK", freeStayReason: "Transaction rollback fixture" } }, metadata("rollback-preview"));
+    const preview = await createCommandPreview(db, principal, { commandType: "CREATE_ORDER", input: { propertyId: demo.propertyId, quoteId: priced.quoteId, primaryGuest: { fullName: "Rollback Guest", nickname: "Rollback Guest" }, bookingChannelCode: "YOUMUDAO", channelOrderReference: "TEST-ORDER-ROLLBACK", freeStayReason: "Transaction rollback fixture" } }, metadata("rollback-preview"));
     await sql.raw("CREATE OR REPLACE FUNCTION fail_receipt() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'forced receipt failure'; END $$; CREATE TRIGGER force_receipt_failure BEFORE INSERT ON command_receipts FOR EACH ROW EXECUTE FUNCTION fail_receipt()").execute(db);
     await expect(confirmCommandPreview(db, principal, preview.preview.previewId, { propertyId: demo.propertyId, commandType: "CREATE_ORDER", confirmation: true, expectedEffectHash: preview.preview.effectHash, reason: { code: "TEST", note: "rollback" } }, metadata("rollback-confirm"))).rejects.toThrow(/forced receipt failure/);
     const orders = await db.selectFrom("orders").select("id").execute();
@@ -874,7 +986,7 @@ describe("PostgreSQL core operations", () => {
     const priced = await quote(demo.roomId, { stayType: "FREE" });
     const preview = await createCommandPreview(db, principal, {
       commandType: "CREATE_ORDER",
-      input: { propertyId: demo.propertyId, quoteId: priced.quoteId, primaryGuest: { fullName: "Recovery Guest" }, bookingChannelCode: "WECOM", channelOrderReference: null, freeStayReason: "Command recovery fixture" }
+      input: { propertyId: demo.propertyId, quoteId: priced.quoteId, primaryGuest: { fullName: "Recovery Guest", nickname: "Recovery Guest" }, bookingChannelCode: "WECOM", channelOrderReference: null, freeStayReason: "Command recovery fixture" }
     }, { idempotencyKey: "recovery-preview", correlationId: "recovery" });
     const confirmation = {
       propertyId: demo.propertyId,

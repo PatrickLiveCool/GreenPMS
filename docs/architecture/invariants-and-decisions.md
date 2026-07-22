@@ -5,13 +5,15 @@
 1. Service dates are property-local ISO dates in `[arrivalDate, departureDate)`; departure does not claim inventory.
 2. Every bed belongs to one room. A whole-room claim conflicts with every child-bed claim on the same service date; different child beds may coexist.
 3. Orders and maintenance use the same claim tables and ordered `roomId + serviceDate` row locks.
-4. An order has one immutable primary-guest snapshot and exactly one Stay. Changes append amendments and stay segments.
+4. An order has one immutable primary-guest snapshot and exactly one Stay. Every newly created snapshot requires a trimmed, nonblank community nickname; a legacy snapshot may omit the `nickname` JSON key or contain an explicit `null`, and Query/API preserves that original representation honestly. Presentation-only labels such as `历史未记录` are never persisted. Changes append amendments and stay segments.
 5. Confirmation locks an immutable pricing-policy version. Any amount change appends a complete revision calculated with that same version.
 6. A revision's manual adjustment belongs only to that revision and defaults to zero in the next revision.
 7. Membership coverage is a concrete set of date/unit/lot entries. Holds reduce available night units, release restores them, consume records fulfillment without converting the night to cash.
 8. Collection, refund, and reversal facts are append-only. Refunds reference a collection in the same order and cannot exceed its un-reversed remaining amount.
 9. The three amount fields are arithmetic views over the current pricing revision and signed collection facts. They carry no accounting or payment-settlement meaning.
 10. A successful command's domain facts, audit event, command state, and Receipt commit in one PostgreSQL transaction.
+11. Membership changes entitlement and settlement treatment only. It neither owns guest identity nor creates a separate guest path; member and non-member orders use the same primary-guest snapshot contract.
+12. A split-bed room's daily parent-cell occupancy ratio is `occupied child beds / total physical child beds`. The numerator counts distinct child beds occupied by active normal-order or `FREE_STAY` lodging facts, excluding maintenance, `INTERNAL_USE`, cleaning, and other non-guest sources.
 
 ## Architecture decisions
 
@@ -22,6 +24,7 @@
 - Idempotency-key recovery is scoped by subject, `propertyId`, and `commandType`; recovery reads never create or update command state.
 - A projection or external Base may consume versioned queries but has no core write capability and is never required for readiness.
 - Unknown pricing behavior is an error, not a zero, nightly, prorated, or rounded fallback.
+- Room-status nickname lists come from immutable primary-guest snapshots. Compact parent cells may truncate visible names, but hover and keyboard focus expose the complete authorized list; redaction remains authoritative and client layout never invents names.
 
 ## Reversible assumptions awaiting operating facts
 

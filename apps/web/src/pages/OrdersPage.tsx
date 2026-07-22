@@ -4,7 +4,7 @@ import { Link } from "react-router-dom";
 import { api } from "../api";
 import { useWorkspace } from "../session";
 import type { OrderRowDto } from "../types";
-import { EmptyState, formatDate, guestName, InlineError, LoadingBlock, StatusBadge } from "../ui";
+import { EmptyState, formatDate, guestName, guestSearchText, InlineError, LoadingBlock, StatusBadge } from "../ui";
 
 export function OrdersPage() {
   const { propertyId } = useWorkspace();
@@ -32,7 +32,7 @@ export function OrdersPage() {
     return orders.filter((order) => {
       if (status !== "ALL" && order.status !== status) return false;
       if (!needle) return true;
-      return order.id.toLowerCase().includes(needle) || guestName(order.primary_guest_snapshot).toLowerCase().includes(needle);
+      return order.id.toLowerCase().includes(needle) || guestSearchText(order.primary_guest_snapshot).toLowerCase().includes(needle);
     });
   }, [orders, query, status]);
 
@@ -43,7 +43,7 @@ export function OrdersPage() {
         <button className="button button-secondary" type="button" onClick={() => setRefreshToken((value) => value + 1)} disabled={loading}><RefreshCw className={loading ? "spin" : ""} aria-hidden="true" size={17} />刷新</button>
       </header>
       <section className="list-toolbar" aria-label="订单筛选">
-        <label className="search-control"><Search aria-hidden="true" size={17} /><span className="sr-only">搜索订单</span><input type="search" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="订单 ID 或住客姓名" /></label>
+        <label className="search-control"><Search aria-hidden="true" size={17} /><span className="sr-only">搜索订单</span><input type="search" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="订单 ID、昵称或姓名" /></label>
         <label>状态<select value={status} onChange={(event) => setStatus(event.target.value)}><option value="ALL">全部状态</option>{statusOptions.map((option) => <option key={option} value={option}>{option.replaceAll("_", " ")}</option>)}</select></label>
         <span className="result-count">{visibleOrders.length} / {orders.length}</span>
       </section>

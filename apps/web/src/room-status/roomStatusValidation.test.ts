@@ -52,6 +52,7 @@ function validBoard(): RoomStatusBoardDto {
       capacity: 1,
       childUnitIds: [],
       children: [],
+      bedOccupancies: [],
       days: [{
         serviceDate: "2028-01-01",
         status: "AVAILABLE",
@@ -137,6 +138,123 @@ function boardWithInternalUse(): RoomStatusBoardDto {
   }];
   room.conflicts = interval.conflicts;
   room.allowedActions = interval.allowedActions;
+  return board;
+}
+
+function splitBedLodgingInterval(displayInventoryUnitId: string, actualInventoryUnitId: string): RoomStatusIntervalDto {
+  const claimReference = { type: "CLAIM" as const, id: "claim_split_validation", label: "Split-bed claim", href: null };
+  const orderReference = { type: "ORDER" as const, id: "order_split_validation", label: "Split-bed order", href: "/orders/order_split_validation" };
+  const stayReference = { type: "STAY" as const, id: "stay_split_validation", label: "Split-bed Stay", href: null };
+  return {
+    id: `interval_split_validation_${displayInventoryUnitId}`,
+    displayInventoryUnitId,
+    actualInventoryUnitId,
+    roomId: "unit_validation",
+    startDate: "2028-01-01",
+    endDate: "2028-01-02",
+    sourceStartDate: "2028-01-01",
+    sourceEndDate: "2028-01-02",
+    status: "RESERVED",
+    available: false,
+    blocking: true,
+    sourceKind: "ORDER",
+    label: "Split-bed order",
+    primaryOccupantLabel: "Validation nickname",
+    reason: null,
+    claimIds: [claimReference.id],
+    references: [claimReference, orderReference, stayReference],
+    conflicts: [{
+      id: `conflict_split_validation_${displayInventoryUnitId}`,
+      blockingFactKind: "CLAIM",
+      claimId: claimReference.id,
+      claimIds: [claimReference.id],
+      requestedInventoryUnitId: displayInventoryUnitId,
+      actualInventoryUnitId,
+      roomId: "unit_validation",
+      startDate: "2028-01-01",
+      endDate: "2028-01-02",
+      sourceKind: "ORDER",
+      sourceReference: orderReference,
+      reason: "Split-bed order",
+      blocking: true
+    }],
+    history: [],
+    allowedActions: [{
+      code: "OPEN_ORDER",
+      enabled: true,
+      disabledReason: null,
+      requiresFullInterval: false,
+      targetReference: orderReference
+    }]
+  };
+}
+
+function boardWithSplitBedLodging(): RoomStatusBoardDto {
+  const board = validBoard();
+  const room = board.rooms[0]!;
+  const childId = "bed_split_validation_a";
+  const parentInterval = splitBedLodgingInterval(room.id, childId);
+  const childInterval = splitBedLodgingInterval(childId, childId);
+  const child = {
+    ...room,
+    id: childId,
+    roomId: room.id,
+    parentRoomId: room.id,
+    kind: "BED" as const,
+    code: "V01-A",
+    name: "Validation bed A",
+    capacity: 1,
+    salesMode: "BED_SPLIT" as const,
+    childUnitIds: [],
+    children: [],
+    bedOccupancies: [],
+    days: [{
+      serviceDate: "2028-01-01",
+      status: "RESERVED" as const,
+      available: false,
+      intervalIds: [childInterval.id],
+      conflicts: [dayConflict(childInterval)]
+    }],
+    intervals: [childInterval],
+    conflicts: childInterval.conflicts,
+    allowedActions: childInterval.allowedActions
+  };
+  room.salesMode = "BED_SPLIT";
+  room.childUnitIds = [childId];
+  room.children = [child];
+  room.bedOccupancies = [{
+    serviceDate: "2028-01-01",
+    occupiedBedCount: 1,
+    totalBedCount: 1,
+    occupants: [{
+      inventoryUnitId: childId,
+      inventoryUnitCode: child.code,
+      primaryOccupantLabel: parentInterval.primaryOccupantLabel,
+      sourceReference: {
+        type: "ORDER",
+        id: "order_split_validation",
+        label: "Split-bed order",
+        href: "/orders/order_split_validation"
+      }
+    }]
+  }];
+  room.days = [{
+    serviceDate: "2028-01-01",
+    status: "RESERVED",
+    available: false,
+    intervalIds: [parentInterval.id],
+    conflicts: [dayConflict(parentInterval)]
+  }];
+  room.intervals = [parentInterval];
+  room.conflicts = parentInterval.conflicts;
+  room.allowedActions = parentInterval.allowedActions;
+  board.filterOptions = {
+    roomTypeCodes: ["VALIDATION"],
+    salesModes: ["BED_SPLIT"],
+    statuses: ["RESERVED"],
+    capacities: [1],
+    unitKinds: ["ROOM", "BED"]
+  };
   return board;
 }
 
@@ -238,6 +356,19 @@ describe("assertRoomStatusBoard", () => {
     expect(() => assertRoomStatusBoard(validBoard(), expected)).not.toThrow();
   });
 
+  it("requires READY child-bed lodging intervals to have matching occupancy while PARTIAL stays fail closed", () => {
+    expect(() => assertRoomStatusBoard(boardWithSplitBedLodging(), expected)).not.toThrow();
+
+    const missingReadyAggregation = boardWithSplitBedLodging();
+    missingReadyAggregation.rooms[0]!.bedOccupancies = [];
+    expect(() => assertRoomStatusBoard(missingReadyAggregation, expected)).toThrow(/READY 投影缺少.*唯一住客聚合/);
+
+    const partialAggregation = boardWithSplitBedLodging();
+    partialAggregation.projectionState = "PARTIAL";
+    partialAggregation.rooms[0]!.bedOccupancies = [];
+    expect(() => assertRoomStatusBoard(partialAggregation, expected)).not.toThrow();
+  });
+
   it("rejects missing or invalid freshness instead of treating it as writable", () => {
     const missing = validBoard() as unknown as Record<string, unknown>;
     delete missing.freshUntil;
@@ -252,6 +383,10 @@ describe("assertRoomStatusBoard", () => {
     const missingFacets = validBoard() as unknown as Record<string, unknown>;
     delete missingFacets.filterOptions;
     expect(() => assertRoomStatusBoard(missingFacets, expected)).toThrow(/filterOptions/);
+
+    const missingBedOccupancies = validBoard() as unknown as { rooms: Array<Record<string, unknown>> };
+    delete missingBedOccupancies.rooms[0]!.bedOccupancies;
+    expect(() => assertRoomStatusBoard(missingBedOccupancies, expected)).toThrow(/bedOccupancies/);
 
     const missingClaimIds = boardWithInternalUse() as unknown as {
       rooms: Array<{ intervals: Array<{ conflicts: Array<Record<string, unknown>> }> }>;

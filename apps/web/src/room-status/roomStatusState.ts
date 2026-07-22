@@ -1,4 +1,10 @@
-import { ROOM_STATUS_MAX_QUERY_NIGHTS, roomStatusStatuses, type RoomStatusStatus, type RoomStatusUnitDto } from "@qintopia/contracts";
+import {
+  ROOM_STATUS_MAX_QUERY_NIGHTS,
+  roomStatusStatuses,
+  type RoomStatusIntervalDto,
+  type RoomStatusStatus,
+  type RoomStatusUnitDto
+} from "@qintopia/contracts";
 
 export const MAX_VISIBLE_DAYS = 31;
 export const DEFAULT_VISIBLE_DAYS = 14;
@@ -63,6 +69,31 @@ export type RoomStatusViewAction =
 export interface FilteredRoomStatusRoom {
   room: RoomStatusUnitDto;
   children: RoomStatusUnitDto[];
+}
+
+export function intervalsRenderedOnRoomStatusGrid(
+  unit: RoomStatusUnitDto,
+  serviceDates: readonly string[] = unit.days.map((day) => day.serviceDate)
+): readonly RoomStatusIntervalDto[] {
+  if (unit.kind !== "ROOM" || unit.salesMode !== "BED_SPLIT") return unit.intervals;
+  const occupancyByDate = new Map(unit.bedOccupancies.map((occupancy) => [occupancy.serviceDate, occupancy]));
+  return unit.intervals.filter((interval) => {
+    const activeChildLodging = interval.actualInventoryUnitId !== unit.id
+      && interval.blocking
+      && (interval.sourceKind === "ORDER" || interval.sourceKind === "FREE_STAY")
+      && (interval.status === "RESERVED" || interval.status === "IN_HOUSE");
+    if (!activeChildLodging) return true;
+    const coveredDates = serviceDates.filter((serviceDate) => interval.startDate <= serviceDate && serviceDate < interval.endDate);
+    if (coveredDates.length === 0) return true;
+    const orderReferenceIds = new Set(interval.references
+      .filter((reference) => reference.type === "ORDER")
+      .map((reference) => reference.id));
+    const representedOnEveryDate = coveredDates.every((serviceDate) => occupancyByDate.get(serviceDate)?.occupants.some(
+      (occupant) => occupant.inventoryUnitId === interval.actualInventoryUnitId
+        && orderReferenceIds.has(occupant.sourceReference.id)
+    ));
+    return !representedOnEveryDate;
+  });
 }
 
 export interface RoomStatusFilterOptions {
@@ -157,6 +188,7 @@ export function roomStatusFactFingerprint(
       blocking: interval.blocking,
       sourceKind: interval.sourceKind,
       label: interval.label,
+      primaryOccupantLabel: interval.primaryOccupantLabel,
       reason: interval.reason,
       claimIds: [...interval.claimIds].sort(),
       references: interval.references.map((reference) => `${reference.type}:${reference.id}`).sort(),
@@ -164,6 +196,18 @@ export function roomStatusFactFingerprint(
       history: interval.history.map((item) => `${item.occurredAt}:${item.action}:${item.commandId ?? ""}:${item.receiptId ?? ""}`).sort(),
       allowedActions: actionFingerprint(interval.allowedActions)
     })).sort((left, right) => left.id.localeCompare(right.id));
+  const bedOccupancies = unit.bedOccupancies
+    .filter((occupancy) => occupancy.serviceDate >= target.arrivalDate && occupancy.serviceDate < target.departureDate)
+    .map((occupancy) => ({
+      serviceDate: occupancy.serviceDate,
+      occupiedBedCount: occupancy.occupiedBedCount,
+      totalBedCount: occupancy.totalBedCount,
+      occupants: occupancy.occupants.map((occupant) => ({
+        inventoryUnitId: occupant.inventoryUnitId,
+        primaryOccupantLabel: occupant.primaryOccupantLabel,
+        sourceReference: `${occupant.sourceReference.type}:${occupant.sourceReference.id}`
+      })).sort((left, right) => left.inventoryUnitId.localeCompare(right.inventoryUnitId))
+    }));
   return JSON.stringify({
     unitId: unit.id,
     active: unit.active,
@@ -171,7 +215,8 @@ export function roomStatusFactFingerprint(
     targetRange: [target.arrivalDate, target.departureDate],
     allowedActions: actionFingerprint(unit.allowedActions),
     days,
-    intervals
+    intervals,
+    bedOccupancies
   });
 }
 
