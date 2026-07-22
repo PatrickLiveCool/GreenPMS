@@ -29,7 +29,7 @@ case "$*" in
     printf '%s' "$count" > "$FAKE_OID_QUERY_COUNT_FILE"
     if [ "$count" -eq 1 ]; then printf '%s' "$FAKE_CREATED_TARGET_OID"; else printf '%s' "$FAKE_CLEANUP_TARGET_OID"; fi
     ;;
-  *"schema_migrations"*) printf '12' ;;
+  *"schema_migrations"*) printf '13' ;;
   *" pg_restore "*) if [ "$FAKE_RESTORE_FAILURE" = "1" ]; then exit 1; fi ;;
 esac
 `, { mode: 0o700 });
@@ -81,6 +81,7 @@ describe("restore script contract", () => {
       expect(calls).toContain("010_qintopia_2026_catalog_pricing_and_free_stays.sql");
       expect(calls).toContain("011_core_fact_shape_guards.sql");
       expect(calls).toContain("012_legacy_demo_inventory_catalog_backfill.sql");
+      expect(calls).toContain("013_room_status_operations.sql");
       expect(calls).not.toContain("dropdb");
     } finally {
       await rm(fixture.workdir, { recursive: true, force: true });

@@ -79,6 +79,7 @@ function trackedPatch(progress: CommandDialogProgress): TrackedCommandPatch {
   if (progress.state === "CONFIRMING") {
     return { state: "CONFIRMING", previewId: progress.previewId, confirmationKey: progress.confirmationKey };
   }
+  if (progress.state === "FAILED_NOT_EXECUTED") return { state: "NOT_EXECUTED", confirmationKey: progress.confirmationKey };
   if (progress.state === "UNKNOWN") return { state: "UNKNOWN", confirmationKey: progress.confirmationKey };
   return {
     state: progress.receipt.businessCommitted ? "EXECUTED" : "NOT_EXECUTED",

@@ -1,0 +1,150 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 760" width="1200" height="760" role="img" aria-labelledby="title desc">
+  <title id="title">QinTopia PMS 项目架构图</title>
+  <desc id="desc">运营 Web 与外部 Agent 通过统一的 Fastify API 访问查询服务和命令协议，应用复用 Contracts、Domain 与 Database 工作区包，并通过 Kysely 事务读写 PostgreSQL。</desc>
+  <style>
+    text { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', 'PingFang SC', 'Microsoft YaHei', 'Microsoft JhengHei', 'SimHei', sans-serif; letter-spacing: 0; }
+    .title { fill: #0d0d0d; font-size: 24px; font-weight: 600; }
+    .subtitle { fill: #6e6e80; font-size: 13px; font-weight: 400; }
+    .section { fill: #6e6e80; font-size: 12px; font-weight: 500; }
+    .label { fill: #0d0d0d; font-size: 16px; font-weight: 600; }
+    .small-label { fill: #0d0d0d; font-size: 14px; font-weight: 600; }
+    .description { fill: #6e6e80; font-size: 13px; font-weight: 400; }
+    .micro { fill: #6e6e80; font-size: 12px; font-weight: 400; }
+    .edge-label { fill: #6e6e80; font-size: 12px; font-weight: 400; }
+  </style>
+  <defs>
+    <marker id="arrow-green" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#10a37f"/>
+    </marker>
+    <marker id="arrow-gray" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#71717a"/>
+    </marker>
+    <marker id="arrow-orange" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#f97316"/>
+    </marker>
+  </defs>
+
+  <rect width="1200" height="760" fill="#ffffff"/>
+  <text x="600" y="42" text-anchor="middle" class="title">QinTopia PMS 项目架构</text>
+  <text x="600" y="68" text-anchor="middle" class="subtitle">统一 API · 事务型命令协议 · PostgreSQL 单一事实源</text>
+
+  <rect id="channels-container" data-graph-role="container" data-container-id="channels" data-semantic-role="boundary" data-graph-bounds="48,112,288,624" x="48" y="112" width="240" height="512" rx="8" fill="none" stroke="#e5e5e5" stroke-width="1" stroke-dasharray="4 3"/>
+  <rect id="application-container" data-graph-role="container" data-container-id="application" data-semantic-role="boundary" data-graph-bounds="336,112,896,624" x="336" y="112" width="560" height="512" rx="8" fill="none" stroke="#e5e5e5" stroke-width="1" stroke-dasharray="4 3"/>
+  <rect id="data-container" data-graph-role="container" data-container-id="data" data-semantic-role="boundary" data-graph-bounds="936,112,1152,624" x="936" y="112" width="216" height="512" rx="8" fill="none" stroke="#e5e5e5" stroke-width="1" stroke-dasharray="4 3"/>
+  <text x="64" y="136" class="section">访问渠道</text>
+  <text x="352" y="136" class="section">NODE.JS 应用 · apps/api</text>
+  <text x="952" y="136" class="section">数据与参考事实</text>
+
+  <path id="web-request" data-graph-role="edge" data-edge-id="web-request" data-source="web" data-target="fastify" data-edge-kind="flow" data-flow="primary" data-bends="2" data-route-stretch="1.05" data-bridges="" d="M 256 222 H 312 V 200 H 384" fill="none" stroke="#10a37f" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow-green)"/>
+  <path id="agent-request" data-graph-role="edge" data-edge-id="agent-request" data-source="agent" data-target="fastify" data-edge-kind="flow" data-flow="primary" data-bends="2" data-route-stretch="1.16" data-bridges="" d="M 256 374 H 312 V 232 H 384" fill="none" stroke="#10a37f" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow-green)"/>
+  <text x="296" y="192" text-anchor="middle" class="edge-label">HTTPS</text>
+  <text x="296" y="366" text-anchor="middle" class="edge-label">REST / JSON</text>
+
+  <path id="fastify-command" data-graph-role="edge" data-edge-id="fastify-command" data-source="fastify" data-target="commands" data-edge-kind="flow" data-flow="primary" data-bends="2" data-route-stretch="1.0" data-bridges="" d="M 480 256 V 280 H 488 V 312" fill="none" stroke="#10a37f" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow-green)"/>
+  <path id="fastify-query" data-graph-role="edge" data-edge-id="fastify-query" data-source="fastify" data-target="queries" data-edge-kind="flow" data-flow="primary" data-bends="2" data-route-stretch="1.0" data-bridges="" d="M 752 256 V 280 H 744 V 312" fill="none" stroke="#10a37f" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow-green)"/>
+  <text x="488" y="292" text-anchor="middle" class="edge-label">写入</text>
+  <text x="744" y="292" text-anchor="middle" class="edge-label">读取</text>
+
+  <path id="query-db" data-graph-role="edge" data-edge-id="query-db" data-source="queries" data-target="db-package" data-edge-kind="flow" data-flow="read" data-bends="2" data-route-stretch="1.0" data-bridges="" d="M 744 408 V 456 H 776 V 488" fill="none" stroke="#71717a" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow-gray)"/>
+  <text x="776" y="448" text-anchor="middle" class="edge-label">投影查询</text>
+
+  <path id="command-domain" data-graph-role="edge" data-edge-id="command-domain" data-source="commands" data-target="domain" data-edge-kind="flow" data-flow="primary" data-bends="2" data-route-stretch="1.08" data-bridges="" d="M 488 408 V 456 H 612 V 488" fill="none" stroke="#10a37f" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow-green)"/>
+  <text x="550" y="448" text-anchor="middle" class="edge-label">业务不变量</text>
+
+  <path id="contracts-domain" data-graph-role="edge" data-edge-id="contracts-domain" data-source="contracts" data-target="domain" data-edge-kind="dependency" data-flow="dependency" data-bends="0" data-route-stretch="1.0" data-bridges="" d="M 520 532 H 544" fill="none" stroke="#71717a" stroke-width="1.5" stroke-dasharray="4 3" stroke-linecap="round" marker-end="url(#arrow-gray)"/>
+  <path id="domain-db" data-graph-role="edge" data-edge-id="domain-db" data-source="domain" data-target="db-package" data-edge-kind="flow" data-flow="primary" data-bends="0" data-route-stretch="1.0" data-bridges="" d="M 680 532 H 704" fill="none" stroke="#10a37f" stroke-width="1.8" stroke-linecap="round" marker-end="url(#arrow-green)"/>
+
+  <path id="db-postgres" data-graph-role="edge" data-edge-id="db-postgres" data-source="db-package" data-target="postgres" data-edge-kind="flow" data-flow="primary" data-bends="2" data-route-stretch="1.22" data-bridges="" d="M 848 512 H 912 V 318 H 960" fill="none" stroke="#10a37f" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow-green)"/>
+  <text x="876" y="504" text-anchor="middle" class="edge-label">SQL 事务</text>
+
+  <path id="catalog-import" data-graph-role="edge" data-edge-id="catalog-import" data-source="catalog" data-target="db-package" data-edge-kind="flow" data-flow="control" data-bends="2" data-route-stretch="1.1" data-bridges="" d="M 960 532 H 928 V 568 H 848" fill="none" stroke="#f97316" stroke-width="1.5" stroke-dasharray="4 3" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow-orange)"/>
+  <text x="900" y="560" text-anchor="middle" class="edge-label">可选导入</text>
+
+  <g id="node-web" data-graph-role="node" data-node-id="web" data-semantic-role="browser" data-graph-bounds="80,176,256,264">
+    <rect x="80" y="176" width="176" height="88" rx="8" fill="#ffffff" stroke="#e5e5e5" stroke-width="1.5"/>
+    <rect x="80" y="176" width="4" height="88" rx="2" fill="#10a37f"/>
+    <text x="168" y="208" text-anchor="middle" class="label">运营 Web</text>
+    <text x="168" y="232" text-anchor="middle" class="description">React 19 · Vite</text>
+    <text x="168" y="250" text-anchor="middle" class="micro">房态 · 订单 · 会员</text>
+  </g>
+
+  <g id="node-agent" data-graph-role="node" data-node-id="agent" data-semantic-role="client" data-graph-bounds="80,328,256,416">
+    <rect x="80" y="328" width="176" height="88" rx="8" fill="#ffffff" stroke="#e5e5e5" stroke-width="1.5"/>
+    <text x="168" y="360" text-anchor="middle" class="label">外部 Agent</text>
+    <text x="168" y="384" text-anchor="middle" class="description">Bearer Token</text>
+    <text x="168" y="402" text-anchor="middle" class="micro">READ / WRITE 上限</text>
+  </g>
+
+  <g id="node-fastify" data-graph-role="node" data-node-id="fastify" data-semantic-role="gateway" data-graph-bounds="384,168,848,256">
+    <rect x="384" y="168" width="464" height="88" rx="8" fill="#ffffff" stroke="#e5e5e5" stroke-width="1.5"/>
+    <rect x="384" y="168" width="4" height="88" rx="2" fill="#10a37f"/>
+    <text x="616" y="198" text-anchor="middle" class="label">Fastify HTTP 层 · /api/v1</text>
+    <text x="616" y="222" text-anchor="middle" class="description">Session / Token 鉴权 · TypeBox 校验 · 限流 · OpenAPI 3.1</text>
+    <text x="616" y="242" text-anchor="middle" class="micro">生产构建同时托管 apps/web/dist</text>
+  </g>
+
+  <g id="node-queries" data-graph-role="node" data-node-id="queries" data-semantic-role="service" data-graph-bounds="640,312,848,408">
+    <rect x="640" y="312" width="208" height="96" rx="8" fill="#ffffff" stroke="#e5e5e5" stroke-width="1.5"/>
+    <text x="744" y="346" text-anchor="middle" class="label">查询服务</text>
+    <text x="744" y="370" text-anchor="middle" class="description">房态 · 库存 · 订单</text>
+    <text x="744" y="390" text-anchor="middle" class="micro">会员 · 审计 · 回执</text>
+  </g>
+
+  <g id="node-commands" data-graph-role="node" data-node-id="commands" data-semantic-role="service" data-graph-bounds="384,312,592,408">
+    <rect x="384" y="312" width="208" height="96" rx="8" fill="#ffffff" stroke="#e5e5e5" stroke-width="1.5"/>
+    <rect x="384" y="312" width="4" height="96" rx="2" fill="#10a37f"/>
+    <text x="488" y="346" text-anchor="middle" class="label">命令协议</text>
+    <text x="488" y="370" text-anchor="middle" class="description">Preview → Confirm → Receipt</text>
+    <text x="488" y="390" text-anchor="middle" class="micro">幂等 · 重校验 · 资源锁</text>
+  </g>
+
+  <g id="node-contracts" data-graph-role="node" data-node-id="contracts" data-semantic-role="package" data-graph-bounds="384,488,520,576">
+    <rect x="384" y="488" width="136" height="88" rx="8" fill="#ffffff" stroke="#e5e5e5" stroke-width="1.5"/>
+    <text x="452" y="522" text-anchor="middle" class="small-label">contracts</text>
+    <text x="452" y="546" text-anchor="middle" class="description">DTO · 错误码</text>
+    <text x="452" y="564" text-anchor="middle" class="micro">命令 / 回执</text>
+  </g>
+
+  <g id="node-domain" data-graph-role="node" data-node-id="domain" data-semantic-role="package" data-graph-bounds="544,488,680,576">
+    <rect x="544" y="488" width="136" height="88" rx="8" fill="#ffffff" stroke="#e5e5e5" stroke-width="1.5"/>
+    <text x="612" y="522" text-anchor="middle" class="small-label">domain</text>
+    <text x="612" y="546" text-anchor="middle" class="description">定价 · 日期</text>
+    <text x="612" y="564" text-anchor="middle" class="micro">权限 · 不变量</text>
+  </g>
+
+  <g id="node-db-package" data-graph-role="node" data-node-id="db-package" data-semantic-role="package" data-graph-bounds="704,488,848,576">
+    <rect x="704" y="488" width="144" height="88" rx="8" fill="#ffffff" stroke="#e5e5e5" stroke-width="1.5"/>
+    <rect x="704" y="488" width="4" height="88" rx="2" fill="#10a37f"/>
+    <text x="776" y="522" text-anchor="middle" class="small-label">db</text>
+    <text x="776" y="546" text-anchor="middle" class="description">Kysely · pg</text>
+    <text x="776" y="564" text-anchor="middle" class="micro">事务 · 仓储 · 投影</text>
+  </g>
+
+  <g id="node-postgres" data-graph-role="node" data-node-id="postgres" data-semantic-role="database" data-graph-bounds="960,240,1128,368">
+    <path d="M 960 258 Q 960 240 1044 240 Q 1128 240 1128 258 V 350 Q 1128 368 1044 368 Q 960 368 960 350 Z" fill="#ffffff" stroke="#e5e5e5" stroke-width="1.5"/>
+    <ellipse cx="1044" cy="258" rx="84" ry="18" fill="#ffffff" stroke="#e5e5e5" stroke-width="1.5"/>
+    <path d="M 960 304 Q 960 322 1044 322 Q 1128 322 1128 304" fill="none" stroke="#e5e5e5" stroke-width="1"/>
+    <rect x="960" y="240" width="4" height="112" rx="2" fill="#10a37f"/>
+    <text x="1044" y="290" text-anchor="middle" class="label">PostgreSQL 16</text>
+    <text x="1044" y="314" text-anchor="middle" class="description">唯一运行时数据库</text>
+    <text x="1044" y="344" text-anchor="middle" class="micro">事实 · 约束 · 审计 · 回执</text>
+  </g>
+
+  <g id="node-catalog" data-graph-role="node" data-node-id="catalog" data-semantic-role="artifact" data-graph-bounds="960,480,1128,576">
+    <rect x="960" y="480" width="168" height="96" rx="8" fill="#ffffff" stroke="#e5e5e5" stroke-width="1.5"/>
+    <rect x="960" y="480" width="4" height="96" rx="2" fill="#f97316"/>
+    <text x="1044" y="514" text-anchor="middle" class="small-label">2026 参考目录</text>
+    <text x="1044" y="538" text-anchor="middle" class="description">JSON · revision 561</text>
+    <text x="1044" y="558" text-anchor="middle" class="micro">只读、密封、可追溯</text>
+  </g>
+
+  <line x1="128" y1="684" x2="176" y2="684" stroke="#10a37f" stroke-width="1.8" marker-end="url(#arrow-green)"/>
+  <text x="190" y="688" class="micro">主请求 / 事务流</text>
+  <line x1="376" y1="684" x2="424" y2="684" stroke="#71717a" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#arrow-gray)"/>
+  <text x="438" y="688" class="micro">共享类型依赖</text>
+  <line x1="608" y1="684" x2="656" y2="684" stroke="#f97316" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#arrow-orange)"/>
+  <text x="670" y="688" class="micro">可选参考事实导入</text>
+  <text x="1072" y="688" text-anchor="end" class="micro">无 Redis · 无消息队列 · 无支付网关</text>
+  <line x1="48" y1="716" x2="1152" y2="716" stroke="#e5e5e5" stroke-width="1"/>
+  <text x="48" y="740" class="micro">依据：README、workspace package 依赖、Fastify 路由、命令服务与数据库实现（2026-07-20）</text>
+</svg>

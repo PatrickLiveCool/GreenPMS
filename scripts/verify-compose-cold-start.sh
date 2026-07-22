@@ -71,10 +71,10 @@ curl --fail --silent --show-error -b "$cookie_jar" \
   -d '{"propertyId":"prop_qintopia_demo","inventoryUnitId":"unit_room_101","stayType":"FREE","arrivalDate":"2028-12-10","departureDate":"2028-12-12","pricingPolicyVersionId":"policy_free_v1"}' \
   "$base_url/api/v1/quotes" >/dev/null
 
-required_migration_count="$(docker exec "$postgres_container" psql -U qintopia -d qintopia -Atc "SELECT count(*) FROM schema_migrations WHERE name IN ('001_initial.sql','002_immutability.sql','003_active_coverage_uniqueness.sql','004_security_identity_guards.sql','005_core_identity_and_entitlement_guards.sql','006_property_scoped_idempotency.sql','007_reference_catalog.sql','008_reference_catalog_sealing.sql','009_booking_channels_and_transaction_references.sql','010_qintopia_2026_catalog_pricing_and_free_stays.sql','011_core_fact_shape_guards.sql','012_legacy_demo_inventory_catalog_backfill.sql')")"
+required_migration_count="$(docker exec "$postgres_container" psql -U qintopia -d qintopia -Atc "SELECT count(*) FROM schema_migrations WHERE name IN ('001_initial.sql','002_immutability.sql','003_active_coverage_uniqueness.sql','004_security_identity_guards.sql','005_core_identity_and_entitlement_guards.sql','006_property_scoped_idempotency.sql','007_reference_catalog.sql','008_reference_catalog_sealing.sql','009_booking_channels_and_transaction_references.sql','010_qintopia_2026_catalog_pricing_and_free_stays.sql','011_core_fact_shape_guards.sql','012_legacy_demo_inventory_catalog_backfill.sql','013_room_status_operations.sql')")"
 demo_subject_count="$(docker exec "$postgres_container" psql -U qintopia -d qintopia -Atc "SELECT count(*) FROM subjects WHERE username = 'operator' AND status = 'ACTIVE'")"
 operational_column_count="$(docker exec "$postgres_container" psql -U qintopia -d qintopia -Atc "SELECT count(*) FROM information_schema.columns WHERE (table_name = 'orders' AND column_name IN ('booking_channel_code','channel_order_reference')) OR (table_name = 'collection_facts' AND column_name = 'transaction_reference')")"
-test "$required_migration_count" = "12"
+test "$required_migration_count" = "13"
 test "$demo_subject_count" = "1"
 test "$operational_column_count" = "3"
 

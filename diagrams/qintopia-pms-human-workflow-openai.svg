@@ -1,0 +1,309 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 1740" width="1600" height="1740" role="img" aria-labelledby="title desc">
+  <title id="title">QinTopia PMS 人工工作流</title>
+  <desc id="desc">突出运营人员从登录、选择库存、报价、创建订单、确认命令、处理变更、记录收退款、结束履约与异常恢复时需要执行的操作和填写的数据。</desc>
+  <style>
+    text { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', 'PingFang SC', 'Microsoft YaHei', 'Microsoft JhengHei', 'SimHei', sans-serif; letter-spacing: 0; }
+    .title { fill: #0d0d0d; font-size: 25px; font-weight: 600; }
+    .subtitle { fill: #6e6e80; font-size: 13px; font-weight: 400; }
+    .lane { fill: #6e6e80; font-size: 13px; font-weight: 600; }
+    .lane-human { fill: #f97316; font-size: 13px; font-weight: 600; }
+    .label { fill: #0d0d0d; font-size: 16px; font-weight: 600; }
+    .small-label { fill: #0d0d0d; font-size: 14px; font-weight: 600; }
+    .description { fill: #6e6e80; font-size: 13px; font-weight: 400; }
+    .micro { fill: #6e6e80; font-size: 12px; font-weight: 400; }
+    .input-head { fill: #f97316; font-size: 12px; font-weight: 600; }
+    .required { fill: #c2410c; font-size: 12px; font-weight: 600; }
+    .system-head { fill: #10a37f; font-size: 12px; font-weight: 600; }
+  </style>
+  <defs>
+    <marker id="arrow-orange" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#f97316"/>
+    </marker>
+    <marker id="arrow-green" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#10a37f"/>
+    </marker>
+    <marker id="arrow-gray" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#71717a"/>
+    </marker>
+  </defs>
+
+  <rect width="1600" height="1740" fill="#ffffff"/>
+  <text x="800" y="42" text-anchor="middle" class="title">QinTopia PMS 人工工作流</text>
+  <text x="800" y="68" text-anchor="middle" class="subtitle">橙色 = 人工操作与判断 · 绿色 = 系统自动处理 · <tspan fill="#c2410c" font-weight="600">*</tspan> = 必填</text>
+
+  <rect id="input-lane" data-graph-role="container" data-container-id="input-lane" data-semantic-role="boundary" data-graph-bounds="48,104,440,1344" x="48" y="104" width="392" height="1240" rx="8" fill="none" stroke="#e5e5e5" stroke-width="1" stroke-dasharray="4 3"/>
+  <rect id="human-lane" data-graph-role="container" data-container-id="human-lane" data-semantic-role="boundary" data-graph-bounds="472,104,984,1344" x="472" y="104" width="512" height="1240" rx="8" fill="none" stroke="#f97316" stroke-opacity="0.55" stroke-width="1.2" stroke-dasharray="4 3"/>
+  <rect id="system-lane" data-graph-role="container" data-container-id="system-lane" data-semantic-role="boundary" data-graph-bounds="1016,104,1552,1344" x="1016" y="104" width="536" height="1240" rx="8" fill="none" stroke="#e5e5e5" stroke-width="1" stroke-dasharray="4 3"/>
+  <text x="64" y="128" class="lane">需要填写 / 选择的数据</text>
+  <text x="488" y="128" class="lane-human">人工操作主线</text>
+  <text x="1032" y="128" class="lane">系统自动处理与反馈</text>
+
+  <!-- Main human progression -->
+  <path id="human-1-2" data-graph-role="edge" data-edge-id="human-1-2" data-source="human-login" data-target="human-select" data-edge-kind="flow" data-flow="control" data-bends="0" data-route-stretch="1" data-bridges="" d="M 728 240 V 288" fill="none" stroke="#f97316" stroke-width="1.8" marker-end="url(#arrow-orange)"/>
+  <path id="human-2-3" data-graph-role="edge" data-edge-id="human-2-3" data-source="human-select" data-target="human-quote" data-edge-kind="flow" data-flow="control" data-bends="0" data-route-stretch="1" data-bridges="" d="M 728 392 V 440" fill="none" stroke="#f97316" stroke-width="1.8" marker-end="url(#arrow-orange)"/>
+  <path id="human-3-4" data-graph-role="edge" data-edge-id="human-3-4" data-source="human-quote" data-target="human-order" data-edge-kind="flow" data-flow="control" data-bends="0" data-route-stretch="1" data-bridges="" d="M 728 552 V 600" fill="none" stroke="#f97316" stroke-width="1.8" marker-end="url(#arrow-orange)"/>
+  <path id="human-4-5" data-graph-role="edge" data-edge-id="human-4-5" data-source="human-order" data-target="human-confirm" data-edge-kind="flow" data-flow="control" data-bends="0" data-route-stretch="1" data-bridges="" d="M 728 728 V 776" fill="none" stroke="#f97316" stroke-width="1.8" marker-end="url(#arrow-orange)"/>
+  <path id="human-5-6" data-graph-role="edge" data-edge-id="human-5-6" data-source="human-confirm" data-target="human-change" data-edge-kind="flow" data-flow="control" data-bends="0" data-route-stretch="1" data-bridges="" d="M 728 896 V 944" fill="none" stroke="#f97316" stroke-width="1.8" marker-end="url(#arrow-orange)"/>
+  <path id="human-6-7" data-graph-role="edge" data-edge-id="human-6-7" data-source="human-change" data-target="human-cash" data-edge-kind="flow" data-flow="control" data-bends="0" data-route-stretch="1" data-bridges="" d="M 728 1064 V 1112" fill="none" stroke="#f97316" stroke-width="1.8" marker-end="url(#arrow-orange)"/>
+  <path id="human-7-8" data-graph-role="edge" data-edge-id="human-7-8" data-source="human-cash" data-target="human-close" data-edge-kind="flow" data-flow="control" data-bends="0" data-route-stretch="1" data-bridges="" d="M 728 1232 V 1260" fill="none" stroke="#f97316" stroke-width="1.8" marker-end="url(#arrow-orange)"/>
+
+  <!-- Input and system sidecar connections -->
+  <path id="input-login" data-graph-role="edge" data-edge-id="input-login" data-source="data-login" data-target="human-login" data-edge-kind="flow" data-flow="input" data-bends="0" data-route-stretch="1" data-bridges="" d="M 416 196 H 512" fill="none" stroke="#f97316" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#arrow-orange)"/>
+  <path id="system-login" data-graph-role="edge" data-edge-id="system-login" data-source="human-login" data-target="system-login" data-edge-kind="flow" data-flow="primary" data-bends="0" data-route-stretch="1" data-bridges="" d="M 944 196 H 1056" fill="none" stroke="#10a37f" stroke-width="1.6" marker-end="url(#arrow-green)"/>
+  <path id="input-select" data-graph-role="edge" data-edge-id="input-select" data-source="data-select" data-target="human-select" data-edge-kind="flow" data-flow="input" data-bends="0" data-route-stretch="1" data-bridges="" d="M 416 340 H 512" fill="none" stroke="#f97316" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#arrow-orange)"/>
+  <path id="system-select" data-graph-role="edge" data-edge-id="system-select" data-source="human-select" data-target="system-select" data-edge-kind="flow" data-flow="primary" data-bends="0" data-route-stretch="1" data-bridges="" d="M 944 340 H 1056" fill="none" stroke="#10a37f" stroke-width="1.6" marker-end="url(#arrow-green)"/>
+  <path id="input-quote" data-graph-role="edge" data-edge-id="input-quote" data-source="data-quote" data-target="human-quote" data-edge-kind="flow" data-flow="input" data-bends="0" data-route-stretch="1" data-bridges="" d="M 416 496 H 512" fill="none" stroke="#f97316" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#arrow-orange)"/>
+  <path id="system-quote" data-graph-role="edge" data-edge-id="system-quote" data-source="human-quote" data-target="system-quote" data-edge-kind="flow" data-flow="primary" data-bends="0" data-route-stretch="1" data-bridges="" d="M 944 496 H 1056" fill="none" stroke="#10a37f" stroke-width="1.6" marker-end="url(#arrow-green)"/>
+  <path id="input-order" data-graph-role="edge" data-edge-id="input-order" data-source="data-order" data-target="human-order" data-edge-kind="flow" data-flow="input" data-bends="0" data-route-stretch="1" data-bridges="" d="M 416 664 H 512" fill="none" stroke="#f97316" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#arrow-orange)"/>
+  <path id="system-order" data-graph-role="edge" data-edge-id="system-order" data-source="human-order" data-target="system-order" data-edge-kind="flow" data-flow="primary" data-bends="0" data-route-stretch="1" data-bridges="" d="M 944 664 H 1056" fill="none" stroke="#10a37f" stroke-width="1.6" marker-end="url(#arrow-green)"/>
+  <path id="input-confirm" data-graph-role="edge" data-edge-id="input-confirm" data-source="data-confirm" data-target="human-confirm" data-edge-kind="flow" data-flow="input" data-bends="0" data-route-stretch="1" data-bridges="" d="M 416 836 H 512" fill="none" stroke="#f97316" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#arrow-orange)"/>
+  <path id="system-confirm" data-graph-role="edge" data-edge-id="system-confirm" data-source="human-confirm" data-target="system-confirm" data-edge-kind="flow" data-flow="primary" data-bends="0" data-route-stretch="1" data-bridges="" d="M 944 836 H 1056" fill="none" stroke="#10a37f" stroke-width="1.6" marker-end="url(#arrow-green)"/>
+  <path id="input-change" data-graph-role="edge" data-edge-id="input-change" data-source="data-change" data-target="human-change" data-edge-kind="flow" data-flow="input" data-bends="0" data-route-stretch="1" data-bridges="" d="M 416 1004 H 512" fill="none" stroke="#f97316" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#arrow-orange)"/>
+  <path id="system-change" data-graph-role="edge" data-edge-id="system-change" data-source="human-change" data-target="system-change" data-edge-kind="flow" data-flow="primary" data-bends="0" data-route-stretch="1" data-bridges="" d="M 944 1004 H 1056" fill="none" stroke="#10a37f" stroke-width="1.6" marker-end="url(#arrow-green)"/>
+  <path id="input-cash" data-graph-role="edge" data-edge-id="input-cash" data-source="data-cash" data-target="human-cash" data-edge-kind="flow" data-flow="input" data-bends="0" data-route-stretch="1" data-bridges="" d="M 416 1172 H 512" fill="none" stroke="#f97316" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#arrow-orange)"/>
+  <path id="system-cash" data-graph-role="edge" data-edge-id="system-cash" data-source="human-cash" data-target="system-cash" data-edge-kind="flow" data-flow="primary" data-bends="0" data-route-stretch="1" data-bridges="" d="M 944 1172 H 1056" fill="none" stroke="#10a37f" stroke-width="1.6" marker-end="url(#arrow-green)"/>
+  <path id="input-close" data-graph-role="edge" data-edge-id="input-close" data-source="data-close" data-target="human-close" data-edge-kind="flow" data-flow="input" data-bends="0" data-route-stretch="1" data-bridges="" d="M 416 1296 H 512" fill="none" stroke="#f97316" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#arrow-orange)"/>
+  <path id="system-close" data-graph-role="edge" data-edge-id="system-close" data-source="human-close" data-target="system-close" data-edge-kind="flow" data-flow="primary" data-bends="0" data-route-stretch="1" data-bridges="" d="M 944 1296 H 1056" fill="none" stroke="#10a37f" stroke-width="1.6" marker-end="url(#arrow-green)"/>
+
+  <!-- Row 1 -->
+  <g id="node-data-login" data-graph-role="node" data-node-id="data-login" data-semantic-role="input" data-graph-bounds="72,152,416,240">
+    <rect x="72" y="152" width="344" height="88" rx="8" fill="#ffffff" stroke="#e5e5e5" stroke-width="1.5"/>
+    <rect x="72" y="152" width="4" height="88" rx="2" fill="#f97316"/>
+    <text x="92" y="178" class="input-head">人工填写</text>
+    <text x="92" y="202" class="required">账号 *　密码 *</text>
+    <text x="92" y="224" class="micro">凭据仅用于建立运营会话</text>
+  </g>
+  <g id="node-human-login" data-graph-role="node" data-node-id="human-login" data-semantic-role="human-action" data-graph-bounds="512,152,944,240">
+    <rect x="512" y="152" width="432" height="88" rx="8" fill="#ffffff" stroke="#f97316" stroke-width="1.5"/>
+    <rect x="512" y="152" width="4" height="88" rx="2" fill="#f97316"/>
+    <text x="728" y="186" text-anchor="middle" class="label">1. 登录运营工作台</text>
+    <text x="728" y="212" text-anchor="middle" class="description">人工输入账号密码并进入当前物业工作区</text>
+  </g>
+  <g id="node-system-login" data-graph-role="node" data-node-id="system-login" data-semantic-role="system-action" data-graph-bounds="1056,152,1528,240">
+    <rect x="1056" y="152" width="472" height="88" rx="8" fill="#ffffff" stroke="#e5e5e5" stroke-width="1.5"/>
+    <rect x="1056" y="152" width="4" height="88" rx="2" fill="#10a37f"/>
+    <text x="1076" y="178" class="system-head">系统自动</text>
+    <text x="1292" y="202" text-anchor="middle" class="small-label">校验账号、建立 Session</text>
+    <text x="1292" y="224" text-anchor="middle" class="micro">载入主体、物业范围与 READ / WRITE 权限</text>
+  </g>
+
+  <!-- Row 2 -->
+  <g id="node-data-select" data-graph-role="node" data-node-id="data-select" data-semantic-role="input" data-graph-bounds="72,288,416,392">
+    <rect x="72" y="288" width="344" height="104" rx="8" fill="#ffffff" stroke="#e5e5e5" stroke-width="1.5"/>
+    <rect x="72" y="288" width="4" height="104" rx="2" fill="#f97316"/>
+    <text x="92" y="314" class="input-head">人工选择</text>
+    <text x="92" y="338" class="required">房间或床位 *　入住日期 *</text>
+    <text x="92" y="360" class="required">退房日期 *</text>
+    <text x="92" y="382" class="micro">日期采用 [入住, 退房) 半开区间</text>
+  </g>
+  <g id="node-human-select" data-graph-role="node" data-node-id="human-select" data-semantic-role="human-action" data-graph-bounds="512,288,944,392">
+    <rect x="512" y="288" width="432" height="104" rx="8" fill="#ffffff" stroke="#f97316" stroke-width="1.5"/>
+    <rect x="512" y="288" width="4" height="104" rx="2" fill="#f97316"/>
+    <text x="728" y="326" text-anchor="middle" class="label">2. 查看房态并框选住宿区间</text>
+    <text x="728" y="352" text-anchor="middle" class="description">人工核对房号、销售粒度、日期与冲突提示</text>
+    <text x="728" y="374" text-anchor="middle" class="micro">拖选本身不会创建订单、Claim 或 Block</text>
+  </g>
+  <g id="node-system-select" data-graph-role="node" data-node-id="system-select" data-semantic-role="system-action" data-graph-bounds="1056,288,1528,392">
+    <rect x="1056" y="288" width="472" height="104" rx="8" fill="#ffffff" stroke="#e5e5e5" stroke-width="1.5"/>
+    <rect x="1056" y="288" width="4" height="104" rx="2" fill="#10a37f"/>
+    <text x="1076" y="314" class="system-head">系统自动</text>
+    <text x="1292" y="338" text-anchor="middle" class="small-label">返回权威房态与可售性</text>
+    <text x="1292" y="362" text-anchor="middle" class="description">整房 / 子床互斥、维修、内部占用、订单区间</text>
+    <text x="1292" y="382" text-anchor="middle" class="micro">阻断冲突由服务端计算</text>
+  </g>
+
+  <!-- Row 3 -->
+  <g id="node-data-quote" data-graph-role="node" data-node-id="data-quote" data-semantic-role="input" data-graph-bounds="72,440,416,552">
+    <rect x="72" y="440" width="344" height="112" rx="8" fill="#ffffff" stroke="#e5e5e5" stroke-width="1.5"/>
+    <rect x="72" y="440" width="4" height="112" rx="2" fill="#f97316"/>
+    <text x="92" y="466" class="input-head">人工选择</text>
+    <text x="92" y="490" class="required">住宿类型 *　计价政策版本 *</text>
+    <text x="92" y="512" class="micro">会员搜索：身份证号 / 姓名（可选）</text>
+    <text x="92" y="534" class="micro">会员合同（可选；FREE 不使用）</text>
+  </g>
+  <g id="node-human-quote" data-graph-role="node" data-node-id="human-quote" data-semantic-role="human-action" data-graph-bounds="512,440,944,552">
+    <rect x="512" y="440" width="432" height="112" rx="8" fill="#ffffff" stroke="#f97316" stroke-width="1.5"/>
+    <rect x="512" y="440" width="4" height="112" rx="2" fill="#f97316"/>
+    <text x="728" y="482" text-anchor="middle" class="label">3. 发起服务端报价</text>
+    <text x="728" y="508" text-anchor="middle" class="description">人工确认选择后点击“获取服务端报价”</text>
+    <text x="728" y="530" text-anchor="middle" class="micro">报价是单阶段命令，不走 Preview / Confirm</text>
+  </g>
+  <g id="node-system-quote" data-graph-role="node" data-node-id="system-quote" data-semantic-role="system-action" data-graph-bounds="1056,440,1528,552">
+    <rect x="1056" y="440" width="472" height="112" rx="8" fill="#ffffff" stroke="#e5e5e5" stroke-width="1.5"/>
+    <rect x="1056" y="440" width="4" height="112" rx="2" fill="#10a37f"/>
+    <text x="1076" y="466" class="system-head">系统自动生成</text>
+    <text x="1292" y="490" text-anchor="middle" class="small-label">Quote ID 与锁定政策版本</text>
+    <text x="1292" y="514" text-anchor="middle" class="description">会员 coverageSet · 现金计价行 · 最终合同金额</text>
+    <text x="1292" y="536" text-anchor="middle" class="micro">同时给出有效期与永久 Receipt</text>
+  </g>
+
+  <!-- Row 4 -->
+  <g id="node-data-order" data-graph-role="node" data-node-id="data-order" data-semantic-role="input" data-graph-bounds="72,600,416,728">
+    <rect x="72" y="600" width="344" height="128" rx="8" fill="#ffffff" stroke="#e5e5e5" stroke-width="1.5"/>
+    <rect x="72" y="600" width="4" height="128" rx="2" fill="#f97316"/>
+    <text x="92" y="626" class="input-head">人工填写</text>
+    <text x="92" y="650" class="required">住客姓名 *　订单来源渠道 *</text>
+    <text x="92" y="672" class="micro">联系电话、证件号码（可选）</text>
+    <text x="92" y="694" class="micro">渠道订单号（可选；WECOM 必须为空）</text>
+    <text x="92" y="716" class="required">FREE：免费入住原因 *</text>
+  </g>
+  <g id="node-human-order" data-graph-role="node" data-node-id="human-order" data-semantic-role="human-action" data-graph-bounds="512,600,944,728">
+    <rect x="512" y="600" width="432" height="128" rx="8" fill="#ffffff" stroke="#f97316" stroke-width="1.5"/>
+    <rect x="512" y="600" width="4" height="128" rx="2" fill="#f97316"/>
+    <text x="728" y="646" text-anchor="middle" class="label">4. 填写住客快照并创建订单</text>
+    <text x="728" y="674" text-anchor="middle" class="description">人工核对报价金额、覆盖日期和住客身份</text>
+    <text x="728" y="698" text-anchor="middle" class="micro">点击“Preview 创建订单”进入高风险写入流程</text>
+  </g>
+  <g id="node-system-order" data-graph-role="node" data-node-id="system-order" data-semantic-role="system-action" data-graph-bounds="1056,600,1528,728">
+    <rect x="1056" y="600" width="472" height="128" rx="8" fill="#ffffff" stroke="#e5e5e5" stroke-width="1.5"/>
+    <rect x="1056" y="600" width="4" height="128" rx="2" fill="#10a37f"/>
+    <text x="1076" y="626" class="system-head">系统自动预演</text>
+    <text x="1292" y="652" text-anchor="middle" class="small-label">生成 Preview 与 effectHash</text>
+    <text x="1292" y="678" text-anchor="middle" class="description">展示库存、价格、权益和状态的变更前后差异</text>
+    <text x="1292" y="702" text-anchor="middle" class="micro">此时尚未提交业务写入</text>
+  </g>
+
+  <!-- Row 5 -->
+  <g id="node-data-confirm" data-graph-role="node" data-node-id="data-confirm" data-semantic-role="input" data-graph-bounds="72,776,416,896">
+    <rect x="72" y="776" width="344" height="120" rx="8" fill="#ffffff" stroke="#f97316" stroke-width="1.5"/>
+    <rect x="72" y="776" width="4" height="120" rx="2" fill="#f97316"/>
+    <text x="92" y="802" class="input-head">每个写命令都必须人工填写</text>
+    <text x="92" y="828" class="required">原因代码 *</text>
+    <text x="92" y="850" class="required">原因说明 *</text>
+    <text x="92" y="874" class="micro">默认代码：OPERATOR_CONFIRMED</text>
+  </g>
+  <g id="node-human-confirm" data-graph-role="node" data-node-id="human-confirm" data-semantic-role="human-gate" data-graph-bounds="512,776,944,896">
+    <rect x="512" y="776" width="432" height="120" rx="8" fill="#ffffff" stroke="#f97316" stroke-width="2"/>
+    <rect x="512" y="776" width="6" height="120" rx="3" fill="#f97316"/>
+    <text x="728" y="816" text-anchor="middle" class="label">5. 人工确认关口</text>
+    <text x="728" y="844" text-anchor="middle" class="description">核对 effect：价格、库存、权益、状态与目标引用</text>
+    <text x="728" y="870" text-anchor="middle" class="small-label" fill="#c2410c">明确填写依据后，点击“确认提交”</text>
+  </g>
+  <g id="node-system-confirm" data-graph-role="node" data-node-id="system-confirm" data-semantic-role="system-action" data-graph-bounds="1056,776,1528,896">
+    <rect x="1056" y="776" width="472" height="120" rx="8" fill="#ffffff" stroke="#e5e5e5" stroke-width="1.5"/>
+    <rect x="1056" y="776" width="4" height="120" rx="2" fill="#10a37f"/>
+    <text x="1076" y="802" class="system-head">系统重新校验并事务提交</text>
+    <text x="1292" y="830" text-anchor="middle" class="description">权限、聚合版本、库存日槽、权益与锁定政策</text>
+    <text x="1292" y="854" text-anchor="middle" class="small-label">返回 EXECUTED / NOT_EXECUTED Receipt</text>
+    <text x="1292" y="878" text-anchor="middle" class="micro">Receipt、审计与业务事实原子持久化</text>
+  </g>
+
+  <!-- Row 6 -->
+  <g id="node-data-change" data-graph-role="node" data-node-id="data-change" data-semantic-role="input" data-graph-bounds="72,944,416,1064">
+    <rect x="72" y="944" width="344" height="120" rx="8" fill="#ffffff" stroke="#e5e5e5" stroke-width="1.5"/>
+    <rect x="72" y="944" width="4" height="120" rx="2" fill="#f97316"/>
+    <text x="92" y="970" class="input-head">按操作填写</text>
+    <text x="92" y="994" class="required">续住 / 缩短：新离店日期 *</text>
+    <text x="92" y="1016" class="required">换房：目标库存 *　生效日期 *</text>
+    <text x="92" y="1038" class="required">调价：最终总价（整数元）*</text>
+    <text x="92" y="1056" class="micro">入住 / 取消 / 未到：无额外业务字段</text>
+  </g>
+  <g id="node-human-change" data-graph-role="node" data-node-id="human-change" data-semantic-role="human-action" data-graph-bounds="512,944,944,1064">
+    <rect x="512" y="944" width="432" height="120" rx="8" fill="#ffffff" stroke="#f97316" stroke-width="1.5"/>
+    <rect x="512" y="944" width="4" height="120" rx="2" fill="#f97316"/>
+    <text x="728" y="984" text-anchor="middle" class="label">6. 办理入住与订单变更</text>
+    <text x="728" y="1012" text-anchor="middle" class="description">人工选择入住、续住、缩短、换房、调价或取消</text>
+    <text x="728" y="1038" text-anchor="middle" class="micro">每次操作都重新经过 Preview / Confirm</text>
+  </g>
+  <g id="node-system-change" data-graph-role="node" data-node-id="system-change" data-semantic-role="system-action" data-graph-bounds="1056,944,1528,1064">
+    <rect x="1056" y="944" width="472" height="120" rx="8" fill="#ffffff" stroke="#e5e5e5" stroke-width="1.5"/>
+    <rect x="1056" y="944" width="4" height="120" rx="2" fill="#10a37f"/>
+    <text x="1076" y="970" class="system-head">系统自动重算</text>
+    <text x="1292" y="996" text-anchor="middle" class="description">锁定政策重算 · 新增 amendment / pricing revision</text>
+    <text x="1292" y="1020" text-anchor="middle" class="description">锁定 / 释放库存 · HELD 权益转为 CONSUMED</text>
+    <text x="1292" y="1044" text-anchor="middle" class="micro">人工调价不会自动继承到后续 revision</text>
+  </g>
+
+  <!-- Row 7 -->
+  <g id="node-data-cash" data-graph-role="node" data-node-id="data-cash" data-semantic-role="input" data-graph-bounds="72,1112,416,1232">
+    <rect x="72" y="1112" width="344" height="120" rx="8" fill="#ffffff" stroke="#f97316" stroke-width="1.5"/>
+    <rect x="72" y="1112" width="4" height="120" rx="2" fill="#f97316"/>
+    <text x="92" y="1138" class="input-head">人工录入经营事实</text>
+    <text x="92" y="1162" class="required">金额（最小货币单位）*　方式 *</text>
+    <text x="92" y="1184" class="required">该笔外部交易单号 *</text>
+    <text x="92" y="1206" class="micro">备注可选；退款还需选择原收款 *</text>
+  </g>
+  <g id="node-human-cash" data-graph-role="node" data-node-id="human-cash" data-semantic-role="human-action" data-graph-bounds="512,1112,944,1232">
+    <rect x="512" y="1112" width="432" height="120" rx="8" fill="#ffffff" stroke="#f97316" stroke-width="1.5"/>
+    <rect x="512" y="1112" width="4" height="120" rx="2" fill="#f97316"/>
+    <text x="728" y="1152" text-anchor="middle" class="label">7. 记录收款 / 退款事实</text>
+    <text x="728" y="1180" text-anchor="middle" class="description">人工根据线下经营凭据逐笔录入，不代表外部结算证明</text>
+    <text x="728" y="1206" text-anchor="middle" class="micro">退款必须引用同订单原收款，再走确认关口</text>
+  </g>
+  <g id="node-system-cash" data-graph-role="node" data-node-id="system-cash" data-semantic-role="system-action" data-graph-bounds="1056,1112,1528,1232">
+    <rect x="1056" y="1112" width="472" height="120" rx="8" fill="#ffffff" stroke="#e5e5e5" stroke-width="1.5"/>
+    <rect x="1056" y="1112" width="4" height="120" rx="2" fill="#10a37f"/>
+    <text x="1076" y="1138" class="system-head">系统自动校验与记账</text>
+    <text x="1292" y="1164" text-anchor="middle" class="description">校验正整数金额、交易号、退款引用与可退上限</text>
+    <text x="1292" y="1188" text-anchor="middle" class="small-label">追加不可变 COLLECTION / REFUND Fact</text>
+    <text x="1292" y="1212" text-anchor="middle" class="micro">重算 netRecordedCollection 与 collectionDifference</text>
+  </g>
+
+  <!-- Row 8 -->
+  <g id="node-data-close" data-graph-role="node" data-node-id="data-close" data-semantic-role="input" data-graph-bounds="72,1260,416,1332">
+    <rect x="72" y="1260" width="344" height="72" rx="8" fill="#ffffff" stroke="#e5e5e5" stroke-width="1.5"/>
+    <rect x="72" y="1260" width="4" height="72" rx="2" fill="#f97316"/>
+    <text x="92" y="1286" class="input-head">异常时人工保留</text>
+    <text x="92" y="1310" class="required">原幂等键；不要创建新 Key</text>
+  </g>
+  <g id="node-human-close" data-graph-role="node" data-node-id="human-close" data-semantic-role="human-action" data-graph-bounds="512,1260,944,1332">
+    <rect x="512" y="1260" width="432" height="72" rx="8" fill="#ffffff" stroke="#f97316" stroke-width="1.5"/>
+    <rect x="512" y="1260" width="4" height="72" rx="2" fill="#f97316"/>
+    <text x="728" y="1288" text-anchor="middle" class="label">8. 退房并收口；中断时查询原结果</text>
+    <text x="728" y="1312" text-anchor="middle" class="micro">人工点击退房；网络不确定时只执行“查询命令结果”</text>
+  </g>
+  <g id="node-system-close" data-graph-role="node" data-node-id="system-close" data-semantic-role="system-action" data-graph-bounds="1056,1260,1528,1332">
+    <rect x="1056" y="1260" width="472" height="72" rx="8" fill="#ffffff" stroke="#e5e5e5" stroke-width="1.5"/>
+    <rect x="1056" y="1260" width="4" height="72" rx="2" fill="#10a37f"/>
+    <text x="1292" y="1288" text-anchor="middle" class="small-label">完成 Stay、释放库存，或恢复原 Receipt</text>
+    <text x="1292" y="1312" text-anchor="middle" class="micro">结果仅为 EXECUTED / NOT_EXECUTED / UNKNOWN</text>
+  </g>
+
+  <!-- Parallel human workflows -->
+  <rect id="parallel-container" data-graph-role="container" data-container-id="parallel" data-semantic-role="boundary" data-graph-bounds="48,1384,1552,1648" x="48" y="1384" width="1504" height="264" rx="8" fill="none" stroke="#e5e5e5" stroke-width="1" stroke-dasharray="4 3"/>
+  <text x="64" y="1410" class="lane-human">并行人工工作流 · 同样必须经过 Preview / Confirm</text>
+
+  <g id="node-member-workflow" data-graph-role="node" data-node-id="member-workflow" data-semantic-role="human-action" data-graph-bounds="80,1432,520,1616">
+    <rect x="80" y="1432" width="440" height="184" rx="8" fill="#ffffff" stroke="#f97316" stroke-width="1.5"/>
+    <rect x="80" y="1432" width="4" height="184" rx="2" fill="#f97316"/>
+    <text x="104" y="1462" class="small-label">会员与权益</text>
+    <text x="104" y="1490" class="required">登记：姓名 *、身份证 *、手机 *、微信 *</text>
+    <text x="104" y="1512" class="required">合同开始 / 结束日 *；飞书 Record ID 可选</text>
+    <text x="104" y="1534" class="required">新增 Lot：权益类型 *、单位数 *、到期日 *</text>
+    <text x="104" y="1556" class="required">调整：非零数量 *、调整原因 *</text>
+    <text x="104" y="1578" class="required">到期：核算日期 *</text>
+    <text x="104" y="1602" class="micro">申请引用本身不会自动发放权益</text>
+  </g>
+
+  <g id="node-inventory-workflow" data-graph-role="node" data-node-id="inventory-workflow" data-semantic-role="human-action" data-graph-bounds="580,1432,1020,1616">
+    <rect x="580" y="1432" width="440" height="184" rx="8" fill="#ffffff" stroke="#f97316" stroke-width="1.5"/>
+    <rect x="580" y="1432" width="4" height="184" rx="2" fill="#f97316"/>
+    <text x="604" y="1462" class="small-label">维修与内部占用</text>
+    <text x="604" y="1490" class="required">选择库存 *、开始日期 *、结束日期 *</text>
+    <text x="604" y="1512" class="required">维修原因 / 内部占用原因 *</text>
+    <text x="604" y="1538" class="description">人工选择锁定、释放或完成清洁</text>
+    <text x="604" y="1562" class="description">系统重检整房与子床互斥后创建 Block</text>
+    <text x="604" y="1586" class="micro">释放操作仍需填写统一确认原因</text>
+  </g>
+
+  <g id="node-token-workflow" data-graph-role="node" data-node-id="token-workflow" data-semantic-role="human-action" data-graph-bounds="1080,1432,1520,1616">
+    <rect x="1080" y="1432" width="440" height="184" rx="8" fill="#ffffff" stroke="#f97316" stroke-width="1.5"/>
+    <rect x="1080" y="1432" width="4" height="184" rx="2" fill="#f97316"/>
+    <text x="1104" y="1462" class="small-label">外部 Agent Token</text>
+    <text x="1104" y="1490" class="required">签发：标签 *、权限上限 *、过期时间 *</text>
+    <text x="1104" y="1512" class="required">人工安全保存一次性 Secret *</text>
+    <text x="1104" y="1534" class="required">勾选“已安全保存”后才能继续 *</text>
+    <text x="1104" y="1560" class="description">轮换后旧 Token 立即撤销</text>
+    <text x="1104" y="1584" class="micro">服务端只保存 SHA-256 哈希，无法找回明文</text>
+  </g>
+
+  <line x1="64" y1="1680" x2="112" y2="1680" stroke="#f97316" stroke-width="1.8" marker-end="url(#arrow-orange)"/>
+  <text x="126" y="1684" class="micro">人工步骤</text>
+  <line x1="264" y1="1680" x2="312" y2="1680" stroke="#f97316" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#arrow-orange)"/>
+  <text x="326" y="1684" class="micro">人工输入</text>
+  <line x1="464" y1="1680" x2="512" y2="1680" stroke="#10a37f" stroke-width="1.6" marker-end="url(#arrow-green)"/>
+  <text x="526" y="1684" class="micro">系统处理</text>
+  <text x="1536" y="1684" text-anchor="end" class="micro">所有业务写入都保留 Command、Receipt、审计与关联事实</text>
+  <line x1="48" y1="1710" x2="1552" y2="1710" stroke="#e5e5e5" stroke-width="1"/>
+  <text x="48" y="1732" class="micro">依据：当前 Web 表单、CommandDialog、命令 Schema 与 README（2026-07-20）</text>
+</svg>

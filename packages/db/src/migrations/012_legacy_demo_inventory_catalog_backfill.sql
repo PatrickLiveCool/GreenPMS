@@ -59,4 +59,6 @@ WHERE unit.property_id = 'prop_qintopia_demo'
   AND unit.code_provenance IS NULL
   AND unit.physical_bed_count IS NULL;
 
+SET CONSTRAINTS inventory_units_validate_hierarchy IMMEDIATE;
+
 ALTER TABLE inventory_units ENABLE TRIGGER inventory_units_protect_identity;

@@ -108,6 +108,16 @@ describe("shared Web command recovery persistence", () => {
     expect(readPersistedCommandRecovery(storage, context.subjectId, context.scopeId)).toEqual({ kind: "VALID", recovery: resolved });
   });
 
+  it("clears a retained confirmation after a definitive non-retryable failure", () => {
+    const started = transitionPersistedCommandRecovery(undefined, context, confirming).recovery!;
+    const failed = transitionPersistedCommandRecovery(started, context, {
+      state: "FAILED_NOT_EXECUTED",
+      confirmationKey: confirming.confirmationKey
+    });
+
+    expect(failed).toEqual({ accepted: true, recovery: undefined });
+  });
+
   it("does not regress a terminal result or resurrect a cleared attempt from delayed callbacks", () => {
     const terminal = transitionPersistedCommandRecovery(
       transitionPersistedCommandRecovery(undefined, context, confirming).recovery,
