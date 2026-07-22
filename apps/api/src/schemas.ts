@@ -1,5 +1,20 @@
 import { Type, type TObject, type TProperties } from "@sinclair/typebox";
-import { bookingChannelCodes, commandTypes, errorCauseCodes, errorCodes, recoverableCommandTypes, stayTypes, type CommandType } from "@qintopia/contracts";
+import {
+  bookingChannelCodes,
+  commandTypes,
+  errorCauseCodes,
+  errorCodes,
+  ROOM_STATUS_MAX_QUERY_NIGHTS,
+  ROOM_STATUS_OPERATIONAL_TASK_LIMIT,
+  recoverableCommandTypes,
+  roomStatusActionCodes,
+  roomStatusBlockingFactKinds,
+  roomStatusOperationalTaskKinds,
+  roomStatusSourceKinds,
+  roomStatusStatuses,
+  stayTypes,
+  type CommandType
+} from "@qintopia/contracts";
 
 const strictObject = <T extends TProperties>(properties: T) => Type.Object(properties, { additionalProperties: false });
 const nullable = <T extends Parameters<typeof Type.Union>[0][number]>(schema: T) => Type.Union([schema, Type.Null()]);
@@ -98,7 +113,8 @@ const ErrorDetailsSchema = Type.Union([
     maximum: Type.Literal("2147483647")
   }),
   strictObject({ orderId: Id, serviceDate: LocalDate, coverageId: Id }),
-  strictObject({ orderId: Id, serviceDate: LocalDate, activeClaimIds: Type.Array(Id) })
+  strictObject({ orderId: Id, serviceDate: LocalDate, activeClaimIds: Type.Array(Id) }),
+  strictObject({ cleaningTaskId: Id, status: Type.Union([Type.Literal("PENDING"), Type.Literal("COMPLETED")]) })
 ]);
 
 export const ErrorResponse = strictObject({
@@ -123,7 +139,6 @@ const PrimaryGuestSchema = strictObject({
 });
 const PropertyInput = { propertyId: Id };
 const OrderInput = { ...PropertyInput, orderId: Id };
-
 export const CommandEnvelopeSchema = Type.Union([
   commandEnvelope("CREATE_MEMBER", strictObject({
     ...PropertyInput,
@@ -152,6 +167,9 @@ export const CommandEnvelopeSchema = Type.Union([
   commandEnvelope("MARK_NO_SHOW", strictObject(OrderInput)),
   commandEnvelope("LOCK_MAINTENANCE", strictObject({ ...PropertyInput, inventoryUnitId: Id, arrivalDate: LocalDate, departureDate: LocalDate, reason: Note })),
   commandEnvelope("RELEASE_MAINTENANCE", strictObject({ ...PropertyInput, maintenanceLockId: Id })),
+  commandEnvelope("PLACE_INTERNAL_USE", strictObject({ ...PropertyInput, inventoryUnitId: Id, arrivalDate: LocalDate, departureDate: LocalDate, reason: Note })),
+  commandEnvelope("RELEASE_INTERNAL_USE", strictObject({ ...PropertyInput, internalUseBlockId: Id })),
+  commandEnvelope("COMPLETE_CLEANING", strictObject({ ...PropertyInput, cleaningTaskId: Id })),
   commandEnvelope("RECORD_COLLECTION", strictObject({ ...OrderInput, amountMinor: PositiveAmount, method: ShortText, transactionReference: ShortText, note: Type.Optional(OptionalNote) })),
   commandEnvelope("RECORD_REFUND", strictObject({ ...OrderInput, amountMinor: PositiveAmount, referencesFactId: Id, method: ShortText, transactionReference: ShortText, note: Type.Optional(OptionalNote) })),
   commandEnvelope("REVERSE_FACT", strictObject({ ...OrderInput, reversesFactId: Id, note: Note })),
@@ -291,6 +309,25 @@ export const CommandEffectSchema = Type.Union([
   strictObject({ inventoryUnit: InventoryUnitRecordSchema, arrivalDate: LocalDate, departureDate: LocalDate, reason: Note }),
   strictObject({ maintenanceLockId: Id, inventoryUnitId: Id, arrivalDate: LocalDate, departureDate: LocalDate }),
   strictObject({
+    internalUseBlockId: Id,
+    inventoryUnitId: Id,
+    arrivalDate: LocalDate,
+    departureDate: LocalDate,
+    reason: Note,
+    fromStatus: Type.Literal("ACTIVE"),
+    toStatus: Type.Literal("RELEASED")
+  }),
+  strictObject({
+    cleaningTaskId: Id,
+    orderId: Id,
+    stayId: Id,
+    inventoryUnitId: Id,
+    roomId: Id,
+    serviceDate: LocalDate,
+    fromStatus: Type.Literal("PENDING"),
+    toStatus: Type.Literal("COMPLETED")
+  }),
+  strictObject({
     entitlementLotId: Id,
     contractId: Id,
     unitKind: EntitlementUnitKindSchema,
@@ -361,6 +398,11 @@ export const CommandEffectSchema = Type.Union([
     freeStayReason: Type.Optional(nullable(Note)),
     currentContractAmount: Type.Optional(Money),
     amounts: Type.Optional(AmountSummarySchema),
+    cleaningTask: Type.Optional(strictObject({
+      inventoryUnitId: Id,
+      serviceDate: LocalDate,
+      status: Type.Literal("PENDING")
+    })),
     entitlementTransition: Type.Optional(strictObject({
       from: Type.Literal("HELD"),
       to: Type.Union([Type.Literal("CONSUMED"), Type.Literal("RELEASED")]),
@@ -396,6 +438,15 @@ const CreateMemberResultSchema = strictObject({
 });
 const MaintenanceLockResultSchema = strictObject({ maintenanceLockId: Id });
 const MaintenanceReleaseResultSchema = strictObject({ maintenanceLockId: Id, status: Type.Literal("RELEASED") });
+const InternalUsePlacementResultSchema = strictObject({
+  internalUseBlockId: Id,
+  inventoryUnitId: Id,
+  arrivalDate: LocalDate,
+  departureDate: LocalDate,
+  status: Type.Literal("ACTIVE")
+});
+const InternalUseReleaseResultSchema = strictObject({ internalUseBlockId: Id, status: Type.Literal("RELEASED") });
+const CleaningCompletionResultSchema = strictObject({ cleaningTaskId: Id, status: Type.Literal("COMPLETED") });
 const EntitlementAdjustmentResultSchema = strictObject({ entitlementLotId: Id, adjustmentFactId: Id });
 const EntitlementLotAddedResultSchema = strictObject({ entitlementLotId: Id, contractId: Id, adjustmentFactId: Id, units: PositiveAmount });
 const EntitlementExpirationResultSchema = strictObject({
@@ -441,6 +492,7 @@ const OrderStatusResultSchema = strictObject({
   amendmentId: Id,
   status: OrderStatusSchema,
   pricingRevisionId: Type.Optional(Id),
+  cleaningTaskId: Type.Optional(Id),
   entitlementTransition: Type.Optional(strictObject({
     from: Type.Literal("HELD"),
     to: Type.Union([Type.Literal("CONSUMED"), Type.Literal("RELEASED")]),
@@ -456,6 +508,9 @@ export const ExecutedCommandResultSchema = Type.Union([
   CreateOrderResultSchema,
   MaintenanceLockResultSchema,
   MaintenanceReleaseResultSchema,
+  InternalUsePlacementResultSchema,
+  InternalUseReleaseResultSchema,
+  CleaningCompletionResultSchema,
   EntitlementAdjustmentResultSchema,
   EntitlementLotAddedResultSchema,
   EntitlementExpirationResultSchema,
@@ -513,8 +568,182 @@ export const AvailabilityUnitSchema = strictObject({
   inventoryBasis: nullable(Type.Union([Type.Literal("INDEPENDENT"), Type.Literal("WHOLE_ROOM_COMBINATION")])),
   codeProvenance: nullable(Type.Union([Type.Literal("SOURCE_EXPLICIT"), Type.Literal("USER_CONFIRMED_RENAMED"), Type.Literal("PMS_GENERATED")])),
   physicalBedCount: nullable(Type.Integer({ minimum: 1, maximum: 4 })),
-  nights: Type.Array(strictObject({ serviceDate: LocalDate, available: Type.Boolean(), blockingClaimIds: Type.Array(Id) })),
+  nights: Type.Array(strictObject({
+    serviceDate: LocalDate,
+    available: Type.Boolean(),
+    blockingClaimIds: Type.Array(Id)
+  })),
   available: Type.Boolean()
+});
+
+export const RoomStatusStatusSchema = Type.Union(roomStatusStatuses.map((status) => Type.Literal(status)));
+export const RoomStatusSourceKindSchema = Type.Union(roomStatusSourceKinds.map((kind) => Type.Literal(kind)));
+export const RoomStatusActionCodeSchema = Type.Union(roomStatusActionCodes.map((code) => Type.Literal(code)));
+export const RoomStatusOperationalTaskKindSchema = Type.Union(roomStatusOperationalTaskKinds.map((kind) => Type.Literal(kind)));
+export const RoomStatusSalesModeSchema = Type.Union([
+  Type.Literal("WHOLE_ROOM"), Type.Literal("BED_SPLIT"), Type.Literal("UNAVAILABLE")
+]);
+export const RoomStatusQuerySchema = strictObject({
+  arrivalDate: LocalDate,
+  departureDate: LocalDate,
+  page: Type.Optional(Type.Integer({ minimum: 0 })),
+  pageSize: Type.Optional(Type.Integer({ minimum: 1, maximum: 200 })),
+  search: Type.Optional(Type.String({ minLength: 1, maxLength: 200 })),
+  roomType: Type.Optional(Type.String({ minLength: 1, maxLength: 200 })),
+  salesMode: Type.Optional(RoomStatusSalesModeSchema),
+  status: Type.Optional(RoomStatusStatusSchema),
+  minCapacity: Type.Optional(Type.Integer({ minimum: 1, maximum: 1000 })),
+  unitKind: Type.Optional(InventoryUnitKindSchema)
+});
+const RoomStatusDisplayText = Type.String({ minLength: 1 });
+export const RoomStatusReferenceSchema = strictObject({
+  type: Type.Union([
+    Type.Literal("CLAIM"), Type.Literal("ORDER"), Type.Literal("STAY"), Type.Literal("OPERATIONS"),
+    Type.Literal("BLOCK"), Type.Literal("INVENTORY_UNIT"), Type.Literal("RECEIPT")
+  ]),
+  id: Id,
+  label: RoomStatusDisplayText,
+  href: nullable(Type.String({ minLength: 1, maxLength: 500 }))
+});
+export const RoomStatusActionSchema = strictObject({
+  code: RoomStatusActionCodeSchema,
+  enabled: Type.Boolean(),
+  disabledReason: nullable(Type.String({ minLength: 1, maxLength: 1000 })),
+  requiresFullInterval: Type.Boolean(),
+  targetReference: nullable(RoomStatusReferenceSchema)
+});
+export const RoomStatusHistorySchema = strictObject({
+  action: Type.String({ minLength: 1, maxLength: 200 }),
+  actorId: nullable(Id),
+  source: Type.Union([Type.Literal("WEB_SESSION"), Type.Literal("API_TOKEN"), Type.Literal("SYSTEM"), Type.Literal("UNKNOWN")]),
+  occurredAt: DateTime,
+  commandId: nullable(Id),
+  receiptId: nullable(Id),
+  correlationId: nullable(Type.String({ minLength: 1, maxLength: 160 }))
+});
+export const RoomStatusConflictSchema = strictObject({
+  id: Id,
+  blockingFactKind: Type.Union(roomStatusBlockingFactKinds.map((kind) => Type.Literal(kind))),
+  claimId: nullable(Id),
+  claimIds: Type.Array(Id),
+  requestedInventoryUnitId: Id,
+  actualInventoryUnitId: Id,
+  roomId: Id,
+  startDate: LocalDate,
+  endDate: LocalDate,
+  sourceKind: RoomStatusSourceKindSchema,
+  sourceReference: RoomStatusReferenceSchema,
+  reason: RoomStatusDisplayText,
+  blocking: Type.Literal(true)
+});
+export const RoomStatusIntervalSchema = strictObject({
+  id: Id,
+  displayInventoryUnitId: Id,
+  actualInventoryUnitId: Id,
+  roomId: Id,
+  startDate: LocalDate,
+  endDate: LocalDate,
+  sourceStartDate: LocalDate,
+  sourceEndDate: LocalDate,
+  status: RoomStatusStatusSchema,
+  available: Type.Boolean(),
+  blocking: Type.Boolean(),
+  sourceKind: RoomStatusSourceKindSchema,
+  label: RoomStatusDisplayText,
+  primaryOccupantLabel: nullable(ShortText),
+  reason: nullable(RoomStatusDisplayText),
+  claimIds: Type.Array(Id),
+  references: Type.Array(RoomStatusReferenceSchema),
+  conflicts: Type.Array(RoomStatusConflictSchema),
+  history: Type.Array(RoomStatusHistorySchema),
+  allowedActions: Type.Array(RoomStatusActionSchema)
+});
+export const RoomStatusOperationalTaskSchema = strictObject({
+  taskKind: RoomStatusOperationalTaskKindSchema,
+  businessDate: LocalDate,
+  id: Id,
+  displayInventoryUnitId: Id,
+  actualInventoryUnitId: Id,
+  roomId: Id,
+  startDate: LocalDate,
+  endDate: LocalDate,
+  sourceStartDate: LocalDate,
+  sourceEndDate: LocalDate,
+  status: RoomStatusStatusSchema,
+  available: Type.Boolean(),
+  blocking: Type.Boolean(),
+  sourceKind: RoomStatusSourceKindSchema,
+  label: RoomStatusDisplayText,
+  primaryOccupantLabel: nullable(ShortText),
+  reason: nullable(RoomStatusDisplayText),
+  claimIds: Type.Array(Id),
+  references: Type.Array(RoomStatusReferenceSchema),
+  conflicts: Type.Array(RoomStatusConflictSchema),
+  history: Type.Array(RoomStatusHistorySchema),
+  allowedActions: Type.Array(RoomStatusActionSchema)
+});
+export const RoomStatusDaySchema = strictObject({
+  serviceDate: LocalDate,
+  status: RoomStatusStatusSchema,
+  available: Type.Boolean(),
+  intervalIds: Type.Array(Id),
+  conflicts: Type.Array(RoomStatusConflictSchema)
+});
+const RoomStatusUnitBase = {
+  id: Id,
+  propertyId: Id,
+  roomId: Id,
+  code: RoomStatusDisplayText,
+  name: RoomStatusDisplayText,
+  active: Type.Boolean(),
+  salesMode: RoomStatusSalesModeSchema,
+  buildingCode: nullable(ShortText),
+  roomTypeCode: nullable(ShortText),
+  pricingProductCode: nullable(ShortText),
+  capacity: Type.Integer({ minimum: 1 }),
+  childUnitIds: Type.Array(Id),
+  days: Type.Array(RoomStatusDaySchema),
+  intervals: Type.Array(RoomStatusIntervalSchema),
+  conflicts: Type.Array(RoomStatusConflictSchema),
+  allowedActions: Type.Array(RoomStatusActionSchema)
+};
+const RoomStatusBedUnitSchema = strictObject({
+  ...RoomStatusUnitBase,
+  parentRoomId: Id,
+  kind: Type.Literal("BED"),
+  children: Type.Array(Type.Never(), { maxItems: 0 })
+});
+export const RoomStatusUnitSchema = strictObject({
+  ...RoomStatusUnitBase,
+  parentRoomId: Type.Null(),
+  kind: Type.Literal("ROOM"),
+  children: Type.Array(RoomStatusBedUnitSchema)
+});
+export const RoomStatusBoardSchema = strictObject({
+  propertyId: Id,
+  businessDate: LocalDate,
+  range: strictObject({ arrivalDate: LocalDate, departureDate: LocalDate }),
+  dates: Type.Array(LocalDate, { maxItems: ROOM_STATUS_MAX_QUERY_NIGHTS }),
+  asOf: DateTime,
+  freshUntil: DateTime,
+  revision: Type.String({ minLength: 1, maxLength: 80, pattern: "^\\d+$" }),
+  accessLevel: AccessLevelSchema,
+  projectionState: Type.Union([Type.Literal("READY"), Type.Literal("PARTIAL")]),
+  filterOptions: strictObject({
+    roomTypeCodes: Type.Array(ShortText),
+    salesModes: Type.Array(RoomStatusSalesModeSchema),
+    statuses: Type.Array(RoomStatusStatusSchema),
+    capacities: Type.Array(Type.Integer({ minimum: 1 })),
+    unitKinds: Type.Array(InventoryUnitKindSchema)
+  }),
+  page: strictObject({
+    index: Type.Integer({ minimum: 0 }),
+    size: Type.Integer({ minimum: 1, maximum: 200 }),
+    totalRooms: Type.Integer({ minimum: 0 }),
+    totalPages: Type.Integer({ minimum: 0 })
+  }),
+  operationalTasks: Type.Array(RoomStatusOperationalTaskSchema, { maxItems: ROOM_STATUS_OPERATIONAL_TASK_LIMIT }),
+  rooms: Type.Array(RoomStatusUnitSchema)
 });
 
 export const LoginSchema = strictObject({

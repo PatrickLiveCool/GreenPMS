@@ -1,21 +1,29 @@
-import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
-import { CalendarDays, FilePlus2, Filter, LockOpen, RefreshCw, Search, ShieldCheck, Wrench } from "lucide-react";
-import { api, type ClientCommandMetadata } from "../api";
-import { addLocalDateDays, defaultInventoryDates } from "../dates";
+import { useEffect, useMemo, useReducer, useRef, useState, type FormEvent } from "react";
+import { FilePlus2, RefreshCw, Search, ShieldCheck } from "lucide-react";
+import { useNavigate } from "react-router-dom";
+import type {
+  RoomStatusActionDto,
+  RoomStatusBoardDto,
+  RoomStatusBoardQueryDto,
+  RoomStatusConflictDto,
+  RoomStatusDayDto,
+  RoomStatusIntervalDto,
+  RoomStatusUnitDto
+} from "@qintopia/contracts";
+import { api, ApiError, type ClientCommandMetadata } from "../api";
+import { addLocalDateDays, localDateInTimeZone } from "../dates";
 import { useWorkspace } from "../session";
 import type {
   BookingChannelCode,
   CommandRequest,
-  InventoryUnitDto,
-  MaintenanceLockDto,
   PricingPolicyVersionDto,
   QuoteDto,
   ReceiptDto,
-  StayType,
-  UnitAvailabilityDto
+  StayType
 } from "../types";
 import {
   CommandDialog,
+  type CommandDialogProgress,
   type CommandRecoveryStorage,
   CommandRecoveryBar,
   EmptyState,
@@ -26,9 +34,33 @@ import {
   LoadingBlock,
   Modal,
   recoveryCommandRequest,
-  StatusBadge,
   usePersistentCommandRecovery
 } from "../ui";
+import {
+  assertRoomStatusBoard,
+  createRoomStatusViewState,
+  filterRoomStatusRooms,
+  hasActiveRoomStatusFilters,
+  isIsoLocalDate,
+  parseRoomStatusRestoration,
+  reconcileRoomStatusRestoration,
+  roomStatusFactFingerprint,
+  RoomStatusContext,
+  RoomStatusGrid,
+  RoomStatusMobileTasks,
+  RoomStatusToolbar,
+  roomStatusViewReducer,
+  selectionFromCells,
+  serializeRoomStatusRestoration,
+  useRoomStatusMobileViewport,
+  type RoomStatusMobileGroups,
+  type RoomStatusMobileFocusRequest,
+  type RoomStatusMobileTab,
+  type RoomStatusRange,
+  type RoomStatusRestorationSnapshot,
+  type RoomStatusSelection,
+  type RoomStatusViewState
+} from "../room-status";
 
 const stayLabels: Record<StayType, string> = {
   TRANSIENT: "临住",
@@ -113,6 +145,56 @@ export class QuoteRequestGuard {
 
   isActive(lease: QuoteRequestLease): boolean {
     return this.mounted && lease.scope === this.scope && lease.generation === this.generation;
+  }
+}
+
+export class RoomStatusCommandAttemptGuard {
+  private generation = 0;
+  private activeAttemptId: number | null = null;
+
+  begin(): number {
+    const attemptId = ++this.generation;
+    this.activeAttemptId = attemptId;
+    return attemptId;
+  }
+
+  invalidate(): void {
+    this.activeAttemptId = null;
+  }
+
+  runIfActive(attemptId: number, action: () => void): boolean {
+    if (this.activeAttemptId !== attemptId) return false;
+    action();
+    return true;
+  }
+}
+
+export class RoomStatusQueryAttemptGuard {
+  private generation = 0;
+  private activeAttemptId: number | null = null;
+
+  begin(): number {
+    const attemptId = ++this.generation;
+    this.activeAttemptId = attemptId;
+    return attemptId;
+  }
+
+  isInFlight(): boolean {
+    return this.activeAttemptId !== null;
+  }
+
+  isActive(attemptId: number): boolean {
+    return this.activeAttemptId === attemptId;
+  }
+
+  finish(attemptId: number): boolean {
+    if (!this.isActive(attemptId)) return false;
+    this.activeAttemptId = null;
+    return true;
+  }
+
+  invalidate(attemptId: number): boolean {
+    return this.finish(attemptId);
   }
 }
 
@@ -213,24 +295,52 @@ function quoteFromReceipt(receipt: ReceiptDto): QuoteDto {
   return record as unknown as QuoteDto;
 }
 
-function unitName(unit: UnitAvailabilityDto | InventoryUnitDto | undefined) {
+interface InventoryActionUnit {
+  id: string;
+  kind: "ROOM" | "BED";
+  code: string;
+  name: string;
+  available: boolean;
+}
+
+function unitName(unit: InventoryActionUnit | undefined) {
   return unit ? `${unit.code} · ${unit.name}` : "未选择库存单元";
 }
 
-function MaintenanceDialog({ unit, arrivalDate, departureDate, onClose, onSubmit }: {
-  unit: UnitAvailabilityDto;
+export function roomStatusBlockDraftWithinSelection(
+  from: string,
+  to: string,
+  selectionArrivalDate: string,
+  selectionDepartureDate: string
+): boolean {
+  return isIsoLocalDate(from)
+    && isIsoLocalDate(to)
+    && selectionArrivalDate <= from
+    && from < to
+    && to <= selectionDepartureDate;
+}
+
+function MaintenanceDialog({ unit, arrivalDate, departureDate, writeBlocked, onClose, onSubmit }: {
+  unit: InventoryActionUnit;
   arrivalDate: string;
   departureDate: string;
+  writeBlocked: boolean;
   onClose: () => void;
-  onSubmit: (request: CommandRequest) => void;
+  onSubmit: (request: CommandRequest) => boolean;
 }) {
   const { propertyId } = useWorkspace();
   const [from, setFrom] = useState(arrivalDate);
   const [to, setTo] = useState(departureDate);
   const [reason, setReason] = useState("");
+  const [validationError, setValidationError] = useState<Error>();
 
   function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (!roomStatusBlockDraftWithinSelection(from, to, arrivalDate, departureDate)) {
+      setValidationError(new Error(`维修日期必须位于已验证选区 [${arrivalDate}, ${departureDate}) 内，且至少包含一晚。`));
+      return;
+    }
+    setValidationError(undefined);
     onSubmit({
       commandType: "LOCK_MAINTENANCE",
       title: `维修锁房 · ${unit.code}`,
@@ -242,12 +352,65 @@ function MaintenanceDialog({ unit, arrivalDate, departureDate, onClose, onSubmit
   return (
     <Modal title={`维修锁房 · ${unitName(unit)}`} onClose={onClose} footer={null}>
       <form className="modal-form" onSubmit={submit}>
+        <InlineError
+          error={writeBlocked ? new Error("当前房态已陈旧、正在刷新、权限已收窄或命令恢复尚未收口。日期和原因草稿仍保留，重新取得可写房态后再继续。") : undefined}
+          title="草稿已保留，写入已暂停"
+        />
+        <InlineError error={validationError} title="维修日期未通过房态校验" />
         <div className="form-grid form-grid-two">
-          <label>开始日期<input type="date" value={from} onChange={(event) => setFrom(event.target.value)} required /></label>
-          <label>结束日期<input type="date" value={to} min={from} onChange={(event) => setTo(event.target.value)} required /></label>
+          <label>开始日期<input type="date" value={from} min={arrivalDate} max={addLocalDateDays(departureDate, -1)} onChange={(event) => { setFrom(event.target.value); setValidationError(undefined); }} required /></label>
+          <label>结束日期<input type="date" value={to} min={isIsoLocalDate(from) ? addLocalDateDays(from, 1) : arrivalDate} max={departureDate} onChange={(event) => { setTo(event.target.value); setValidationError(undefined); }} required /></label>
           <label className="span-two">维修原因<textarea rows={3} value={reason} onChange={(event) => setReason(event.target.value)} required maxLength={1000} /></label>
         </div>
-        <div className="form-actions"><button type="button" className="button button-secondary" onClick={onClose}>取消</button><button type="submit" className="button button-primary">继续生成 Preview</button></div>
+        <div className="form-actions"><button type="button" className="button button-secondary" onClick={onClose}>取消</button><button type="submit" className="button button-primary" disabled={writeBlocked}>继续生成 Preview</button></div>
+      </form>
+    </Modal>
+  );
+}
+
+function InternalUseDialog({ unit, arrivalDate, departureDate, writeBlocked, onClose, onSubmit }: {
+  unit: InventoryActionUnit;
+  arrivalDate: string;
+  departureDate: string;
+  writeBlocked: boolean;
+  onClose: () => void;
+  onSubmit: (request: CommandRequest) => boolean;
+}) {
+  const { propertyId } = useWorkspace();
+  const [from, setFrom] = useState(arrivalDate);
+  const [to, setTo] = useState(departureDate);
+  const [reason, setReason] = useState("");
+  const [validationError, setValidationError] = useState<Error>();
+
+  function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!roomStatusBlockDraftWithinSelection(from, to, arrivalDate, departureDate)) {
+      setValidationError(new Error(`内部占用日期必须位于已验证选区 [${arrivalDate}, ${departureDate}) 内，且至少包含一晚。`));
+      return;
+    }
+    setValidationError(undefined);
+    onSubmit({
+      commandType: "PLACE_INTERNAL_USE",
+      title: `放置内部占用 · ${unit.code}`,
+      description: "服务端将重新校验整房与子床位互斥，并以完整半开区间创建内部占用 Block。",
+      input: { propertyId, inventoryUnitId: unit.id, arrivalDate: from, departureDate: to, reason }
+    });
+  }
+
+  return (
+    <Modal title={`内部占用 · ${unitName(unit)}`} onClose={onClose} footer={null}>
+      <form className="modal-form" onSubmit={submit}>
+        <InlineError
+          error={writeBlocked ? new Error("当前房态已陈旧、正在刷新、权限已收窄或命令恢复尚未收口。日期和原因草稿仍保留，重新取得可写房态后再继续。") : undefined}
+          title="草稿已保留，写入已暂停"
+        />
+        <InlineError error={validationError} title="内部占用日期未通过房态校验" />
+        <div className="form-grid form-grid-two">
+          <label>开始日期<input type="date" value={from} min={arrivalDate} max={addLocalDateDays(departureDate, -1)} onChange={(event) => { setFrom(event.target.value); setValidationError(undefined); }} required /></label>
+          <label>结束日期<input type="date" value={to} min={isIsoLocalDate(from) ? addLocalDateDays(from, 1) : arrivalDate} max={departureDate} onChange={(event) => { setTo(event.target.value); setValidationError(undefined); }} required /></label>
+          <label className="span-two">内部占用原因<textarea rows={3} value={reason} onChange={(event) => setReason(event.target.value)} required maxLength={1000} /></label>
+        </div>
+        <div className="form-actions"><button type="button" className="button button-secondary" onClick={onClose}>取消</button><button type="submit" className="button button-primary" disabled={writeBlocked}>继续生成 Preview</button></div>
       </form>
     </Modal>
   );
@@ -258,14 +421,16 @@ function QuoteWorkbench({
   arrivalDate,
   departureDate,
   policies,
+  initialStayType,
   commandsBlocked,
   resetToken,
   onCommand
 }: {
-  unit: UnitAvailabilityDto | undefined;
+  unit: InventoryActionUnit | undefined;
   arrivalDate: string;
   departureDate: string;
   policies: PricingPolicyVersionDto[];
+  initialStayType?: StayType;
   commandsBlocked: boolean;
   resetToken: number;
   onCommand: (request: CommandRequest) => void;
@@ -280,7 +445,7 @@ function QuoteWorkbench({
     if (supported.has("FREE")) ordered.push("FREE");
     return ordered;
   }, [productPolicies]);
-  const [stayType, setStayType] = useState<StayType>(stayTypes[0] ?? "TRANSIENT");
+  const [stayType, setStayType] = useState<StayType>(initialStayType && stayTypes.includes(initialStayType) ? initialStayType : stayTypes[0] ?? "TRANSIENT");
   const matchingPolicies = productPolicies.filter((policy) => policy.stay_type === stayType || (policy.stay_type === null && stayType !== "FREE"));
   const [policyId, setPolicyId] = useState(matchingPolicies[0]?.id ?? "");
   const [memberContractId, setMemberContractId] = useState("");
@@ -633,194 +798,1055 @@ function QuoteWorkbench({
   );
 }
 
+const ROOM_STATUS_PAGE_SIZE = 50;
+const ROOM_STATUS_POLL_MS = 4_000;
+const ROOM_STATUS_QUERY_TIMEOUT_MS = 15_000;
+const ROOM_STATUS_RESTORATION_PREFIX = "qintopia.room-status-view.v1";
+const selectionActionCodes = new Set(["CREATE_ORDER", "CREATE_FREE_STAY", "PLACE_INTERNAL_USE", "LOCK_MAINTENANCE"]);
+
+interface RoomStatusQuoteTarget {
+  unitId: string;
+  arrivalDate: string;
+  departureDate: string;
+  initialStayType: StayType;
+}
+
+type PendingMobileTaskFocus = Omit<RoomStatusMobileFocusRequest, "token">;
+
+type RoomStatusCommandPhase = "IDLE" | "DRAFT" | "PREVIEW" | "CONFIRMING" | "SETTLED";
+
+function roomStatusQuery(
+  range: RoomStatusRange,
+  page: number,
+  filters: RoomStatusViewState["filters"]
+): RoomStatusBoardQueryDto {
+  const search = filters.search.trim();
+  return {
+    arrivalDate: range.arrivalDate,
+    departureDate: range.departureDate,
+    page,
+    pageSize: ROOM_STATUS_PAGE_SIZE,
+    ...(search ? { search } : {}),
+    ...(filters.roomTypeCode !== "ALL" ? { roomType: filters.roomTypeCode } : {}),
+    ...(filters.salesMode !== "ALL" ? { salesMode: filters.salesMode } : {}),
+    ...(filters.status !== "ALL" ? { status: filters.status } : {}),
+    ...(filters.minimumCapacity !== null ? { minCapacity: filters.minimumCapacity } : {}),
+    ...(filters.kind !== "ALL" ? { unitKind: filters.kind } : {})
+  };
+}
+
+function roomStatusQueryKey(query: RoomStatusBoardQueryDto): string {
+  return JSON.stringify([
+    query.arrivalDate,
+    query.departureDate,
+    query.page ?? 0,
+    query.pageSize ?? ROOM_STATUS_PAGE_SIZE,
+    query.search ?? null,
+    query.roomType ?? null,
+    query.salesMode ?? null,
+    query.status ?? null,
+    query.minCapacity ?? null,
+    query.unitKind ?? null
+  ]);
+}
+
+function roomStatusRestorationKey(subjectId: string, propertyId: string): string {
+  return `${ROOM_STATUS_RESTORATION_PREFIX}:${encodeURIComponent(subjectId)}:${encodeURIComponent(propertyId)}`;
+}
+
+function defaultRoomStatusRange(timeZone: string): RoomStatusRange {
+  const today = localDateInTimeZone(timeZone);
+  return { arrivalDate: today, departureDate: addLocalDateDays(today, 14) };
+}
+
+function rangeNights(range: RoomStatusRange): number {
+  if (!isIsoLocalDate(range.arrivalDate) || !isIsoLocalDate(range.departureDate)) return 0;
+  return Math.round((Date.parse(`${range.departureDate}T00:00:00Z`) - Date.parse(`${range.arrivalDate}T00:00:00Z`)) / 86_400_000);
+}
+
+function readRoomStatusRestoration(subjectId: string, propertyId: string): RoomStatusRestorationSnapshot | undefined {
+  if (typeof window === "undefined") return undefined;
+  try {
+    const serialized = window.sessionStorage.getItem(roomStatusRestorationKey(subjectId, propertyId));
+    return serialized ? parseRoomStatusRestoration(serialized, propertyId) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function writeRoomStatusRestoration(subjectId: string, snapshot: RoomStatusRestorationSnapshot): boolean {
+  try {
+    window.sessionStorage.setItem(roomStatusRestorationKey(subjectId, snapshot.propertyId), serializeRoomStatusRestoration(snapshot));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function flattenRoomStatusUnits(board: RoomStatusBoardDto): RoomStatusUnitDto[] {
+  return board.rooms.flatMap((room) => [room, ...room.children]);
+}
+
+function findRoomStatusUnit(board: RoomStatusBoardDto | undefined, unitId: string | undefined): RoomStatusUnitDto | null {
+  if (!board || !unitId) return null;
+  return flattenRoomStatusUnits(board).find((unit) => unit.id === unitId) ?? null;
+}
+
+function withoutRoomStatusWriteActions(unit: RoomStatusUnitDto, stale: boolean): RoomStatusUnitDto {
+  const status = stale ? "STALE" as const : undefined;
+  const readActions = (actions: readonly RoomStatusActionDto[]) => actions.filter((action) => action.code === "OPEN_ORDER");
+  return {
+    ...unit,
+    days: unit.days.map((day) => ({
+      ...day,
+      ...(status ? { status, available: false } : {})
+    })),
+    intervals: unit.intervals.map((interval) => ({
+      ...interval,
+      ...(status ? { status, available: false } : {}),
+      allowedActions: readActions(interval.allowedActions)
+    })),
+    allowedActions: readActions(unit.allowedActions),
+    children: unit.children.map((child) => withoutRoomStatusWriteActions(child, stale))
+  };
+}
+
+function displayRoomStatusBoard(board: RoomStatusBoardDto, commandsBlocked: boolean, stale: boolean): RoomStatusBoardDto {
+  if (!commandsBlocked && !stale) return board;
+  return {
+    ...board,
+    projectionState: stale ? "PARTIAL" : board.projectionState,
+    operationalTasks: board.operationalTasks.map((task) => ({
+      ...task,
+      ...(stale ? { status: "STALE" as const, available: false } : {}),
+      allowedActions: task.allowedActions.filter((action) => action.code === "OPEN_ORDER")
+    })),
+    rooms: board.rooms.map((room) => withoutRoomStatusWriteActions(room, stale))
+  };
+}
+
+function uniqueConflicts(conflicts: readonly RoomStatusConflictDto[]): RoomStatusConflictDto[] {
+  return [...new Map(conflicts.map((conflict) => [conflict.id, conflict])).values()];
+}
+
+function selectionDays(unit: RoomStatusUnitDto | null, selection: RoomStatusSelection | null): RoomStatusDayDto[] {
+  if (!unit || !selection || unit.id !== selection.unitId) return [];
+  return unit.days.filter((day) => day.serviceDate >= selection.arrivalDate && day.serviceDate < selection.departureDate);
+}
+
+function selectionActions(unit: RoomStatusUnitDto | null, selection: RoomStatusSelection | null): RoomStatusActionDto[] {
+  const days = selectionDays(unit, selection);
+  if (!selection || days.length !== rangeNights(selection) || days.some((day) => !day.available || day.conflicts.length > 0)) return [];
+  return unit?.allowedActions.filter((candidate) => candidate.enabled && selectionActionCodes.has(candidate.code)) ?? [];
+}
+
+function dayActions(unit: RoomStatusUnitDto | null, day: RoomStatusDayDto | null): RoomStatusActionDto[] {
+  if (!unit || !day) return [];
+  const create = day.available && day.conflicts.length === 0
+    ? unit.allowedActions.filter((candidate) => candidate.enabled && selectionActionCodes.has(candidate.code))
+    : [];
+  const sourceActions = unit.intervals
+    .filter((interval) => day.intervalIds.includes(interval.id))
+    .flatMap((interval) => interval.allowedActions);
+  return [...new Map([...create, ...sourceActions].map((candidate) => [
+    `${candidate.code}:${candidate.targetReference?.type ?? "none"}:${candidate.targetReference?.id ?? "none"}`,
+    candidate
+  ])).values()];
+}
+
+function intervalActions(interval: RoomStatusIntervalDto | null, selection: RoomStatusSelection | null): RoomStatusActionDto[] {
+  if (!interval) return [];
+  const fullIntervalSelected = Boolean(selection
+    && selection.unitId === interval.displayInventoryUnitId
+    && selection.arrivalDate === interval.sourceStartDate
+    && selection.departureDate === interval.sourceEndDate);
+  return interval.allowedActions.map((action) => action.requiresFullInterval && !fullIntervalSelected
+    ? {
+        ...action,
+        enabled: false,
+        disabledReason: action.disabledReason ?? `当前选区必须精确匹配来源完整区间 [${interval.sourceStartDate}, ${interval.sourceEndDate})`
+      }
+    : action);
+}
+
+function actionUnit(unit: RoomStatusUnitDto, available: boolean): InventoryActionUnit {
+  return { id: unit.id, kind: unit.kind, code: unit.code, name: unit.name, available };
+}
+
+function buildMobileGroups(board: RoomStatusBoardDto): RoomStatusMobileGroups {
+  const tasks = board.operationalTasks.filter((task) => task.businessDate === board.businessDate);
+  return {
+    arrivals: tasks.filter((task) => task.taskKind === "ARRIVAL"),
+    inHouse: tasks.filter((task) => task.taskKind === "IN_HOUSE"),
+    departures: tasks.filter((task) => task.taskKind === "DEPARTURE"),
+    exceptions: tasks.filter((task) => task.taskKind === "EXCEPTION")
+  };
+}
+
 export function InventoryPage() {
+  const navigate = useNavigate();
+  const isMobile = useRoomStatusMobileViewport();
   const { meta, principal, propertyId } = useWorkspace();
+  const property = meta.properties.find((item) => item.id === propertyId);
+  const propertyTimezone = property?.timezone ?? "UTC";
+  const initialRestoration = useRef(readRoomStatusRestoration(principal.subjectId, propertyId));
+  const [range, setRange] = useState<RoomStatusRange>(() => initialRestoration.current?.range ?? defaultRoomStatusRange(propertyTimezone));
+  const [viewState, dispatchView] = useReducer(
+    roomStatusViewReducer,
+    initialRestoration.current?.state ?? createRoomStatusViewState()
+  );
   const commandRecovery = usePersistentCommandRecovery({ subjectId: principal.subjectId, scopeId: `property:${propertyId}` });
-  const propertyTimezone = meta.properties.find((property) => property.id === propertyId)?.timezone ?? "UTC";
-  const [searchDates, setSearchDates] = useState(() => defaultInventoryDates(propertyTimezone));
-  const { arrivalDate, departureDate } = searchDates;
-  const datesEdited = useRef(false);
+  const [board, setBoard] = useState<RoomStatusBoardDto>();
+  const boardRef = useRef<RoomStatusBoardDto | undefined>(undefined);
+  const [boardQueryKey, setBoardQueryKey] = useState<string>();
+  const boardQueryKeyRef = useRef<string | undefined>(undefined);
+  const queryAttemptGuardRef = useRef<RoomStatusQueryAttemptGuard | null>(null);
+  if (!queryAttemptGuardRef.current) queryAttemptGuardRef.current = new RoomStatusQueryAttemptGuard();
+  const queryAttemptGuard = queryAttemptGuardRef.current;
+  const permissionDeniedRef = useRef(false);
+  const pendingRestoration = useRef<RoomStatusRestorationSnapshot | undefined>(initialRestoration.current);
+  const restorationPageAdjusted = useRef(false);
   const previousPropertyId = useRef(propertyId);
-  const [unitKind, setUnitKind] = useState<"ALL" | "ROOM" | "BED">("ALL");
-  const [units, setUnits] = useState<UnitAvailabilityDto[]>([]);
-  const [selectedUnitId, setSelectedUnitId] = useState<string>();
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<unknown>();
-  const [recoveryError, setRecoveryError] = useState<unknown>();
-  const [command, setCommand] = useState<CommandRequest>();
-  const [recoveryDialogOpen, setRecoveryDialogOpen] = useState(false);
-  const [maintenanceUnit, setMaintenanceUnit] = useState<UnitAvailabilityDto>();
-  const [maintenanceLocks, setMaintenanceLocks] = useState<MaintenanceLockDto[]>([]);
-  const [maintenanceLoading, setMaintenanceLoading] = useState(true);
-  const [maintenanceError, setMaintenanceError] = useState<unknown>();
+  const [queryPhase, setQueryPhase] = useState<"LOADING" | "RANGE_LOADING" | "READY" | "REFRESHING" | "ERROR" | "PERMISSION_DENIED">("LOADING");
+  const [queryError, setQueryError] = useState<unknown>();
+  const [rangeError, setRangeError] = useState<unknown>();
+  const [restorationError, setRestorationError] = useState<unknown>();
+  const [returnNotice, setReturnNotice] = useState<string>();
+  const [actionError, setActionError] = useState<unknown>();
+  const [clock, setClock] = useState(() => Date.now());
   const [refreshToken, setRefreshToken] = useState(0);
   const [quoteResetToken, setQuoteResetToken] = useState(0);
-  const commandsBlocked = commandRecovery.blocked;
+  const [command, setCommand] = useState<CommandRequest>();
+  const [commandAttemptId, setCommandAttemptId] = useState(0);
+  const [recoveryDialogOpen, setRecoveryDialogOpen] = useState(false);
+  const [recoveryError, setRecoveryError] = useState<unknown>();
+  const [selectedUnitId, setSelectedUnitId] = useState<string>();
+  const [selectedDayDate, setSelectedDayDate] = useState<string>();
+  const [selectedIntervalId, setSelectedIntervalId] = useState<string>();
+  const [maintenanceTarget, setMaintenanceTarget] = useState<InventoryActionUnit>();
+  const [internalUseTarget, setInternalUseTarget] = useState<InventoryActionUnit>();
+  const [quoteTarget, setQuoteTarget] = useState<RoomStatusQuoteTarget>();
+  const [mobileTab, setMobileTab] = useState<RoomStatusMobileTab>("ARRIVALS");
+  const [mobileCreateOpen, setMobileCreateOpen] = useState(false);
+  const [mobileFocusRequest, setMobileFocusRequest] = useState<RoomStatusMobileFocusRequest>();
+  const [commandContextInvalidated, setCommandContextInvalidated] = useState(false);
+  const [focusRequestToken, setFocusRequestToken] = useState(0);
+  const [filterFocusRequestToken, setFilterFocusRequestToken] = useState(0);
+  const quoteSectionRef = useRef<HTMLDivElement>(null);
+  const commandPhaseRef = useRef<RoomStatusCommandPhase>("IDLE");
+  const commandAttemptGuardRef = useRef<RoomStatusCommandAttemptGuard | null>(null);
+  if (!commandAttemptGuardRef.current) commandAttemptGuardRef.current = new RoomStatusCommandAttemptGuard();
+  const commandAttemptGuard = commandAttemptGuardRef.current;
+  const commandRevisionRef = useRef<string | undefined>(undefined);
+  const refreshedReceiptIdRef = useRef<string | undefined>(undefined);
+  const focusAfterNextBoard = useRef(false);
+  const pendingMobileTaskFocus = useRef<PendingMobileTaskFocus | undefined>(undefined);
+  const mobileFocusSequence = useRef(0);
+
+  useEffect(() => {
+    boardRef.current = board;
+  }, [board]);
+
+  const boardMatchesCurrentProperty = Boolean(board && board.propertyId === propertyId);
+  const currentBoardQueryKey = roomStatusQueryKey(roomStatusQuery(range, viewState.roomPageIndex, viewState.filters));
+  const boardMatchesCurrentQuery = Boolean(board
+    && board.propertyId === propertyId
+    && boardQueryKey === currentBoardQueryKey);
+
+  useEffect(() => {
+    if (!board || !boardMatchesCurrentQuery) return;
+    const delay = Math.max(0, Date.parse(board.freshUntil) - Date.now() + 1);
+    const timer = window.setTimeout(() => setClock(Date.now()), delay);
+    return () => window.clearTimeout(timer);
+  }, [board?.freshUntil]);
+
+  useEffect(() => {
+    const interval = window.setInterval(() => {
+      if (document.visibilityState !== "visible") return;
+      setClock(Date.now());
+      if (!permissionDeniedRef.current
+        && commandPhaseRef.current !== "CONFIRMING"
+        && !queryAttemptGuard.isInFlight()) {
+        setRefreshToken((value) => value + 1);
+      }
+    }, ROOM_STATUS_POLL_MS);
+    const refreshVisible = () => {
+      if (document.visibilityState !== "visible") return;
+      setClock(Date.now());
+      if (!permissionDeniedRef.current
+        && commandPhaseRef.current !== "CONFIRMING"
+        && !queryAttemptGuard.isInFlight()) {
+        setRefreshToken((value) => value + 1);
+      }
+    };
+    document.addEventListener("visibilitychange", refreshVisible);
+    return () => {
+      window.clearInterval(interval);
+      document.removeEventListener("visibilitychange", refreshVisible);
+    };
+  }, [propertyId]);
 
   useEffect(() => {
     if (previousPropertyId.current === propertyId) return;
     previousPropertyId.current = propertyId;
+    permissionDeniedRef.current = false;
+    const restored = readRoomStatusRestoration(principal.subjectId, propertyId);
+    pendingRestoration.current = restored;
+    setRange(restored?.range ?? defaultRoomStatusRange(propertyTimezone));
+    dispatchView({ type: "RESTORE", state: restored?.state ?? createRoomStatusViewState() });
+    setBoard(undefined);
+    boardRef.current = undefined;
+    setBoardQueryKey(undefined);
+    boardQueryKeyRef.current = undefined;
+    setSelectedUnitId(undefined);
+    setSelectedDayDate(undefined);
+    setSelectedIntervalId(undefined);
+    setQuoteTarget(undefined);
+    setMaintenanceTarget(undefined);
+    setInternalUseTarget(undefined);
+    setMobileCreateOpen(false);
+    setMobileFocusRequest(undefined);
+    pendingMobileTaskFocus.current = undefined;
+    commandPhaseRef.current = "IDLE";
+    commandAttemptGuard.invalidate();
+    commandRevisionRef.current = undefined;
+    focusAfterNextBoard.current = false;
+    setCommandContextInvalidated(false);
     setCommand(undefined);
-    setRecoveryDialogOpen(false);
-    setRecoveryError(undefined);
-    setMaintenanceUnit(undefined);
-    if (!datesEdited.current) setSearchDates(defaultInventoryDates(propertyTimezone));
-  }, [propertyId, propertyTimezone]);
+    setQueryError(undefined);
+    setReturnNotice(undefined);
+    setActionError(undefined);
+  }, [principal.subjectId, propertyId, propertyTimezone]);
 
   useEffect(() => {
-    let current = true;
-    setLoading(true);
-    setError(undefined);
-    api.availability(propertyId, arrivalDate, departureDate, unitKind === "ALL" ? undefined : unitKind)
-      .then((response) => {
-        if (!current) return;
-        setUnits(response.units);
-        setSelectedUnitId((selected) => response.units.some((unit) => unit.id === selected) ? selected : undefined);
-      })
-      .catch((nextError) => current && setError(nextError))
-      .finally(() => current && setLoading(false));
-    return () => { current = false; };
-  }, [arrivalDate, departureDate, propertyId, refreshToken, unitKind]);
-
-  useEffect(() => {
-    let current = true;
-    setMaintenanceLoading(true);
-    setMaintenanceError(undefined);
-    setMaintenanceLocks([]);
-    api.maintenanceLocks(propertyId)
-      .then((response) => current && setMaintenanceLocks(response.maintenanceLocks))
-      .catch((nextError) => current && setMaintenanceError(nextError))
-      .finally(() => current && setMaintenanceLoading(false));
-    return () => { current = false; };
-  }, [propertyId, refreshToken]);
-
-  const selectedUnit = units.find((unit) => unit.id === selectedUnitId);
-  const policies = meta.pricingPolicyVersions.filter((policy) => policy.property_id === propertyId && policy.status === "PUBLISHED");
-  const nights = units[0]?.nights ?? [];
-  const inventoryUnitMap = new Map(meta.inventoryUnits.map((unit) => [unit.id, unit]));
-
-  function updateArrival(next: string) {
-    datesEdited.current = true;
-    let nextDeparture = departureDate;
-    if (departureDate <= next) {
-      nextDeparture = addLocalDateDays(next, 1);
+    const query = roomStatusQuery(range, viewState.roomPageIndex, viewState.filters);
+    const requestQueryKey = roomStatusQueryKey(query);
+    const requestId = queryAttemptGuard.begin();
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => {
+      controller.abort(new Error("房态查询超时，未把未知状态解释为可售"));
+    }, ROOM_STATUS_QUERY_TIMEOUT_MS);
+    const existing = boardRef.current;
+    const sameQuery = existing?.propertyId === propertyId
+      && boardQueryKeyRef.current === requestQueryKey;
+    const projectionRefreshPaused = commandPhaseRef.current === "CONFIRMING" && Boolean(existing);
+    if (!sameQuery) {
+      setQueryPhase(existing ? "RANGE_LOADING" : "LOADING");
+      setQueryError(undefined);
+    } else if (!projectionRefreshPaused) {
+      setQueryPhase("REFRESHING");
     }
-    setSearchDates({ arrivalDate: next, departureDate: nextDeparture });
+    api.roomStatus(propertyId, query, controller.signal)
+      .then((response) => {
+        if (!queryAttemptGuard.isActive(requestId)) return;
+        permissionDeniedRef.current = false;
+        assertRoomStatusBoard(response, { propertyId, range, pageIndex: viewState.roomPageIndex });
+        if (commandPhaseRef.current === "CONFIRMING" && existing) {
+          setQueryError(undefined);
+          setQueryPhase("READY");
+          setClock(Date.now());
+          return;
+        }
+        if (commandRevisionRef.current
+          && commandPhaseRef.current !== "IDLE"
+          && response.revision !== commandRevisionRef.current) {
+          setCommandContextInvalidated(true);
+        }
+        const restored = pendingRestoration.current;
+        if (restored && response.page.totalPages > 0 && response.page.index >= response.page.totalPages) {
+          const pageIndex = response.page.totalPages - 1;
+          restorationPageAdjusted.current = true;
+          pendingRestoration.current = {
+            ...restored,
+            state: { ...restored.state, roomPageIndex: pageIndex }
+          };
+          setBoard(undefined);
+          boardRef.current = undefined;
+          setBoardQueryKey(undefined);
+          boardQueryKeyRef.current = undefined;
+          setQueryPhase("LOADING");
+          dispatchView({ type: "SET_ROOM_PAGE", index: pageIndex, totalPages: response.page.totalPages });
+          return;
+        }
+        setBoard(response);
+        boardRef.current = response;
+        setBoardQueryKey(requestQueryKey);
+        boardQueryKeyRef.current = requestQueryKey;
+        setQueryError(undefined);
+        setQueryPhase("READY");
+        setClock(Date.now());
+        if (focusAfterNextBoard.current) {
+          focusAfterNextBoard.current = false;
+          setFocusRequestToken((value) => value + 1);
+        }
+        if (restored) {
+          pendingRestoration.current = undefined;
+          const pageAdjusted = restorationPageAdjusted.current;
+          restorationPageAdjusted.current = false;
+          const resolution = reconcileRoomStatusRestoration(response.rooms, response.dates, {
+            ...restored.state,
+            roomPageIndex: response.page.index
+          }, restored.factFingerprint);
+          dispatchView({ type: "RESTORE", state: resolution.state });
+          if (resolution.outcome === "FACT_CHANGED") {
+            setReturnNotice(restored.revision === response.revision
+              ? "已重新校验返回位置。原选区的可售、状态、来源、冲突或允许动作已经变化；已保留选区供核对并将焦点移至选区起点。旧 Preview 不会继续使用。"
+              : "房态 revision 已变化，且原选区的可售、状态、来源、冲突或允许动作已经变化；已保留选区供核对并将焦点移至选区起点。旧 Preview 不会继续使用。");
+          } else if (resolution.outcome === "FALLBACK") {
+            setReturnNotice(`原焦点或选区在当前筛选、展开、分页或日期窗口中已不可见。${pageAdjusted ? "原分页已失效；" : ""}${resolution.filtersCleared ? "原筛选已无结果并已清除；" : ""}已清除旧选区并将焦点移至当前视图首个可见房间和日期。旧 Preview 不会继续使用。`);
+          } else if (resolution.outcome === "EMPTY") {
+            setReturnNotice("原房态返回位置已失效，且当前页没有可聚焦的库存日期格。已清除旧焦点和选区；旧 Preview 不会继续使用。");
+          } else if (restored.revision === response.revision) {
+            const adjusted = pageAdjusted || resolution.dateWindowAdjusted || resolution.scrollAnchorAdjusted;
+            setReturnNotice(adjusted
+              ? "已恢复上次房态范围、筛选、展开、选区和焦点；不可用的分页、日期窗口或滚动锚点已校正到当前可见内容。"
+              : "已恢复上次房态范围、筛选、展开、滚动、选区和焦点。它们均已验证为当前可见且可聚焦。"
+            );
+          } else {
+            setReturnNotice("房态 revision 已变化。已刷新并确认原选区与焦点在当前筛选、展开、分页和日期窗口中仍可见；任何旧 Preview 均已作废。");
+          }
+        }
+      })
+      .catch((error) => {
+        if (!queryAttemptGuard.isActive(requestId)) return;
+        setQueryError(error);
+        if (error instanceof ApiError && (error.status === 401 || error.status === 403)) {
+          permissionDeniedRef.current = true;
+          setBoard(undefined);
+          boardRef.current = undefined;
+          setBoardQueryKey(undefined);
+          boardQueryKeyRef.current = undefined;
+          pendingRestoration.current = undefined;
+          try {
+            window.sessionStorage.removeItem(roomStatusRestorationKey(principal.subjectId, propertyId));
+          } catch {
+            // Permission denial still clears all in-memory business state.
+          }
+          dispatchView({ type: "RESTORE", state: createRoomStatusViewState() });
+          setSelectedUnitId(undefined);
+          setSelectedDayDate(undefined);
+          setSelectedIntervalId(undefined);
+          setQuoteTarget(undefined);
+          setMaintenanceTarget(undefined);
+          setInternalUseTarget(undefined);
+          setMobileCreateOpen(false);
+          commandPhaseRef.current = "IDLE";
+          commandAttemptGuard.invalidate();
+          commandRevisionRef.current = undefined;
+          focusAfterNextBoard.current = false;
+          setCommandContextInvalidated(false);
+          setCommand(undefined);
+          setRecoveryDialogOpen(false);
+          setActionError(undefined);
+          setReturnNotice(undefined);
+          setRestorationError(undefined);
+          setQueryPhase("PERMISSION_DENIED");
+        } else {
+          setQueryPhase("ERROR");
+        }
+      })
+      .finally(() => {
+        window.clearTimeout(timeout);
+        queryAttemptGuard.finish(requestId);
+      });
+    return () => {
+      window.clearTimeout(timeout);
+      queryAttemptGuard.invalidate(requestId);
+      controller.abort();
+    };
+  }, [
+    propertyId,
+    range.arrivalDate,
+    range.departureDate,
+    refreshToken,
+    viewState.roomPageIndex,
+    viewState.filters.search,
+    viewState.filters.roomTypeCode,
+    viewState.filters.salesMode,
+    viewState.filters.status,
+    viewState.filters.kind,
+    viewState.filters.minimumCapacity
+  ]);
+
+  useEffect(() => {
+    if (!board || !boardMatchesCurrentQuery) return;
+    const timer = window.setTimeout(() => {
+      const saved = writeRoomStatusRestoration(principal.subjectId, {
+        version: 1,
+        propertyId,
+        revision: board.revision,
+        range,
+        savedAt: new Date().toISOString(),
+        state: viewState,
+        factFingerprint: roomStatusFactFingerprint(board.rooms, viewState)
+      });
+      setRestorationError(saved ? undefined : new Error("浏览器无法保存房态返回位置；本次业务事实未受影响"));
+    }, 150);
+    return () => window.clearTimeout(timer);
+  }, [board, boardMatchesCurrentQuery, principal.subjectId, propertyId, range, viewState]);
+
+  const boardForCurrentProperty = boardMatchesCurrentProperty ? board : undefined;
+  const boardExpired = Boolean(boardForCurrentProperty && clock > Date.parse(boardForCurrentProperty.freshUntil));
+  const boardStale = Boolean(boardForCurrentProperty && (boardExpired || queryError));
+  const rangeLoading = queryPhase === "RANGE_LOADING"
+    || Boolean(boardForCurrentProperty && !boardMatchesCurrentQuery);
+  const queryBusy = queryPhase === "LOADING"
+    || queryPhase === "RANGE_LOADING"
+    || queryPhase === "REFRESHING"
+    || Boolean(board && !boardMatchesCurrentQuery);
+  const projectionWritable = Boolean(board
+    && boardMatchesCurrentQuery
+    && !boardStale
+    && !focusAfterNextBoard.current
+    && board.projectionState === "READY"
+    && board.accessLevel === "WRITE"
+    && (queryPhase === "READY" || queryPhase === "REFRESHING"));
+  const commandsBlocked = commandRecovery.blocked || !projectionWritable;
+  const renderedBoard = useMemo(
+    () => boardForCurrentProperty
+      ? displayRoomStatusBoard(boardForCurrentProperty, commandsBlocked && !command, boardStale)
+      : undefined,
+    [boardForCurrentProperty, boardStale, command, commandsBlocked]
+  );
+  const filteredViewHasNoRooms = Boolean(renderedBoard
+    && hasActiveRoomStatusFilters(viewState.filters)
+    && filterRoomStatusRooms(renderedBoard.rooms, viewState.filters).length === 0);
+  const selectedUnit = findRoomStatusUnit(renderedBoard, selectedUnitId ?? viewState.selection?.unitId);
+  const selectedDay = selectedUnit?.days.find((day) => day.serviceDate === selectedDayDate) ?? null;
+  const selectedInterval = selectedUnit?.intervals.find((interval) => interval.id === selectedIntervalId) ?? null;
+  const selectedSelectionDays = selectionDays(selectedUnit, viewState.selection);
+  const relatedIntervals = useMemo(() => {
+    if (!selectedUnit) return [];
+    const intervalIds = new Set(selectedInterval
+      ? [selectedInterval.id]
+      : viewState.selection
+        ? selectedSelectionDays.flatMap((day) => day.intervalIds)
+        : selectedDay?.intervalIds ?? []);
+    return selectedUnit.intervals.filter((interval) => intervalIds.has(interval.id));
+  }, [selectedDay?.intervalIds, selectedInterval, selectedSelectionDays, selectedUnit, viewState.selection]);
+  const contextConflicts = uniqueConflicts(selectedInterval?.conflicts
+    ?? (viewState.selection ? relatedIntervals.flatMap((interval) => interval.conflicts) : selectedDay?.conflicts ?? []));
+  const candidateContextActions = selectedInterval
+      ? intervalActions(selectedInterval, viewState.selection)
+      : viewState.selection
+        ? selectionActions(selectedUnit, viewState.selection)
+        : dayActions(selectedUnit, selectedDay).filter((action) => action.enabled);
+  const contextActions = projectionWritable || Boolean(command)
+    ? candidateContextActions
+    : candidateContextActions.filter((action) => action.code === "OPEN_ORDER");
+  const policies = meta.pricingPolicyVersions.filter((policy) => policy.property_id === propertyId && policy.status === "PUBLISHED");
+  const filterOptions = renderedBoard?.filterOptions ?? {
+    roomTypeCodes: [],
+    salesModes: [],
+    statuses: [],
+    capacities: []
+  };
+  const filteredRoomCount = renderedBoard?.page.totalRooms ?? 0;
+  const todayDate = localDateInTimeZone(propertyTimezone);
+  const mobileGroups = useMemo(() => renderedBoard ? buildMobileGroups(renderedBoard) : { arrivals: [], inHouse: [], departures: [], exceptions: [] }, [renderedBoard]);
+  const activeMobileTasks = mobileTab === "ARRIVALS"
+    ? mobileGroups.arrivals
+    : mobileTab === "IN_HOUSE"
+      ? mobileGroups.inHouse
+      : mobileTab === "DEPARTURES"
+        ? mobileGroups.departures
+        : mobileGroups.exceptions;
+  const quoteUnit = findRoomStatusUnit(renderedBoard, quoteTarget?.unitId);
+  const pageQuoteRecovery = browserQuoteRecovery(principal.subjectId, propertyId).read;
+  const showQuoteWorkbench = Boolean(quoteTarget) || pageQuoteRecovery.kind !== "ABSENT";
+  const quoteActionUnit = quoteTarget && quoteUnit ? actionUnit(
+    quoteUnit,
+    projectionWritable && selectionActions(quoteUnit, {
+      unitId: quoteTarget.unitId,
+      anchorDate: quoteTarget.arrivalDate,
+      focusDate: addLocalDateDays(quoteTarget.departureDate, -1),
+      arrivalDate: quoteTarget.arrivalDate,
+      departureDate: quoteTarget.departureDate
+    }).some((action) => action.code === (quoteTarget.initialStayType === "FREE" ? "CREATE_FREE_STAY" : "CREATE_ORDER"))
+  ) : undefined;
+
+  function clearTransientRoomStatusContext() {
+    setSelectedUnitId(undefined);
+    setSelectedDayDate(undefined);
+    setSelectedIntervalId(undefined);
+    setQuoteTarget(undefined);
+    setMaintenanceTarget(undefined);
+    setInternalUseTarget(undefined);
+    setMobileCreateOpen(false);
+    setActionError(undefined);
   }
 
-  function releaseMaintenance(lock: MaintenanceLockDto) {
-    if (commandsBlocked) return;
-    const unit = inventoryUnitMap.get(lock.inventory_unit_id);
-    setRecoveryDialogOpen(false);
-    setCommand({
-      commandType: "RELEASE_MAINTENANCE",
-      title: `释放维修锁 · ${unit?.code ?? lock.inventory_unit_id}`,
-      description: "服务端将重新校验维修锁版本，确认后释放对应日期范围的库存 claim。",
-      input: { propertyId, maintenanceLockId: lock.id }
+  function applyFilters(filters: typeof viewState.filters) {
+    dispatchView({ type: "SET_FILTERS", filters });
+    dispatchView({ type: "SET_ROOM_PAGE", index: 0, totalPages: board?.page.totalPages ?? 1 });
+    clearTransientRoomStatusContext();
+  }
+
+  function clearFilters() {
+    dispatchView({ type: "CLEAR_FILTERS" });
+    dispatchView({ type: "SET_ROOM_PAGE", index: 0, totalPages: board?.page.totalPages ?? 1 });
+    clearTransientRoomStatusContext();
+    setFilterFocusRequestToken((value) => value + 1);
+  }
+
+  function applyRange(next: RoomStatusRange) {
+    if (!isIsoLocalDate(next.arrivalDate) || !isIsoLocalDate(next.departureDate)) {
+      setRangeError(new Error("请输入有效的开始日期和结束日期。"));
+      return;
+    }
+    const nights = rangeNights(next);
+    if (nights < 1) {
+      setRangeError(new Error("结束日期必须晚于开始日期。"));
+      return;
+    }
+    if (nights > 90) {
+      setRangeError(new Error("房态日期范围最多为 90 夜。"));
+      return;
+    }
+    setRangeError(undefined);
+    setRange(next);
+    dispatchView({ type: "SET_ROOM_PAGE", index: 0, totalPages: 1 });
+    dispatchView({ type: "SET_DATE_WINDOW", start: 0, totalDates: nights });
+    dispatchView({ type: "SET_SELECTION", selection: null });
+    dispatchView({ type: "SET_FOCUS", focus: null });
+    clearTransientRoomStatusContext();
+  }
+
+  function shiftRange(direction: -1 | 1) {
+    const nights = Math.max(1, rangeNights(range));
+    applyRange({
+      arrivalDate: addLocalDateDays(range.arrivalDate, direction * nights),
+      departureDate: addLocalDateDays(range.departureDate, direction * nights)
     });
   }
 
-  function startCommand(request: CommandRequest) {
-    if (commandsBlocked) return;
+  function changeRoomPage(index: number, totalPages: number) {
+    dispatchView({ type: "SET_ROOM_PAGE", index, totalPages });
+    dispatchView({ type: "SET_SELECTION", selection: null });
+    dispatchView({ type: "SET_FOCUS", focus: null });
+    clearTransientRoomStatusContext();
+  }
+
+  function changeDateWindow(start: number, totalDates: number) {
+    dispatchView({ type: "SET_DATE_WINDOW", start, totalDates });
+    dispatchView({ type: "SET_SELECTION", selection: null });
+    dispatchView({ type: "SET_FOCUS", focus: null });
+    clearTransientRoomStatusContext();
+  }
+
+  function persistViewNow() {
+    if (!board || !boardMatchesCurrentQuery) return;
+    writeRoomStatusRestoration(principal.subjectId, {
+      version: 1,
+      propertyId,
+      revision: board.revision,
+      range,
+      savedAt: new Date().toISOString(),
+      state: viewState,
+      factFingerprint: roomStatusFactFingerprint(board.rooms, viewState)
+    });
+  }
+
+  function inspectUnit(unit: RoomStatusUnitDto) {
+    setSelectedUnitId(unit.id);
+    setSelectedDayDate(undefined);
+    setSelectedIntervalId(undefined);
+  }
+
+  function inspectDay(unit: RoomStatusUnitDto, day: RoomStatusDayDto | null) {
+    setSelectedUnitId(unit.id);
+    setSelectedDayDate(day?.serviceDate);
+    setSelectedIntervalId(undefined);
+    if (day) dispatchView({ type: "SET_SELECTION", selection: selectionFromCells(unit.id, day.serviceDate, day.serviceDate) });
+  }
+
+  function inspectInterval(unit: RoomStatusUnitDto, interval: RoomStatusIntervalDto) {
+    setSelectedUnitId(unit.id);
+    setSelectedDayDate(undefined);
+    setSelectedIntervalId(interval.id);
+    dispatchView({
+      type: "SET_SELECTION",
+      selection: {
+        unitId: unit.id,
+        anchorDate: interval.startDate,
+        focusDate: addLocalDateDays(interval.endDate, -1),
+        arrivalDate: interval.startDate,
+        departureDate: interval.endDate
+      }
+    });
+  }
+
+  function selectRange(selection: RoomStatusSelection | null) {
+    dispatchView({ type: "SET_SELECTION", selection });
+    if (selection) setSelectedUnitId(selection.unitId);
+    setSelectedDayDate(undefined);
+    setSelectedIntervalId(undefined);
+  }
+
+  function openReference(reference: { href: string | null }) {
+    if (!reference.href) return;
+    persistViewNow();
+    if (reference.href.startsWith("/orders/")) navigate(reference.href);
+    else window.open(reference.href, "_blank", "noopener,noreferrer");
+  }
+
+  function startCommand(request: CommandRequest): boolean {
+    if (commandsBlocked) {
+      setActionError(new Error("当前房态已陈旧、正在刷新、权限已收窄或命令恢复尚未收口；命令未发送，表单草稿保持不变。"));
+      return false;
+    }
+    const attemptId = commandAttemptGuard.begin();
+    setCommandAttemptId(attemptId);
+    commandPhaseRef.current = "DRAFT";
+    commandRevisionRef.current = boardRef.current?.revision;
+    setCommandContextInvalidated(false);
     setRecoveryDialogOpen(false);
+    setActionError(undefined);
     setCommand(request);
+    return true;
+  }
+
+  function handleAction(
+    action: RoomStatusActionDto,
+    unitOverride?: RoomStatusUnitDto | null,
+    selectionOverride?: RoomStatusSelection | null,
+    unitReferenceLabel?: string
+  ): boolean {
+    setActionError(undefined);
+    if (action.code === "OPEN_ORDER") {
+      if (!action.targetReference) return false;
+      openReference(action.targetReference);
+      return true;
+    }
+    const actionSelectedUnit = unitOverride === undefined ? selectedUnit : unitOverride;
+    if (commandsBlocked) {
+      setActionError(new Error("当前房态不再满足安全写入条件。未发送命令，请刷新后重新核对选区。"));
+      return false;
+    }
+    const selection = selectionOverride ?? viewState.selection;
+    if (action.code === "CREATE_ORDER" || action.code === "CREATE_FREE_STAY" || action.code === "PLACE_INTERNAL_USE" || action.code === "LOCK_MAINTENANCE") {
+      if (!actionSelectedUnit || !selection || selection.unitId !== actionSelectedUnit.id) {
+        setActionError(new Error("请选择一个完整的房源与半开日期区间"));
+        return false;
+      }
+      const unit = actionUnit(actionSelectedUnit, true);
+      if (action.code === "CREATE_ORDER" || action.code === "CREATE_FREE_STAY") {
+        setQuoteTarget({
+          unitId: unit.id,
+          arrivalDate: selection.arrivalDate,
+          departureDate: selection.departureDate,
+          initialStayType: action.code === "CREATE_FREE_STAY" ? "FREE" : "TRANSIENT"
+        });
+        requestAnimationFrame(() => quoteSectionRef.current?.scrollIntoView({ block: "start", behavior: "smooth" }));
+      } else if (action.code === "PLACE_INTERNAL_USE") {
+        setInternalUseTarget(unit);
+      } else {
+        setMaintenanceTarget(unit);
+      }
+      return true;
+    }
+    const targetId = action.targetReference?.id;
+    const unitLabel = actionSelectedUnit?.code ?? unitReferenceLabel;
+    if (!targetId || !unitLabel) {
+      setActionError(new Error("服务端动作缺少稳定目标引用，未发送命令"));
+      return false;
+    }
+    if (action.code === "RELEASE_MAINTENANCE") {
+      return startCommand({
+        commandType: "RELEASE_MAINTENANCE",
+        title: `释放维修锁 · ${unitLabel}`,
+        description: "服务端将重新校验完整维修 Block 版本，确认后释放全部对应 Claim。",
+        input: { propertyId, maintenanceLockId: targetId }
+      });
+    } else if (action.code === "RELEASE_INTERNAL_USE") {
+      return startCommand({
+        commandType: "RELEASE_INTERNAL_USE",
+        title: `释放内部占用 · ${unitLabel}`,
+        description: "服务端只接受完整、当前有效的内部占用 Block，并在确认时重新校验。",
+        input: { propertyId, internalUseBlockId: targetId }
+      });
+    } else if (action.code === "COMPLETE_CLEANING") {
+      return startCommand({
+        commandType: "COMPLETE_CLEANING",
+        title: `完成清洁 · ${unitLabel}`,
+        description: "确认后将当前清洁任务追加为已完成；夜间库存 Claim 不会因此被改写。",
+        input: { propertyId, cleaningTaskId: targetId }
+      });
+    }
+    return false;
   }
 
   function openRecoveryDialog() {
     if (!commandRecovery.pending) return;
+    const attemptId = commandAttemptGuard.begin();
+    setCommandAttemptId(attemptId);
+    commandPhaseRef.current = "CONFIRMING";
+    commandRevisionRef.current = boardRef.current?.revision;
+    setCommandContextInvalidated(false);
     setRecoveryDialogOpen(true);
     setCommand(recoveryCommandRequest(commandRecovery.pending));
   }
 
   function closeCommandDialog() {
     let refreshAfterClose = false;
-    if (commandRecovery.pending && isTerminalCommandRecovery(commandRecovery.pending.state)) {
-      const receipt = commandRecovery.pending.receipt;
+    const pendingAtClose = commandRecovery.pending;
+    const terminalAtClose = Boolean(pendingAtClose && isTerminalCommandRecovery(pendingAtClose.state));
+    if (pendingAtClose && terminalAtClose) {
+      const receipt = pendingAtClose.receipt;
       refreshAfterClose = receipt?.businessCommitted === true;
-      if (refreshAfterClose && commandRecovery.pending.commandType === "CREATE_ORDER") {
+      if (refreshAfterClose && pendingAtClose.commandType === "CREATE_ORDER") {
         setQuoteResetToken((value) => value + 1);
+        setQuoteTarget(undefined);
       }
       if (commandRecovery.clearResolved()) setRecoveryError(undefined);
       else setRecoveryError(new Error("无法清除已收口的本地恢复记录；为避免重复库存写入，命令继续保持暂停"));
     }
+    commandAttemptGuard.invalidate();
+    commandPhaseRef.current = "IDLE";
+    commandRevisionRef.current = undefined;
     setCommand(undefined);
     setRecoveryDialogOpen(false);
-    if (refreshAfterClose) setRefreshToken((value) => value + 1);
+    if (refreshAfterClose) {
+      if (pendingMobileTaskFocus.current) {
+        setMobileFocusRequest({
+          ...pendingMobileTaskFocus.current,
+          token: ++mobileFocusSequence.current
+        });
+      } else if (viewState.selection) {
+        dispatchView({
+          type: "SET_FOCUS",
+          focus: { unitId: viewState.selection.unitId, serviceDate: viewState.selection.arrivalDate }
+        });
+      }
+      focusAfterNextBoard.current = true;
+      setRefreshToken((value) => value + 1);
+    } else if (commandContextInvalidated) {
+      setFocusRequestToken((value) => value + 1);
+    }
+    if (!pendingAtClose || terminalAtClose) pendingMobileTaskFocus.current = undefined;
+    setCommandContextInvalidated(false);
   }
 
+  function trackCommandProgress(request: CommandRequest, progress: CommandDialogProgress, attemptId: number): boolean {
+    commandAttemptGuard.runIfActive(attemptId, () => {
+      if (progress.state === "PREVIEWING" || progress.state === "PREVIEWED") commandPhaseRef.current = "PREVIEW";
+      else if (progress.state === "CONFIRMING" || progress.state === "UNKNOWN") commandPhaseRef.current = "CONFIRMING";
+      else if (progress.state === "RESOLVED") commandPhaseRef.current = "SETTLED";
+      else if (progress.state === "PREVIEW_FAILED" || progress.state === "PREVIEW_UNKNOWN" || progress.state === "FAILED_NOT_EXECUTED") commandPhaseRef.current = "DRAFT";
+    });
+    return commandRecovery.track(request, progress);
+  }
+
+  function refreshCommittedRoomStatus(receipt: ReceiptDto) {
+    if (!receipt.businessCommitted || refreshedReceiptIdRef.current === receipt.receiptId) return;
+    refreshedReceiptIdRef.current = receipt.receiptId;
+    commandPhaseRef.current = "SETTLED";
+    setRefreshToken((value) => value + 1);
+  }
+
+  const roomStatusToolbar = renderedBoard ? (
+    <RoomStatusToolbar
+      board={renderedBoard}
+      propertyLabel={`${property?.code ?? propertyId} · ${property?.name ?? propertyId}`}
+      principalLabel={principal.displayName}
+      range={range}
+      filters={viewState.filters}
+      filterOptions={filterOptions}
+      filteredRoomCount={filteredRoomCount}
+      loading={queryBusy}
+      rangeLoading={rangeLoading}
+      rangeError={rangeError instanceof Error ? rangeError.message : undefined}
+      focusSearchRequestToken={filterFocusRequestToken}
+      onRangeChange={applyRange}
+      onPreviousRange={() => shiftRange(-1)}
+      onNextRange={() => shiftRange(1)}
+      onToday={() => {
+        const nights = Math.max(1, rangeNights(range));
+        applyRange({ arrivalDate: todayDate, departureDate: addLocalDateDays(todayDate, nights) });
+      }}
+      onFiltersChange={applyFilters}
+      onClearFilters={clearFilters}
+      onRefresh={() => setRefreshToken((value) => value + 1)}
+    />
+  ) : null;
+
   return (
-    <div className="inventory-page">
+    <div className="inventory-page room-status-page">
       <header className="page-heading page-heading-actions">
-        <div><p className="eyebrow">Inventory</p><h1>房态与可售</h1><p>整房 / 子床位逐日互斥视图</p></div>
-        <button className="button button-secondary" type="button" onClick={() => setRefreshToken((value) => value + 1)} disabled={loading}>
-          <RefreshCw className={loading ? "spin" : ""} aria-hidden="true" size={17} />刷新
+        <div><p className="eyebrow">Room status</p><h1>房态与可售</h1><p>房间、床位、订单、Stay 与 Operations 的统一运营视图</p></div>
+        <button className="button button-secondary" type="button" onClick={() => setRefreshToken((value) => value + 1)} disabled={queryBusy}>
+          <RefreshCw className={queryBusy ? "spin" : ""} aria-hidden="true" size={17} />刷新
         </button>
       </header>
-      <InlineError error={recoveryError} title="恢复记录未收口" />
-      <InlineError error={commandRecovery.error} title="本地命令恢复记录不可用" />
-      {commandRecovery.pending ? <CommandRecoveryBar recovery={commandRecovery.pending} onOpen={openRecoveryDialog} testId="inventory-command-recovery" /> : null}
 
-      <section className="inventory-filters" aria-label="房态筛选">
-        <div className="date-control"><CalendarDays aria-hidden="true" size={17} /><label>到店<input type="date" value={arrivalDate} onChange={(event) => updateArrival(event.target.value)} data-testid="arrival-date" /></label></div>
-        <div className="date-control"><label>离店<input type="date" value={departureDate} min={arrivalDate} onChange={(event) => { datesEdited.current = true; setSearchDates({ arrivalDate, departureDate: event.target.value }); }} data-testid="departure-date" /></label></div>
-        <fieldset className="segmented-control"><legend className="sr-only">库存类型</legend><Filter aria-hidden="true" size={16} />
-          {(["ALL", "ROOM", "BED"] as const).map((kind) => <label key={kind}><input type="radio" name="unitKind" value={kind} checked={unitKind === kind} onChange={() => setUnitKind(kind)} /><span>{kind === "ALL" ? "全部" : kind === "ROOM" ? "整房" : "床位"}</span></label>)}
-        </fieldset>
-      </section>
+      {queryPhase !== "PERMISSION_DENIED" ? <InlineError error={recoveryError} title="恢复记录未收口" /> : null}
+      {queryPhase !== "PERMISSION_DENIED" ? <InlineError error={commandRecovery.error} title="本地命令恢复记录不可用" /> : null}
+      <InlineError error={restorationError} title="房态位置未保存" />
+      <InlineError error={actionError} title="动作未开始" />
+      {queryPhase !== "PERMISSION_DENIED" && commandRecovery.pending ? <CommandRecoveryBar recovery={commandRecovery.pending} onOpen={openRecoveryDialog} testId="inventory-command-recovery" /> : null}
+      {returnNotice ? <div className="room-status-return-notice" role="status">{returnNotice}</div> : null}
+      {boardStale ? <div className="room-status-stale-notice" role="alert">当前房态已陈旧或刷新失败。页面保留最后一次来源事实，但所有依赖新鲜度的写动作已暂停。</div> : null}
+      {queryError ? <InlineError error={queryError} title={board ? "房态刷新失败" : "无法查询房态"} /> : null}
 
-      <InlineError error={error} title="无法查询房态" />
-      <div className="inventory-workspace">
-        <section className="inventory-board" aria-labelledby="inventory-table-heading">
-          <div className="panel-heading inventory-board-heading"><div><h2 id="inventory-table-heading">逐日库存</h2><p>{units.length} 个库存单元 · {nights.length} 晚</p></div><div className="board-legend"><span><i className="legend-available" />可售</span><span><i className="legend-blocked" />占用</span></div></div>
-          {loading ? <LoadingBlock label="正在查询可售库存" /> : units.length === 0 ? <EmptyState title="没有库存结果" detail="调整日期或库存类型后重新查询。" /> : (
-            <div className="table-region" role="region" aria-label="房间和床位逐日可售表" tabIndex={0}>
-              <table className="inventory-table" data-testid="inventory-board">
-                <thead><tr><th scope="col" className="sticky-column">库存单元</th>{nights.map((night) => <th scope="col" key={night.serviceDate}><span>{night.serviceDate.slice(5)}</span></th>)}<th scope="col">操作</th></tr></thead>
-                <tbody>
-                  {units.map((unit) => (
-                    <tr key={unit.id} className={selectedUnitId === unit.id ? "selected-row" : undefined}>
-                      <th scope="row" className={`sticky-column unit-cell ${unit.kind === "BED" ? "child-unit" : ""}`}><span className="unit-code">{unit.code}</span><span>{unit.name}</span><small>{unit.kind === "ROOM" ? "整房" : "床位"}</small></th>
-                      {unit.nights.map((night) => <td key={night.serviceDate}><span className={`availability-cell ${night.available ? "available" : "blocked"}`} aria-label={`${night.serviceDate} ${night.available ? "可售" : "占用"}`}>{night.available ? "可售" : "占用"}</span></td>)}
-                      <td className="row-actions"><button className="icon-button" type="button" onClick={() => setMaintenanceUnit(unit)} disabled={commandsBlocked} aria-label={`维修锁房 ${unit.code}`} title="维修锁房"><Wrench aria-hidden="true" size={17} /></button><button className="button button-compact button-secondary" type="button" onClick={() => setSelectedUnitId(unit.id)} disabled={!unit.available} data-testid={`quote-unit-${unit.code}`}>报价</button></td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
+      {!renderedBoard ? (
+        queryPhase === "LOADING" || (board !== undefined && !boardMatchesCurrentProperty)
+          ? <LoadingBlock label="正在查询房间、床位与来源事实" />
+          : queryPhase === "PERMISSION_DENIED"
+            ? <section className="room-status-query-failure" role="alert"><strong>无权查看当前物业房态</strong><p>当前主体没有这项读取权限，页面未保留旧房态，也不会开放任何写入动作。</p></section>
+          : <section className="room-status-query-failure" role="status"><strong>状态未知，未显示为可售</strong><p>重新查询成功前，页面不会开放房态写入。</p><button type="button" className="button button-secondary" onClick={() => setRefreshToken((value) => value + 1)}>重试查询</button></section>
+      ) : (
+        <>
+          {!isMobile ? roomStatusToolbar : null}
+
+          {rangeLoading ? (
+            <div className="room-status-range-loading" role="status" aria-live="polite" data-testid="room-status-range-loading">
+              <strong>正在载入新的日期范围或房间分页</strong>
+              <span>工具栏保留上次获权的数据时点；下方仍是 [{renderedBoard.range.arrivalDate}, {renderedBoard.range.departureDate}) 的旧事实，已暂停全部交互和写入。</span>
             </div>
-          )}
-        </section>
-        <QuoteWorkbench unit={selectedUnit} arrivalDate={arrivalDate} departureDate={departureDate} policies={policies} commandsBlocked={commandsBlocked} resetToken={quoteResetToken} onCommand={startCommand} />
-      </div>
+          ) : null}
 
-      <section className="maintenance-locks-panel" aria-labelledby="maintenance-locks-heading" data-testid="maintenance-locks">
-        <header className="panel-heading inventory-board-heading">
-          <div><p className="eyebrow">Maintenance</p><h2 id="maintenance-locks-heading">有效维修锁</h2></div>
-          <span className="maintenance-lock-count">{maintenanceLocks.length} 条</span>
-        </header>
-        <InlineError error={maintenanceError} title="无法载入维修锁" />
-        {maintenanceLoading ? <LoadingBlock label="正在载入维修锁" /> : maintenanceLocks.length === 0 ? <EmptyState title="没有有效维修锁" detail="新建维修锁后会在此显示并提供释放入口。" /> : (
-          <div className="table-region" role="region" aria-label="有效维修锁列表" tabIndex={0}>
-            <table className="data-table maintenance-locks-table">
-              <thead><tr><th scope="col">维修锁</th><th scope="col">库存单元</th><th scope="col">锁房周期</th><th scope="col">原因</th><th scope="col">状态</th><th scope="col">操作</th></tr></thead>
-              <tbody>{maintenanceLocks.map((lock) => {
-                const unit = inventoryUnitMap.get(lock.inventory_unit_id);
-                return <tr key={lock.id}><th scope="row"><code>{lock.id}</code><small>{formatDateTime(lock.created_at)}</small></th><td><strong>{unit ? `${unit.code} · ${unit.name}` : lock.inventory_unit_id}</strong></td><td>{lock.arrival_date} 至 {lock.departure_date}</td><td className="maintenance-reason">{lock.reason}</td><td><StatusBadge value={lock.status} /></td><td><button className="button button-compact button-secondary" type="button" onClick={() => releaseMaintenance(lock)} disabled={commandsBlocked} aria-label={`释放维修锁 ${unit?.code ?? lock.id}`}><LockOpen aria-hidden="true" size={16} />释放</button></td></tr>;
-              })}</tbody>
-            </table>
+          <div
+            className="room-status-workspace"
+            aria-busy={rangeLoading}
+            inert={rangeLoading && !filteredViewHasNoRooms}
+          >
+            <div className="room-status-board-column">
+              <RoomStatusGrid
+                board={renderedBoard}
+                filters={viewState.filters}
+                expandedRoomIds={viewState.expandedRoomIds}
+                focusedCell={viewState.focusedCell}
+                selection={viewState.selection}
+                dateWindowStart={viewState.dateWindowStart}
+                dateWindowSize={viewState.dateWindowSize}
+                todayDate={todayDate}
+                initialScrollAnchor={viewState.scrollAnchor}
+                restoreFocus={Boolean(returnNotice)}
+                focusRequestToken={focusRequestToken}
+                onToggleRoom={(roomId) => dispatchView({ type: "TOGGLE_ROOM", roomId })}
+                onFocusedCellChange={(focus) => dispatchView({ type: "SET_FOCUS", focus })}
+                onSelectionChange={selectRange}
+                onPageChange={(index) => changeRoomPage(index, renderedBoard.page.totalPages)}
+                onDateWindowChange={(start) => changeDateWindow(start, renderedBoard.dates.length)}
+                onInspectUnit={inspectUnit}
+                onInspectDay={inspectDay}
+                onInspectInterval={inspectInterval}
+                onClearFilters={clearFilters}
+                onScrollAnchorChange={(anchor) => dispatchView({ type: "SET_SCROLL_ANCHOR", anchor })}
+              />
+              <RoomStatusMobileTasks
+                board={renderedBoard}
+                groups={mobileGroups}
+                activeTab={mobileTab}
+                canCreate={!commandsBlocked && renderedBoard.accessLevel === "WRITE"}
+                focusRequest={mobileFocusRequest}
+                onTabChange={setMobileTab}
+                onPageChange={(index) => changeRoomPage(index, renderedBoard.page.totalPages)}
+                onCreate={() => setMobileCreateOpen(true)}
+                onOpenReference={openReference}
+                onOpenReceipt={(receiptId) => window.open(`/api/v1/receipts/${encodeURIComponent(receiptId)}`, "_blank", "noopener,noreferrer")}
+                onAction={(action, task, unit) => {
+                  if (action.code === "OPEN_ORDER") {
+                    handleAction(action);
+                    return;
+                  }
+                  pendingMobileTaskFocus.current = {
+                    tab: mobileTab,
+                    completedTaskId: task.id,
+                    taskIndex: Math.max(0, activeMobileTasks.findIndex((candidate) => candidate.id === task.id)),
+                    sourceRevision: renderedBoard.revision
+                  };
+                  handleAction(action, unit, {
+                    unitId: unit?.id ?? task.actualInventoryUnitId,
+                    anchorDate: task.sourceStartDate,
+                    focusDate: addLocalDateDays(task.sourceEndDate, -1),
+                    arrivalDate: task.sourceStartDate,
+                    departureDate: task.sourceEndDate
+                  }, task.actualInventoryUnitId);
+                }}
+              />
+            </div>
+            {!isMobile ? <RoomStatusContext
+                board={renderedBoard}
+                selectedUnit={selectedUnit}
+                selectedDay={selectedDay}
+                selectedInterval={selectedInterval}
+                relatedIntervals={relatedIntervals}
+                selection={viewState.selection}
+                conflicts={contextConflicts}
+                allowedActions={contextActions}
+                onSelectedUnitChange={(unit) => {
+                  inspectUnit(unit);
+                  const firstDate = renderedBoard.dates[0];
+                  if (firstDate) selectRange(selectionFromCells(unit.id, firstDate, firstDate));
+                }}
+                onSelectionChange={selectRange}
+                onOpenReference={openReference}
+                onOpenReceipt={(receiptId) => window.open(`/api/v1/receipts/${encodeURIComponent(receiptId)}`, "_blank", "noopener,noreferrer")}
+                onAction={handleAction}
+              /> : null}
           </div>
-        )}
-      </section>
 
-      {maintenanceUnit ? <MaintenanceDialog unit={maintenanceUnit} arrivalDate={arrivalDate} departureDate={departureDate} onClose={() => setMaintenanceUnit(undefined)} onSubmit={(request) => { if (commandsBlocked) return; setMaintenanceUnit(undefined); startCommand(request); }} /> : null}
+          {isMobile ? roomStatusToolbar : null}
+
+          {isMobile && mobileCreateOpen ? (
+            <Modal title="新建住宿或库存 Block" size="mobile-fullscreen" onClose={() => setMobileCreateOpen(false)} footer={null}>
+              <RoomStatusContext
+                board={renderedBoard}
+                selectedUnit={selectedUnit}
+                selectedDay={selectedDay}
+                selectedInterval={selectedInterval}
+                relatedIntervals={relatedIntervals}
+                selection={viewState.selection}
+                conflicts={contextConflicts}
+                allowedActions={contextActions}
+                onSelectedUnitChange={(unit) => {
+                  inspectUnit(unit);
+                  const firstDate = renderedBoard.dates[0];
+                  if (firstDate) selectRange(selectionFromCells(unit.id, firstDate, firstDate));
+                }}
+                onSelectionChange={selectRange}
+                onOpenReference={openReference}
+                onOpenReceipt={(receiptId) => window.open(`/api/v1/receipts/${encodeURIComponent(receiptId)}`, "_blank", "noopener,noreferrer")}
+                onAction={(action) => {
+                  if (handleAction(action)) setMobileCreateOpen(false);
+                }}
+              />
+            </Modal>
+          ) : null}
+
+          {showQuoteWorkbench ? (
+            <div className="room-status-quote-section" ref={quoteSectionRef}>
+              <QuoteWorkbench
+                key={`${quoteTarget?.unitId ?? "recovery"}:${quoteTarget?.arrivalDate ?? range.arrivalDate}:${quoteTarget?.departureDate ?? range.departureDate}:${quoteTarget?.initialStayType ?? "recover"}:${quoteResetToken}`}
+                unit={quoteActionUnit}
+                arrivalDate={quoteTarget?.arrivalDate ?? range.arrivalDate}
+                departureDate={quoteTarget?.departureDate ?? range.departureDate}
+                policies={policies}
+                {...(quoteTarget ? { initialStayType: quoteTarget.initialStayType } : {})}
+                commandsBlocked={commandsBlocked}
+                resetToken={quoteResetToken}
+                onCommand={startCommand}
+              />
+            </div>
+          ) : null}
+        </>
+      )}
+
+      {maintenanceTarget && viewState.selection ? <MaintenanceDialog unit={maintenanceTarget} arrivalDate={viewState.selection.arrivalDate} departureDate={viewState.selection.departureDate} writeBlocked={commandsBlocked} onClose={() => setMaintenanceTarget(undefined)} onSubmit={(request) => { const started = startCommand(request); if (started) setMaintenanceTarget(undefined); return started; }} /> : null}
+      {internalUseTarget && viewState.selection ? <InternalUseDialog unit={internalUseTarget} arrivalDate={viewState.selection.arrivalDate} departureDate={viewState.selection.departureDate} writeBlocked={commandsBlocked} onClose={() => setInternalUseTarget(undefined)} onSubmit={(request) => { const started = startCommand(request); if (started) setInternalUseTarget(undefined); return started; }} /> : null}
       {command ? <CommandDialog
-        key={recoveryDialogOpen ? `recovery-${commandRecovery.pending?.confirmationKey ?? "missing"}` : "new-inventory-command"}
+        key={recoveryDialogOpen ? `recovery-${commandRecovery.pending?.confirmationKey ?? "missing"}-${commandAttemptId}` : `new-room-status-command-${commandAttemptId}`}
         request={command}
         onClose={closeCommandDialog}
+        writeBlocked={!recoveryDialogOpen && (commandsBlocked || commandContextInvalidated)}
+        writeBlockedReason="房态权限、查询范围、数据新鲜度、投影完整性或命令恢复状态已经变化。未重新取得当前获权事实前不能生成或确认 Preview。"
+        onCommitted={refreshCommittedRoomStatus}
         {...(recoveryDialogOpen && commandRecovery.pending ? {
           initialConfirmationKey: commandRecovery.pending.confirmationKey,
           ...(commandRecovery.pending.receipt ? { initialReceipt: commandRecovery.pending.receipt } : {})
         } : {})}
-        onProgress={(progress) => commandRecovery.track(command, progress)}
+        onProgress={(progress) => trackCommandProgress(command, progress, commandAttemptId)}
       /> : null}
     </div>
   );

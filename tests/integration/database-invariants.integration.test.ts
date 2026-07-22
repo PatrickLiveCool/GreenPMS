@@ -550,13 +550,13 @@ describe.sequential("database-owned invariants on PostgreSQL", () => {
       .toEqual({ fact_id: result.factIds[0], coverage_id: coverage.id, entry_type: "RELEASE" });
   });
 
-  it("requires migration 012 for readiness", async () => {
+  it("requires the current room-status migration for readiness", async () => {
     expect(await databaseReady(db)).toBe(true);
-    await db.deleteFrom("schema_migrations").where("name", "=", "012_legacy_demo_inventory_catalog_backfill.sql").execute();
+    await db.deleteFrom("schema_migrations").where("name", "=", "013_room_status_operations.sql").execute();
     try {
       expect(await databaseReady(db)).toBe(false);
     } finally {
-      await db.insertInto("schema_migrations").values({ name: "012_legacy_demo_inventory_catalog_backfill.sql" }).execute();
+      await db.insertInto("schema_migrations").values({ name: "013_room_status_operations.sql" }).execute();
     }
     expect(await databaseReady(db)).toBe(true);
   });

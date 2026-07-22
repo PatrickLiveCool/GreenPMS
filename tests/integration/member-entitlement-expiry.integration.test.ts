@@ -10,6 +10,7 @@ import {
   type Database
 } from "@qintopia/db";
 import type { Kysely } from "kysely";
+import { createQuoteForTesting } from "../../packages/db/src/pricing-service.ts";
 import { demo } from "../../packages/db/src/seed.ts";
 import { resetDatabase } from "../helpers/database.ts";
 
@@ -283,5 +284,44 @@ describe("member entitlement natural expiry", () => {
     expect(await listMemberSummaries(db, demo.propertyId, "expiry-consistency-id")).toEqual([
       expect.objectContaining({ availableBalance: { ROOM_NIGHT: 3, BED_NIGHT: 0 }, balanceAsOfDate: today })
     ]);
+  });
+
+  it("never allocates a naturally expired Lot to a new Quote, including a historical service date", async () => {
+    await db.insertInto("entitlement_lots").values([
+      {
+        id: "lot_expired_before_quote",
+        contract_id: activeContractId,
+        unit_kind: "ROOM_NIGHT",
+        total_units: 4,
+        expires_on: yesterday,
+        version: 1
+      },
+      {
+        id: "lot_valid_for_quote",
+        contract_id: activeContractId,
+        unit_kind: "ROOM_NIGHT",
+        total_units: 1,
+        expires_on: tomorrow,
+        version: 1
+      }
+    ]).execute();
+
+    const quote = await createQuoteForTesting(db, {
+      propertyId: demo.propertyId,
+      inventoryUnitId: demo.roomId,
+      stayType: "TRANSIENT",
+      arrivalDate: yesterday,
+      departureDate: tomorrow,
+      pricingPolicyVersionId: demo.publicPricingPolicyId,
+      memberContractId: activeContractId
+    });
+
+    expect(quote.coverageSet).toEqual([{
+      serviceDate: yesterday,
+      inventoryUnitId: demo.roomId,
+      unitKind: "ROOM_NIGHT",
+      entitlementLotId: "lot_valid_for_quote"
+    }]);
+    expect(quote.cashLines).toEqual([expect.objectContaining({ serviceDate: today })]);
   });
 });

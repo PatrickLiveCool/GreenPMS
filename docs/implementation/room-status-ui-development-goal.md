@@ -1,7 +1,7 @@
 ---
 title: QinTopia PMS Room Status UI Development Goal
 type: ui-development-goal
-status: ready-for-development
+status: done
 created: 2026-07-19
 target_project: QinTopia PMS greenfield
 scope: desktop room status board, responsive alternatives, and supporting UI/API contracts
@@ -331,21 +331,21 @@ npm run test:e2e
 
 ## 14. Definition Of Done
 
-- [ ] `InventoryPage` 已成为真实数据驱动的 `RoomStatusGrid`，不是静态演示；
-- [ ] 房间、床位、销售模式和父子互斥被准确表达；
-- [ ] Order、Stay、Operations 和 Block 来源可区分并可导航；
-- [ ] `asOf`、freshness、stale 和 unknown 语义完整；
-- [ ] 空白选区不写事实，动作入口正确分流；
-- [ ] blocking conflict 禁用确认并给出精确原因；
-- [ ] READ/WRITE 的可见动作正确；
-- [ ] Preview、Confirm、Receipt 和 state-unknown 行为保持现有命令合同；
-- [ ] 返回房态恢复日期、筛选、展开、滚动、选区和焦点；
-- [ ] 移动端使用任务流，不缩放桌面矩阵；
-- [ ] WCAG 2.2 AA、键盘、屏读、320px reflow 和 200% zoom 通过；
-- [ ] 性能与 5 秒 freshness 指标有可重复证据；
-- [ ] OpenAPI、Web、外围智能体和数据库事实没有行为分叉；
-- [ ] 既有核心旅程和测试无回归；
-- [ ] 应用已启动并提供最终 URL、测试摘要、截图和剩余非阻断风险。
+- [x] `InventoryPage` 已成为真实数据驱动的 `RoomStatusGrid`，不是静态演示；
+- [x] 房间、床位、销售模式和父子互斥被准确表达；
+- [x] Order、Stay、Operations 和 Block 来源可区分并可导航；
+- [x] `asOf`、freshness、stale 和 unknown 语义完整；
+- [x] 空白选区不写事实，动作入口正确分流；
+- [x] blocking conflict 禁用确认并给出精确原因；
+- [x] READ/WRITE 的可见动作正确；
+- [x] Preview、Confirm、Receipt 和 state-unknown 行为保持现有命令合同；
+- [x] 返回房态恢复日期、筛选、展开、滚动、选区和焦点；
+- [x] 移动端使用任务流，不缩放桌面矩阵；
+- [x] WCAG 2.2 AA、键盘、屏读、320px reflow 和 200% zoom 通过；
+- [x] 性能与 5 秒 freshness 指标有可重复证据；
+- [x] OpenAPI、Web、外围智能体和数据库事实没有行为分叉；
+- [x] 既有核心旅程和测试无回归；
+- [x] 应用已启动并提供最终 URL、测试摘要、截图和剩余非阻断风险。
 
 ## 15. Non-Goals
 

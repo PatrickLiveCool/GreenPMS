@@ -22,6 +22,9 @@ export const commandTypes = [
   "MARK_NO_SHOW",
   "LOCK_MAINTENANCE",
   "RELEASE_MAINTENANCE",
+  "PLACE_INTERNAL_USE",
+  "RELEASE_INTERNAL_USE",
+  "COMPLETE_CLEANING",
   "RECORD_COLLECTION",
   "RECORD_REFUND",
   "REVERSE_FACT",
@@ -272,6 +275,212 @@ export interface AmountSummaryDto {
   currentContractAmount: MoneyDto;
   netRecordedCollection: MoneyDto;
   collectionDifference: MoneyDto;
+}
+
+export const roomStatusStatuses = [
+  "AVAILABLE",
+  "RESERVED",
+  "IN_HOUSE",
+  "CLEANING",
+  "MAINTENANCE",
+  "INTERNAL_USE",
+  "UNAVAILABLE",
+  "STALE",
+  "UNKNOWN"
+] as const;
+export type RoomStatusStatus = (typeof roomStatusStatuses)[number];
+
+export const ROOM_STATUS_MAX_QUERY_NIGHTS = 90;
+export const ROOM_STATUS_OPERATIONAL_TASK_LIMIT = 500;
+
+export const roomStatusActionCodes = [
+  "CREATE_ORDER",
+  "CREATE_FREE_STAY",
+  "PLACE_INTERNAL_USE",
+  "LOCK_MAINTENANCE",
+  "OPEN_ORDER",
+  "RELEASE_MAINTENANCE",
+  "RELEASE_INTERNAL_USE",
+  "COMPLETE_CLEANING"
+] as const;
+export type RoomStatusActionCode = (typeof roomStatusActionCodes)[number];
+
+export const roomStatusSourceKinds = [
+  "ORDER",
+  "FREE_STAY",
+  "MAINTENANCE",
+  "INTERNAL_USE",
+  "CLEANING",
+  "UNIT_UNSELLABLE"
+] as const;
+export type RoomStatusSourceKind = (typeof roomStatusSourceKinds)[number];
+
+export const roomStatusOperationalTaskKinds = ["ARRIVAL", "IN_HOUSE", "DEPARTURE", "EXCEPTION"] as const;
+export type RoomStatusOperationalTaskKind = (typeof roomStatusOperationalTaskKinds)[number];
+
+export const roomStatusBlockingFactKinds = ["CLAIM", "LODGING_ORDER", "OVERDUE_IN_HOUSE", "UNIT_UNSELLABLE"] as const;
+export type RoomStatusBlockingFactKind = (typeof roomStatusBlockingFactKinds)[number];
+
+export interface RoomStatusReferenceDto {
+  type: "CLAIM" | "ORDER" | "STAY" | "OPERATIONS" | "BLOCK" | "INVENTORY_UNIT" | "RECEIPT";
+  id: string;
+  label: string;
+  href: string | null;
+}
+
+export interface RoomStatusActionDto {
+  code: RoomStatusActionCode;
+  enabled: boolean;
+  disabledReason: string | null;
+  requiresFullInterval: boolean;
+  targetReference: RoomStatusReferenceDto | null;
+}
+
+export interface RoomStatusHistoryDto {
+  action: string;
+  actorId: string | null;
+  source: "WEB_SESSION" | "API_TOKEN" | "SYSTEM" | "UNKNOWN";
+  occurredAt: string;
+  commandId: string | null;
+  receiptId: string | null;
+  correlationId: string | null;
+}
+
+export interface RoomStatusConflictDto {
+  id: string;
+  blockingFactKind: RoomStatusBlockingFactKind;
+  claimId: string | null;
+  claimIds: string[];
+  requestedInventoryUnitId: string;
+  actualInventoryUnitId: string;
+  roomId: string;
+  startDate: string;
+  endDate: string;
+  sourceKind: RoomStatusSourceKind;
+  sourceReference: RoomStatusReferenceDto;
+  reason: string;
+  blocking: true;
+}
+
+export interface RoomStatusDayDto {
+  serviceDate: string;
+  status: RoomStatusStatus;
+  available: boolean;
+  intervalIds: string[];
+  conflicts: RoomStatusConflictDto[];
+}
+
+export interface RoomStatusIntervalDto {
+  id: string;
+  displayInventoryUnitId: string;
+  actualInventoryUnitId: string;
+  roomId: string;
+  startDate: string;
+  endDate: string;
+  sourceStartDate: string;
+  sourceEndDate: string;
+  status: RoomStatusStatus;
+  available: boolean;
+  blocking: boolean;
+  sourceKind: RoomStatusSourceKind;
+  label: string;
+  primaryOccupantLabel: string | null;
+  reason: string | null;
+  claimIds: string[];
+  references: RoomStatusReferenceDto[];
+  conflicts: RoomStatusConflictDto[];
+  history: RoomStatusHistoryDto[];
+  allowedActions: RoomStatusActionDto[];
+}
+
+export interface RoomStatusOperationalTaskDto extends RoomStatusIntervalDto {
+  taskKind: RoomStatusOperationalTaskKind;
+  businessDate: string;
+}
+
+export interface RoomStatusUnitDto {
+  id: string;
+  propertyId: string;
+  roomId: string;
+  parentRoomId: string | null;
+  kind: InventoryUnitKind;
+  code: string;
+  name: string;
+  active: boolean;
+  salesMode: "WHOLE_ROOM" | "BED_SPLIT" | "UNAVAILABLE";
+  buildingCode: string | null;
+  roomTypeCode: string | null;
+  pricingProductCode: string | null;
+  capacity: number;
+  childUnitIds: string[];
+  children: RoomStatusUnitDto[];
+  days: RoomStatusDayDto[];
+  intervals: RoomStatusIntervalDto[];
+  conflicts: RoomStatusConflictDto[];
+  allowedActions: RoomStatusActionDto[];
+}
+
+export interface RoomStatusFilterOptionsDto {
+  roomTypeCodes: string[];
+  salesModes: RoomStatusUnitDto["salesMode"][];
+  statuses: RoomStatusStatus[];
+  capacities: number[];
+  unitKinds: InventoryUnitKind[];
+}
+
+export interface RoomStatusBoardQueryDto {
+  arrivalDate: string;
+  departureDate: string;
+  page?: number;
+  pageSize?: number;
+  search?: string;
+  roomType?: string;
+  salesMode?: RoomStatusUnitDto["salesMode"];
+  status?: RoomStatusStatus;
+  minCapacity?: number;
+  unitKind?: InventoryUnitKind;
+}
+
+export interface RoomStatusBoardDto {
+  propertyId: string;
+  businessDate: string;
+  range: {
+    arrivalDate: string;
+    departureDate: string;
+  };
+  dates: string[];
+  asOf: string;
+  freshUntil: string;
+  revision: string;
+  accessLevel: AccessLevel;
+  projectionState: "READY" | "PARTIAL";
+  filterOptions: RoomStatusFilterOptionsDto;
+  page: {
+    index: number;
+    size: number;
+    totalRooms: number;
+    totalPages: number;
+  };
+  operationalTasks: RoomStatusOperationalTaskDto[];
+  rooms: RoomStatusUnitDto[];
+}
+
+export interface PlaceInternalUseInput {
+  propertyId: string;
+  inventoryUnitId: string;
+  arrivalDate: string;
+  departureDate: string;
+  reason: string;
+}
+
+export interface ReleaseInternalUseInput {
+  propertyId: string;
+  internalUseBlockId: string;
+}
+
+export interface CompleteCleaningInput {
+  propertyId: string;
+  cleaningTaskId: string;
 }
 
 export interface CommandReason {

@@ -1,0 +1,302 @@
+import { expect, test, type Page, type TestInfo } from "@playwright/test";
+import type { AuthPrincipal, RoomStatusBoardDto } from "@qintopia/contracts";
+import { todayInTimeZone, sha256 } from "@qintopia/domain";
+import { confirmCommandPreview, createCommandPreview } from "../../packages/db/src/commands/service.ts";
+import { createDatabase } from "../../packages/db/src/database.ts";
+import { createRoomStatusViewState, serializeRoomStatusRestoration } from "../../apps/web/src/room-status/roomStatusState.ts";
+
+const e2eDatabaseUrl = process.env.E2E_DATABASE_URL
+  ?? "postgres://qintopia:qintopia@127.0.0.1:55432/qintopia_e2e";
+const baseUrl = process.env.ROOM_STATUS_E2E_BASE_URL ?? "/";
+const performancePropertyId = "prop_e2e_room_status_performance";
+const performancePropertyCode = "Z-RS-PERF";
+const operator = { username: "operator", password: "demo-pass-2026" };
+const operatorSubjectId = "subject_demo_operator";
+const agentSubjectId = "subject_demo_agent";
+const performanceTokenId = "token_e2e_room_status_performance";
+const roomStatusPageSize = 50;
+
+function isDesktop(testInfo: TestInfo): boolean {
+  return testInfo.project.name === "desktop" || process.env.ROOM_STATUS_E2E_PROJECT === "desktop";
+}
+
+function isMobile(testInfo: TestInfo): boolean {
+  return testInfo.project.name === "mobile" || process.env.ROOM_STATUS_E2E_PROJECT === "mobile";
+}
+
+function addDays(value: string, days: number): string {
+  const date = new Date(`${value}T00:00:00.000Z`);
+  date.setUTCDate(date.getUTCDate() + days);
+  return date.toISOString().slice(0, 10);
+}
+
+async function preparePerformanceProperty(arrivalDate: string): Promise<void> {
+  const db = createDatabase(e2eDatabaseUrl);
+  try {
+    const operatorSubject = await db.selectFrom("subjects")
+      .select("id")
+      .where("username", "=", operator.username)
+      .executeTakeFirstOrThrow();
+    await db.transaction().execute(async (trx) => {
+      await trx.insertInto("properties").values({
+        id: performancePropertyId,
+        code: performancePropertyCode,
+        name: "Room Status Performance Fixture",
+        timezone: "Asia/Shanghai",
+        currency: "CNY"
+      }).onConflict((conflict) => conflict.column("id").doNothing()).execute();
+      await trx.insertInto("inventory_units").values(Array.from({ length: 200 }, (_, index) => {
+        const suffix = index.toString().padStart(3, "0");
+        return {
+          id: `unit_e2e_room_status_performance_${suffix}`,
+          property_id: performancePropertyId,
+          kind: "ROOM" as const,
+          parent_room_id: null,
+          code: `PERF-${suffix}`,
+          name: `Performance room ${suffix}`,
+          active: true,
+          catalog_version: null,
+          building_code: "PERF",
+          room_type_code: null,
+          pricing_product_code: null,
+          inventory_basis: "INDEPENDENT" as const,
+          code_provenance: "PMS_GENERATED" as const,
+          physical_bed_count: 1
+        };
+      })).onConflict((conflict) => conflict.column("id").doNothing()).execute();
+      await trx.insertInto("room_status_revisions").values({
+        property_id: performancePropertyId,
+        revision: 0
+      }).onConflict((conflict) => conflict.column("property_id").doNothing()).execute();
+      await trx.insertInto("subject_property_grants").values({
+        subject_id: operatorSubject.id,
+        property_id: performancePropertyId,
+        access_level: "WRITE"
+      }).onConflict((conflict) => conflict.columns(["subject_id", "property_id"]).doUpdateSet({
+        access_level: "WRITE"
+      })).execute();
+      await trx.insertInto("subject_property_grants").values({
+        subject_id: agentSubjectId,
+        property_id: performancePropertyId,
+        access_level: "WRITE"
+      }).onConflict((conflict) => conflict.columns(["subject_id", "property_id"]).doUpdateSet({
+        access_level: "WRITE"
+      })).execute();
+      await trx.insertInto("api_tokens").values({
+        id: performanceTokenId,
+        subject_id: agentSubjectId,
+        label: "Room-status performance fixture writer",
+        secret_hash: sha256("e2e-room-status-performance-token"),
+        access_ceiling: "WRITE",
+        property_scope: performancePropertyId,
+        expires_at: "2035-01-01T00:00:00.000Z",
+        revoked_at: null,
+        rotated_from_id: null,
+        replaced_by_id: null
+      }).onConflict((conflict) => conflict.column("id").doUpdateSet({
+        revoked_at: null,
+        replaced_by_id: null,
+        expires_at: "2035-01-01T00:00:00.000Z"
+      })).execute();
+    });
+
+    const principal: AuthPrincipal = {
+      subjectId: agentSubjectId,
+      credentialId: performanceTokenId,
+      credentialType: "TOKEN",
+      displayName: "Room-status performance fixture writer",
+      propertyAccess: new Map([[performancePropertyId, "WRITE"]])
+    };
+    for (let index = 0; index < 200; index += 10) {
+      const suffix = index.toString().padStart(3, "0");
+      const reason = `E2E performance typed source ${arrivalDate} ${suffix}`;
+      const existing = await db.selectFrom("internal_use_blocks")
+        .select("id")
+        .where("property_id", "=", performancePropertyId)
+        .where("reason", "=", reason)
+        .executeTakeFirst();
+      if (existing) continue;
+      const sourceStart = addDays(arrivalDate, index % 20);
+      const sourceEnd = addDays(sourceStart, 21);
+      const preview = await createCommandPreview(db, principal, {
+        commandType: "PLACE_INTERNAL_USE",
+        input: {
+          propertyId: performancePropertyId,
+          inventoryUnitId: `unit_e2e_room_status_performance_${suffix}`,
+          arrivalDate: sourceStart,
+          departureDate: sourceEnd,
+          reason
+        }
+      }, {
+        idempotencyKey: `e2e-performance-preview-${arrivalDate}-${suffix}`,
+        correlationId: `e2e-performance-preview-${arrivalDate}-${suffix}`
+      });
+      await confirmCommandPreview(db, principal, preview.preview.previewId, {
+        propertyId: performancePropertyId,
+        commandType: "PLACE_INTERNAL_USE",
+        confirmation: true,
+        expectedEffectHash: preview.preview.effectHash,
+        reason: {
+          code: "E2E_PERFORMANCE_FIXTURE",
+          note: "Populate the measured room-status projection with real typed sources"
+        }
+      }, {
+        idempotencyKey: `e2e-performance-confirm-${arrivalDate}-${suffix}`,
+        correlationId: `e2e-performance-confirm-${arrivalDate}-${suffix}`
+      });
+    }
+  } finally {
+    await db.destroy();
+  }
+}
+
+function roomStatusResponse(
+  page: Page,
+  expectedRange?: { arrivalDate: string; departureDate: string }
+) {
+  return page.waitForResponse((response) => {
+    const url = new URL(response.url());
+    return response.request().method() === "GET"
+      && url.pathname === `/api/v1/properties/${performancePropertyId}/room-status`
+      && (!expectedRange || (url.searchParams.get("arrivalDate") === expectedRange.arrivalDate
+        && url.searchParams.get("departureDate") === expectedRange.departureDate))
+      && response.status() === 200;
+  });
+}
+
+async function login(page: Page): Promise<void> {
+  await page.goto(baseUrl);
+  await expect(page.getByRole("heading", { name: "登录", exact: true })).toBeVisible();
+  await page.getByTestId("login-username").fill(operator.username);
+  await page.getByTestId("login-password").fill(operator.password);
+  await page.getByTestId("login-submit").click();
+  await expect(page.getByRole("heading", { name: "房态与可售" })).toBeVisible();
+}
+
+test("200 real inventory units by 90 nights become keyboard-interactive within two seconds", async ({ page }, testInfo) => {
+  test.skip(!isDesktop(testInfo), "desktop room-status performance coverage");
+  test.setTimeout(120_000);
+  const arrivalDate = todayInTimeZone("Asia/Shanghai");
+  await preparePerformanceProperty(arrivalDate);
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await login(page);
+
+  const departureDate = addDays(arrivalDate, 90);
+  await page.evaluate(({ key, value }) => window.sessionStorage.setItem(key, value), {
+    key: `qintopia.room-status-view.v1:${operatorSubjectId}:${performancePropertyId}`,
+    value: serializeRoomStatusRestoration({
+      version: 1,
+      propertyId: performancePropertyId,
+      range: { arrivalDate, departureDate },
+      revision: "0",
+      savedAt: new Date().toISOString(),
+      state: createRoomStatusViewState()
+    })
+  });
+
+  const committedRange = page.getByTestId("room-status-board-range");
+  const responsePromise = roomStatusResponse(page, { arrivalDate, departureDate });
+  const startedAt = performance.now();
+  await page.getByTestId("property-select").selectOption(performancePropertyId);
+  const response = await responsePromise;
+  await expect(committedRange).toHaveAttribute("data-range-arrival", arrivalDate);
+  await expect(committedRange).toHaveAttribute("data-range-departure", departureDate);
+
+  const gridRegion = committedRange.getByRole("region", { name: /房态二维网格/ });
+  const grid = gridRegion.getByRole("grid");
+  await expect(grid).toBeVisible();
+  await expect(page.getByRole("button", { name: "向后移动可见日期", exact: true })).toBeEnabled();
+  await expect(grid).toHaveAttribute("aria-rowcount", String(roomStatusPageSize + 1));
+  const renderedDateCount = await grid.locator(".room-status-date-header").count();
+  expect(renderedDateCount).toBeGreaterThan(0);
+  expect(renderedDateCount).toBeLessThanOrEqual(31);
+  await expect(grid.locator("[data-room-status-row]")).toHaveCount(roomStatusPageSize);
+  await expect(grid.locator("[data-room-status-cell='true']")).toHaveCount(roomStatusPageSize * renderedDateCount);
+
+  const firstCell = grid.locator("[data-room-status-cell='true']").first();
+  await firstCell.focus();
+  await page.keyboard.press("ArrowRight");
+  await expect(grid.locator("[data-room-status-cell='true']:focus")).toHaveAttribute("data-service-date", addDays(arrivalDate, 1));
+  const elapsedMs = performance.now() - startedAt;
+  expect(elapsedMs, "first 90-night page through keyboard-interactive 200-unit property")
+    .toBeLessThanOrEqual(2_000);
+
+  const responseBody = await response.body();
+  const board = JSON.parse(responseBody.toString("utf8")) as RoomStatusBoardDto;
+  expect(board.dates).toHaveLength(90);
+  expect(board.rooms.reduce((count, room) => count + 1 + room.children.length, 0)).toBe(roomStatusPageSize);
+  expect(board.rooms.flatMap((room) => room.intervals).filter((interval) => interval.sourceKind === "INTERNAL_USE").length).toBeGreaterThanOrEqual(5);
+  await expect(grid.locator(".room-status-interval-internal-use")).toHaveCount(5);
+  expect(board.page).toMatchObject({ index: 0, size: roomStatusPageSize, totalRooms: 200, totalPages: 4 });
+  expect(responseBody.byteLength).toBeLessThanOrEqual(2_100_000);
+  expect(response.headers()["content-encoding"]).toMatch(/^(br|gzip|zstd)$/);
+
+  const filteredResponsePromise = page.waitForResponse((candidate) => {
+    const url = new URL(candidate.url());
+    return candidate.request().method() === "GET"
+      && url.pathname === `/api/v1/properties/${performancePropertyId}/room-status`
+      && url.searchParams.get("search") === "PERF-190"
+      && candidate.status() === 200;
+  });
+  await page.getByLabel("搜索房间或床位").fill("PERF-190");
+  const filteredResponse = await filteredResponsePromise;
+  const filteredBoard = await filteredResponse.json() as RoomStatusBoardDto;
+  expect(filteredBoard.page).toMatchObject({ index: 0, totalRooms: 1, totalPages: 1 });
+  expect(filteredBoard.rooms.map((room) => room.code)).toEqual(["PERF-190"]);
+  expect(filteredBoard.filterOptions.capacities).toContain(1);
+  await expect(grid.locator("[data-room-status-row]")).toHaveCount(1);
+  await expect(page.getByText("1 间房", { exact: true })).toBeVisible();
+});
+
+test("mobile operators can page through every room in a property larger than one server page", async ({ page }, testInfo) => {
+  test.skip(!isMobile(testInfo), "mobile room pagination coverage");
+  test.setTimeout(120_000);
+  const arrivalDate = todayInTimeZone("Asia/Shanghai");
+  await preparePerformanceProperty(arrivalDate);
+  await page.setViewportSize({ width: 375, height: 812 });
+  await login(page);
+
+  const firstPageResponse = page.waitForResponse((response) => {
+    const url = new URL(response.url());
+    return response.request().method() === "GET"
+      && url.pathname === `/api/v1/properties/${performancePropertyId}/room-status`
+      && url.searchParams.get("page") === "0"
+      && response.status() === 200;
+  });
+  await page.getByTestId("property-select").selectOption(performancePropertyId);
+  await firstPageResponse;
+
+  const pager = page.getByRole("navigation", { name: "移动房源分页" });
+  await expect(pager).toContainText("房源第 1 / 4 页，共 200 间");
+  await expect(page.getByRole("region", { name: /房态二维网格/ })).toHaveCount(0);
+
+  const secondPageResponse = page.waitForResponse((response) => {
+    const url = new URL(response.url());
+    return response.request().method() === "GET"
+      && url.pathname === `/api/v1/properties/${performancePropertyId}/room-status`
+      && url.searchParams.get("page") === "1"
+      && response.status() === 200;
+  });
+  await pager.getByRole("button", { name: "下一页房源" }).click();
+  await secondPageResponse;
+  await expect(pager).toContainText("房源第 2 / 4 页，共 200 间");
+  await page.screenshot({ path: testInfo.outputPath("room-status-mobile-pagination-200-rooms.png"), fullPage: true });
+
+  await page.getByRole("button", { name: "新建住宿或库存 Block" }).click();
+  const unitSelect = page.getByTestId("room-status-unit-select");
+  await expect(unitSelect.locator("option")).toHaveCount(roomStatusPageSize + 1);
+  await expect(unitSelect.locator("option[value='unit_e2e_room_status_performance_050']")).toHaveCount(1);
+  await expect(unitSelect.locator("option[value='unit_e2e_room_status_performance_000']")).toHaveCount(0);
+  await page.getByRole("button", { name: "关闭", exact: true }).click();
+
+  const previousPageResponse = page.waitForResponse((response) => {
+    const url = new URL(response.url());
+    return response.request().method() === "GET"
+      && url.pathname === `/api/v1/properties/${performancePropertyId}/room-status`
+      && url.searchParams.get("page") === "0"
+      && response.status() === 200;
+  });
+  await pager.getByRole("button", { name: "上一页房源" }).click();
+  await previousPageResponse;
+  await expect(pager).toContainText("房源第 1 / 4 页，共 200 间");
+});

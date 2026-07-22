@@ -1,6 +1,6 @@
 import { sql, type Kysely, type Transaction } from "kysely";
 import { DomainError, type InventoryUnitKind } from "@qintopia/contracts";
-import { enumerateServiceDates, newId } from "@qintopia/domain";
+import { enumerateServiceDates, newId, todayInTimeZone } from "@qintopia/domain";
 import type { Database } from "./schema.ts";
 
 export type DbExecutor = Kysely<Database> | Transaction<Database>;
@@ -32,13 +32,74 @@ export interface UnitAvailability extends InventoryUnitRecord {
   available: boolean;
 }
 
-export async function loadInventoryUnit(db: DbExecutor, propertyId: string, unitId: string): Promise<InventoryUnitRecord> {
-  const row = await db.selectFrom("inventory_units")
+interface OverdueStayBlocker {
+  orderId: string;
+  stayId: string;
+  segmentId: string;
+  inventoryUnitId: string;
+  roomId: string;
+  serviceDate: string;
+}
+
+async function loadOverdueStayBlockers(
+  db: DbExecutor,
+  propertyId: string,
+  dates: readonly string[]
+): Promise<OverdueStayBlocker[]> {
+  if (dates.length === 0) return [];
+  const property = await db.selectFrom("properties").select("timezone").where("id", "=", propertyId).executeTakeFirst();
+  if (!property) throw new DomainError("NOT_FOUND", "Property not found", 404);
+  const clock = await sql<{ as_of: Date }>`select transaction_timestamp() as as_of`.execute(db);
+  const businessDate = todayInTimeZone(property.timezone, clock.rows[0]!.as_of);
+  if (!dates.includes(businessDate)) return [];
+
+  const orderRows = await db.selectFrom("orders")
+    .select(["id", "status"])
+    .where("property_id", "=", propertyId)
+    .where("departure_date", "<=", businessDate)
+    .where("status", "=", "CHECKED_IN")
+    .orderBy("id")
+    .execute();
+  const orderIds = orderRows.map((row) => row.id);
+  if (orderIds.length === 0) return [];
+
+  const segmentRows = await db.selectFrom("stays as stay")
+    .innerJoin("stay_segments as segment", "segment.stay_id", "stay.id")
+    .innerJoin("inventory_units as unit", "unit.id", "segment.inventory_unit_id")
+    .select([
+      "stay.order_id", "stay.id as stay_id", "segment.id as segment_id", "segment.inventory_unit_id",
+      "segment.sequence", "unit.kind", "unit.parent_room_id"
+    ])
+    .where("stay.order_id", "in", orderIds)
+    .orderBy("stay.order_id")
+    .orderBy("segment.sequence", "desc")
+    .execute();
+  const latestByOrder = new Map<string, typeof segmentRows[number]>();
+  for (const row of segmentRows) {
+    if (!latestByOrder.has(row.order_id)) latestByOrder.set(row.order_id, row);
+  }
+  return [...latestByOrder.values()].map((row) => ({
+    orderId: row.order_id,
+    stayId: row.stay_id,
+    segmentId: row.segment_id,
+    inventoryUnitId: row.inventory_unit_id,
+    roomId: row.kind === "ROOM" ? row.inventory_unit_id : row.parent_room_id!,
+    serviceDate: businessDate
+  }));
+}
+
+function blockerAffectsUnit(blocker: OverdueStayBlocker, unit: Pick<InventoryUnitRecord, "id" | "kind" | "roomId">): boolean {
+  return blocker.roomId === unit.roomId
+    && (unit.kind === "ROOM" || blocker.inventoryUnitId === blocker.roomId || blocker.inventoryUnitId === unit.id);
+}
+
+async function loadInventoryUnitRecord(db: DbExecutor, propertyId: string, unitId: string, requireActive: boolean): Promise<InventoryUnitRecord> {
+  let query = db.selectFrom("inventory_units")
     .select(["id", "property_id", "kind", "parent_room_id", "code", "name", "catalog_version", "building_code", "room_type_code", "pricing_product_code", "inventory_basis", "code_provenance", "physical_bed_count"])
     .where("id", "=", unitId)
-    .where("property_id", "=", propertyId)
-    .where("active", "=", true)
-    .executeTakeFirst();
+    .where("property_id", "=", propertyId);
+  if (requireActive) query = query.where("active", "=", true);
+  const row = await query.executeTakeFirst();
   if (!row) throw new DomainError("NOT_FOUND", "Inventory unit not found", 404);
   return {
     id: row.id,
@@ -57,6 +118,14 @@ export async function loadInventoryUnit(db: DbExecutor, propertyId: string, unit
   };
 }
 
+export async function loadInventoryUnit(db: DbExecutor, propertyId: string, unitId: string): Promise<InventoryUnitRecord> {
+  return loadInventoryUnitRecord(db, propertyId, unitId, true);
+}
+
+export async function loadInventoryUnitIncludingInactive(db: DbExecutor, propertyId: string, unitId: string): Promise<InventoryUnitRecord> {
+  return loadInventoryUnitRecord(db, propertyId, unitId, false);
+}
+
 export async function listAvailability(db: DbExecutor, propertyId: string, arrivalDate: string, departureDate: string, kind?: InventoryUnitKind): Promise<UnitAvailability[]> {
   const dates = enumerateServiceDates(arrivalDate, departureDate);
   let query = db.selectFrom("inventory_units")
@@ -72,6 +141,7 @@ export async function listAvailability(db: DbExecutor, propertyId: string, arriv
     .where("service_date", ">=", arrivalDate)
     .where("service_date", "<", departureDate)
     .execute();
+  const overdueStayBlockers = await loadOverdueStayBlockers(db, propertyId, dates);
 
   return units.map((unit) => {
     const roomId = unit.kind === "ROOM" ? unit.id : unit.parent_room_id!;
@@ -79,7 +149,16 @@ export async function listAvailability(db: DbExecutor, propertyId: string, arriv
       const blocking = claims.filter((claim) => claim.service_date === serviceDate && claim.room_id === roomId && (
         unit.kind === "ROOM" || claim.inventory_unit_id === roomId || claim.inventory_unit_id === unit.id
       ));
-      return { serviceDate, available: blocking.length === 0, blockingClaimIds: blocking.map((claim) => claim.id) };
+      const blockingStays = overdueStayBlockers.filter((blocker) => blocker.serviceDate === serviceDate && blockerAffectsUnit(blocker, {
+        id: unit.id,
+        kind: unit.kind,
+        roomId
+      }));
+      return {
+        serviceDate,
+        available: blocking.length === 0 && blockingStays.length === 0,
+        blockingClaimIds: blocking.map((claim) => claim.id)
+      };
     });
     return {
       id: unit.id,
@@ -103,6 +182,7 @@ export async function listAvailability(db: DbExecutor, propertyId: string, arriv
 
 export async function inventoryFingerprint(db: DbExecutor, propertyId: string, unitId: string, arrivalDate: string, departureDate: string, excludeSourceIds: string[] = []): Promise<string[]> {
   const unit = await loadInventoryUnit(db, propertyId, unitId);
+  const dates = enumerateServiceDates(arrivalDate, departureDate);
   let query = db.selectFrom("inventory_claims")
     .select(["id", "inventory_unit_id", "service_date", "source_id"])
     .where("property_id", "=", propertyId)
@@ -112,9 +192,13 @@ export async function inventoryFingerprint(db: DbExecutor, propertyId: string, u
     .where("service_date", "<", departureDate);
   if (excludeSourceIds.length > 0) query = query.where("source_id", "not in", excludeSourceIds);
   const claims = await query.orderBy("service_date").orderBy("id").execute();
-  return claims
+  const claimFingerprint = claims
     .filter((claim) => unit.kind === "ROOM" || claim.inventory_unit_id === unit.roomId || claim.inventory_unit_id === unit.id)
     .map((claim) => `${claim.service_date}:${claim.inventory_unit_id}:${claim.id}`);
+  const stayFingerprint = (await loadOverdueStayBlockers(db, propertyId, dates))
+    .filter((blocker) => !excludeSourceIds.includes(blocker.segmentId) && blockerAffectsUnit(blocker, unit))
+    .map((blocker) => `${blocker.serviceDate}:OVERDUE_STAY:${blocker.inventoryUnitId}:${blocker.stayId}`);
+  return [...claimFingerprint, ...stayFingerprint];
 }
 
 export async function lockRoomDays(trx: Transaction<Database>, roomDates: Array<{ roomId: string; serviceDate: string }>): Promise<void> {
@@ -134,14 +218,22 @@ export async function lockRoomDays(trx: Transaction<Database>, roomDates: Array<
   }
 }
 
-export async function lockUnitDates(trx: Transaction<Database>, propertyId: string, unitId: string, arrivalDate: string, departureDate: string): Promise<InventoryUnitRecord> {
-  const unit = await loadInventoryUnit(trx, propertyId, unitId);
+export async function lockUnitDates(trx: Transaction<Database>, propertyId: string, unitId: string, arrivalDate: string, departureDate: string, allowInactive = false): Promise<InventoryUnitRecord> {
+  const unit = allowInactive
+    ? await loadInventoryUnitIncludingInactive(trx, propertyId, unitId)
+    : await loadInventoryUnit(trx, propertyId, unitId);
   await lockRoomDays(trx, enumerateServiceDates(arrivalDate, departureDate).map((serviceDate) => ({ roomId: unit.roomId, serviceDate })));
   return unit;
 }
 
 export async function assertUnitAvailable(trx: Transaction<Database>, unit: InventoryUnitRecord, dates: string[], excludeSourceIds: string[] = []): Promise<void> {
+  const overdueStayBlockers = (await loadOverdueStayBlockers(trx, unit.propertyId, dates))
+    .filter((blocker) => !excludeSourceIds.includes(blocker.segmentId) && blockerAffectsUnit(blocker, unit));
   for (const serviceDate of dates) {
+    const blockingStay = overdueStayBlockers.find((blocker) => blocker.serviceDate === serviceDate);
+    if (blockingStay) {
+      throw new DomainError("INVENTORY_CONFLICT", `An in-house Stay is overdue on ${serviceDate}`, 409);
+    }
     const roomDay = await trx.selectFrom("inventory_room_days")
       .select("whole_claim_id")
       .where("room_id", "=", unit.roomId)
@@ -181,7 +273,7 @@ export async function createInventoryClaims(trx: Transaction<Database>, options:
   propertyId: string;
   unit: InventoryUnitRecord;
   dates: string[];
-  sourceType: "ORDER_SEGMENT" | "MAINTENANCE";
+  sourceType: "ORDER_SEGMENT" | "MAINTENANCE" | "INTERNAL_USE";
   sourceId: string;
 }): Promise<string[]> {
   await assertUnitAvailable(trx, options.unit, options.dates);
@@ -221,7 +313,7 @@ export async function createInventoryClaims(trx: Transaction<Database>, options:
   return claimIds;
 }
 
-export async function releaseInventoryClaims(trx: Transaction<Database>, sourceType: "ORDER_SEGMENT" | "MAINTENANCE", sourceIds: string[], fromDate?: string): Promise<string[]> {
+export async function releaseInventoryClaims(trx: Transaction<Database>, sourceType: "ORDER_SEGMENT" | "MAINTENANCE" | "INTERNAL_USE", sourceIds: string[], fromDate?: string): Promise<string[]> {
   if (sourceIds.length === 0) return [];
   let query = trx.selectFrom("inventory_claims")
     .selectAll()

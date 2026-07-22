@@ -1,0 +1,667 @@
+import { randomUUID } from "node:crypto";
+import { expect, test, type Locator, type Page, type TestInfo } from "@playwright/test";
+import type { RoomStatusBoardDto } from "@qintopia/contracts";
+import { todayInTimeZone } from "@qintopia/domain";
+import { createRoomStatusViewState, serializeRoomStatusRestoration } from "../../apps/web/src/room-status/roomStatusState.ts";
+
+const baseUrl = process.env.ROOM_STATUS_E2E_BASE_URL ?? "/";
+const propertyId = "prop_qintopia_demo";
+const operatorSubjectId = "subject_demo_operator";
+const operator = { username: "operator", password: "demo-pass-2026" };
+const operatorRestorationKey = `qintopia.room-status-view.v1:${operatorSubjectId}:${propertyId}`;
+
+function addDays(value: string, days: number): string {
+  const date = new Date(`${value}T00:00:00.000Z`);
+  date.setUTCDate(date.getUTCDate() + days);
+  return date.toISOString().slice(0, 10);
+}
+
+function roomStatusResponse(page: Page) {
+  return page.waitForResponse((response) => {
+    const url = new URL(response.url());
+    return response.request().method() === "GET"
+      && url.pathname === `/api/v1/properties/${propertyId}/room-status`
+      && response.status() === 200;
+  });
+}
+
+async function login(page: Page): Promise<RoomStatusBoardDto> {
+  await page.goto(baseUrl);
+  await expect(page.getByRole("heading", { name: "登录", exact: true })).toBeVisible();
+  await page.getByTestId("login-username").fill(operator.username);
+  await page.getByTestId("login-password").fill(operator.password);
+  const responsePromise = roomStatusResponse(page);
+  await page.getByTestId("login-submit").click();
+  const response = await responsePromise;
+  await expect(page.getByRole("heading", { name: "房态与可售" })).toBeVisible();
+  return response.json() as Promise<RoomStatusBoardDto>;
+}
+
+function roomCell(page: Page, unitId: string, serviceDate: string): Locator {
+  return page.locator(
+    `[data-room-status-cell="true"][data-unit-id="${unitId}"][data-service-date="${serviceDate}"]`
+  );
+}
+
+function roomRow(page: Page, unitId: string): Locator {
+  return page.locator(`[data-room-status-row="${unitId}"]`);
+}
+
+async function tabTo(page: Page, target: Locator, description: string, maximumTabs = 40): Promise<void> {
+  await expect(target, description).toBeVisible();
+  for (let index = 0; index < maximumTabs; index += 1) {
+    if (await target.evaluate((element) => element === document.activeElement)) return;
+    await page.keyboard.press("Tab");
+  }
+  throw new Error(`Keyboard focus did not reach ${description} after ${maximumTabs} Tab presses`);
+}
+
+async function expectFullyHitTestable(target: Locator, description: string): Promise<void> {
+  await expect(target, description).toBeVisible();
+  const geometry = await target.evaluate((element) => {
+    const box = element.getBoundingClientRect();
+    const viewport = window.visualViewport;
+    let clipLeft = viewport?.offsetLeft ?? 0;
+    let clipTop = viewport?.offsetTop ?? 0;
+    let clipRight = clipLeft + (viewport?.width ?? window.innerWidth);
+    let clipBottom = clipTop + (viewport?.height ?? window.innerHeight);
+
+    for (let ancestor = element.parentElement; ancestor; ancestor = ancestor.parentElement) {
+      const style = getComputedStyle(ancestor);
+      const clipsX = /^(auto|scroll|hidden|clip)$/.test(style.overflowX);
+      const clipsY = /^(auto|scroll|hidden|clip)$/.test(style.overflowY);
+      if (!clipsX && !clipsY) continue;
+      const ancestorBox = ancestor.getBoundingClientRect();
+      if (clipsX) {
+        clipLeft = Math.max(clipLeft, ancestorBox.left);
+        clipRight = Math.min(clipRight, ancestorBox.right);
+      }
+      if (clipsY) {
+        clipTop = Math.max(clipTop, ancestorBox.top);
+        clipBottom = Math.min(clipBottom, ancestorBox.bottom);
+      }
+    }
+
+    const centerX = box.left + box.width / 2;
+    const centerY = box.top + box.height / 2;
+    const insetX = Math.min(Math.max(2, box.width * 0.1), box.width / 2);
+    const insetY = Math.min(Math.max(2, box.height * 0.1), box.height / 2);
+    const points = [
+      { x: centerX, y: centerY },
+      { x: box.left + insetX, y: centerY },
+      { x: box.right - insetX, y: centerY },
+      { x: centerX, y: box.top + insetY },
+      { x: centerX, y: box.bottom - insetY }
+    ];
+    const hitResults = points.map(({ x, y }) => {
+      const hit = document.elementFromPoint(x, y);
+      return {
+        matches: hit === element || (hit !== null && element.contains(hit)),
+        description: hit instanceof HTMLElement
+          ? `${hit.tagName.toLowerCase()}${hit.id ? `#${hit.id}` : ""}${hit.className ? `.${String(hit.className).replaceAll(" ", ".")}` : ""}`
+          : String(hit)
+      };
+    });
+    const style = getComputedStyle(element);
+    const focusMargin = element.matches(":focus-visible")
+      ? Math.max(
+          0,
+          Number.parseFloat(style.outlineWidth) + Number.parseFloat(style.outlineOffset),
+          style.boxShadow === "none" || style.boxShadow.includes("inset") ? 0 : 3
+        )
+      : 0;
+    return {
+      box: { left: box.left, top: box.top, right: box.right, bottom: box.bottom, width: box.width, height: box.height },
+      clip: { left: clipLeft, top: clipTop, right: clipRight, bottom: clipBottom },
+      focusMargin,
+      hitResults
+    };
+  });
+
+  expect(geometry.box.width, `${description} width`).toBeGreaterThan(0);
+  expect(geometry.box.height, `${description} height`).toBeGreaterThan(0);
+  expect(geometry.box.left - geometry.focusMargin, `${description} left edge`).toBeGreaterThanOrEqual(geometry.clip.left - 2);
+  expect(geometry.box.top - geometry.focusMargin, `${description} top edge`).toBeGreaterThanOrEqual(geometry.clip.top - 2);
+  expect(geometry.box.right + geometry.focusMargin, `${description} right edge`).toBeLessThanOrEqual(geometry.clip.right + 2);
+  expect(geometry.box.bottom + geometry.focusMargin, `${description} bottom edge`).toBeLessThanOrEqual(geometry.clip.bottom + 2);
+  for (const [index, hit] of geometry.hitResults.entries()) {
+    expect(hit.matches, `${description} hit point ${index + 1} was covered by ${hit.description}`).toBe(true);
+  }
+}
+
+async function previewAndConfirm(page: Page, confirmationReason: string): Promise<Locator> {
+  await page.getByTestId("create-command-preview").click();
+  await expect(page.getByTestId("command-effect")).toBeVisible();
+  await page.getByTestId("reason-note").fill(confirmationReason);
+  const refreshedPromise = roomStatusResponse(page);
+  await page.getByTestId("confirm-command").click();
+  const receipt = page.getByTestId("command-receipt");
+  await expect(receipt).toContainText("业务写入已提交");
+  await expect(receipt).toContainText("EXECUTED");
+  await refreshedPromise;
+  return receipt;
+}
+
+async function finishReceipt(page: Page): Promise<void> {
+  await page.getByRole("button", { name: "完成", exact: true }).click();
+  await expect(page.getByTestId("command-receipt")).toBeHidden();
+}
+
+function findFiveNightDragCandidate(board: RoomStatusBoardDto) {
+  for (const room of board.rooms) {
+    if (!room.allowedActions.some((action) => action.code === "PLACE_INTERNAL_USE" && action.enabled)) continue;
+    for (let index = 0; index <= board.dates.length - 5; index += 1) {
+      const dates = board.dates.slice(index, index + 5);
+      if (dates.every((date) => {
+        const day = room.days.find((candidate) => candidate.serviceDate === date);
+        return day?.available && day.conflicts.length === 0 && day.intervalIds.length === 0;
+      })) {
+        return {
+          unitId: room.id,
+          dragStart: dates[0]!,
+          blockStart: dates[1]!,
+          blockEnd: dates[4]!,
+          dragEnd: dates[4]!
+        };
+      }
+    }
+  }
+  throw new Error("No room has five consecutive available nights for the interval-overlay drag fixture");
+}
+
+function findWritableNight(board: RoomStatusBoardDto) {
+  for (const room of board.rooms) {
+    if (!room.allowedActions.some((action) => action.code === "PLACE_INTERNAL_USE" && action.enabled)) continue;
+    const day = room.days.find((candidate) => candidate.available
+      && candidate.conflicts.length === 0
+      && candidate.intervalIds.length === 0);
+    if (day) return { unitId: room.id, arrivalDate: day.serviceDate, departureDate: addDays(day.serviceDate, 1) };
+  }
+  throw new Error("No room has an available night for the internal-use draft");
+}
+
+function findLastWritableNight(board: RoomStatusBoardDto) {
+  for (const room of [...board.rooms].reverse()) {
+    if (!room.allowedActions.some((action) => action.code === "PLACE_INTERNAL_USE" && action.enabled)) continue;
+    const day = [...room.days].reverse().find((candidate) => candidate.available && candidate.conflicts.length === 0);
+    if (day) return { unitId: room.id, serviceDate: day.serviceDate };
+  }
+  throw new Error("No late-grid available night exists for sticky evidence");
+}
+
+test("a restoration mounted at 375px restores its focused date cell and scroll anchor after expanding to desktop", async ({ page }, testInfo: TestInfo) => {
+  test.setTimeout(90_000);
+  await page.setViewportSize({ width: 375, height: 812 });
+  await page.goto(baseUrl);
+  await expect(page.getByRole("heading", { name: "登录", exact: true })).toBeVisible();
+
+  const arrivalDate = todayInTimeZone("Asia/Shanghai");
+  const departureDate = addDays(arrivalDate, 14);
+  const targetUnitId = "unit_room_e_gen_03";
+  const targetDate = addDays(arrivalDate, 10);
+  const selection = {
+    unitId: targetUnitId,
+    anchorDate: targetDate,
+    focusDate: targetDate,
+    arrivalDate: targetDate,
+    departureDate: addDays(targetDate, 1)
+  };
+  await page.evaluate(({ key, value }) => window.sessionStorage.setItem(key, value), {
+    key: operatorRestorationKey,
+    value: serializeRoomStatusRestoration({
+      version: 1,
+      propertyId,
+      range: { arrivalDate, departureDate },
+      revision: "0",
+      savedAt: new Date().toISOString(),
+      state: createRoomStatusViewState({
+        focusedCell: { unitId: targetUnitId, serviceDate: targetDate },
+        selection,
+        scrollAnchor: { unitId: targetUnitId, left: 640, top: 2_800 }
+      })
+    })
+  });
+
+  await page.getByTestId("login-username").fill(operator.username);
+  await page.getByTestId("login-password").fill(operator.password);
+  const responsePromise = roomStatusResponse(page);
+  await page.getByTestId("login-submit").click();
+  await responsePromise;
+  await expect(page.getByRole("heading", { name: "今日运营任务" })).toBeVisible();
+  await expect(page.getByRole("grid")).toHaveCount(0);
+  await expect(page.locator(".room-status-return-notice")).toBeVisible();
+
+  await page.setViewportSize({ width: 1440, height: 900 });
+  const target = roomCell(page, targetUnitId, targetDate);
+  const scroll = page.locator(".room-status-grid-scroll");
+  await expect(page.getByRole("grid")).toBeVisible();
+  await expect(target).toBeFocused();
+  await expect(target).toHaveAttribute("aria-selected", "true");
+
+  const geometry = await page.evaluate(({ unitId, serviceDate }) => {
+    const container = document.querySelector<HTMLElement>(".room-status-grid-scroll");
+    const cell = document.querySelector<HTMLElement>(
+      `[data-room-status-cell="true"][data-unit-id="${unitId}"][data-service-date="${serviceDate}"]`
+    );
+    if (!container || !cell) return null;
+    const containerBox = container.getBoundingClientRect();
+    const cellBox = cell.getBoundingClientRect();
+    return {
+      scrollLeft: container.scrollLeft,
+      scrollTop: container.scrollTop,
+      container: { left: containerBox.left, top: containerBox.top, right: containerBox.right, bottom: containerBox.bottom },
+      cell: { left: cellBox.left, top: cellBox.top, right: cellBox.right, bottom: cellBox.bottom }
+    };
+  }, { unitId: targetUnitId, serviceDate: targetDate });
+  expect(geometry).not.toBeNull();
+  expect(geometry!.scrollTop).toBeGreaterThan(0);
+  expect(geometry!.scrollLeft).toBeGreaterThan(0);
+  expect(geometry!.cell.top).toBeGreaterThanOrEqual(geometry!.container.top + 44);
+  expect(geometry!.cell.bottom).toBeLessThanOrEqual(geometry!.container.bottom + 1);
+  expect(geometry!.cell.left).toBeGreaterThanOrEqual(geometry!.container.left + 200);
+  expect(geometry!.cell.right).toBeLessThanOrEqual(geometry!.container.right + 1);
+  await expect(scroll).toBeVisible();
+  await expectFullyHitTestable(target, "restored room-status cell");
+  await page.screenshot({ path: testInfo.outputPath("mobile-first-restoration-expanded-desktop.png") });
+});
+
+test("sticky date and resource headers remain hit-testable after both grid axes reach their end", async ({ page }, testInfo: TestInfo) => {
+  test.setTimeout(90_000);
+  await page.setViewportSize({ width: 1440, height: 900 });
+  const board = await login(page);
+  const targetIdentity = findLastWritableNight(board);
+  const scroll = page.locator(".room-status-grid-scroll");
+  const target = roomCell(page, targetIdentity.unitId, targetIdentity.serviceDate);
+  await expect(target).toBeVisible({ timeout: 5_000 });
+
+  const browserMaximumScroll = await scroll.evaluate((element) => {
+    element.scrollLeft = Number.MAX_SAFE_INTEGER;
+    element.scrollTop = Number.MAX_SAFE_INTEGER;
+    return { left: element.scrollLeft, top: element.scrollTop };
+  });
+  expect(browserMaximumScroll.left).toBeGreaterThan(0);
+  expect(browserMaximumScroll.top).toBeGreaterThan(0);
+  await page.keyboard.press("Tab");
+  await target.focus();
+  await expect(target).toBeFocused();
+  expect(await target.evaluate((element) => element.matches(":focus-visible"))).toBe(true);
+  await scroll.evaluate((element, maximum) => {
+    element.scrollLeft = maximum.left;
+    element.scrollTop = maximum.top;
+  }, browserMaximumScroll);
+  await expect.poll(() => scroll.evaluate((element, maximum) => (
+    Math.abs(element.scrollLeft - maximum.left) <= 1 && Math.abs(element.scrollTop - maximum.top) <= 1
+  ), browserMaximumScroll)).toBe(true);
+
+  const stickyGeometry = await page.evaluate(({ unitId, serviceDate }) => {
+    const scrollport = document.querySelector<HTMLElement>(".room-status-grid-scroll");
+    const dateHeader = document.querySelector<HTMLElement>(".room-status-date-header:last-child");
+    const resourceHeader = document.querySelector<HTMLElement>(".room-status-resource-header");
+    const cell = document.querySelector<HTMLElement>(
+      `[data-room-status-cell="true"][data-unit-id="${unitId}"][data-service-date="${serviceDate}"]`
+    );
+    const resourceCell = cell?.closest(".room-status-grid-row")?.querySelector<HTMLElement>(".room-status-resource-cell");
+    if (!scrollport || !dateHeader || !resourceHeader || !cell || !resourceCell) return null;
+    const box = (element: Element) => {
+      const rect = element.getBoundingClientRect();
+      return { left: rect.left, top: rect.top, right: rect.right, bottom: rect.bottom };
+    };
+    const hit = (element: Element) => {
+      const rect = element.getBoundingClientRect();
+      const candidate = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
+      return candidate === element || (candidate !== null && element.contains(candidate));
+    };
+    return {
+      scrollLeft: scrollport.scrollLeft,
+      scrollTop: scrollport.scrollTop,
+      scrollport: box(scrollport),
+      dateHeader: box(dateHeader),
+      resourceHeader: box(resourceHeader),
+      resourceCell: box(resourceCell),
+      cell: box(cell),
+      hits: {
+        dateHeader: hit(dateHeader),
+        resourceHeader: hit(resourceHeader),
+        resourceCell: hit(resourceCell),
+        cell: hit(cell)
+      }
+    };
+  }, targetIdentity);
+
+  expect(stickyGeometry).not.toBeNull();
+  expect(stickyGeometry!.scrollLeft).toBeGreaterThanOrEqual(browserMaximumScroll.left - 1);
+  expect(stickyGeometry!.scrollTop).toBeGreaterThanOrEqual(browserMaximumScroll.top - 1);
+  expect(stickyGeometry!.dateHeader.top).toBeGreaterThanOrEqual(stickyGeometry!.scrollport.top - 1);
+  expect(stickyGeometry!.resourceHeader.left).toBeGreaterThanOrEqual(stickyGeometry!.scrollport.left - 1);
+  expect(stickyGeometry!.resourceCell.left).toBeGreaterThanOrEqual(stickyGeometry!.scrollport.left - 1);
+  expect(stickyGeometry!.cell.top).toBeGreaterThanOrEqual(stickyGeometry!.dateHeader.bottom - 1);
+  expect(stickyGeometry!.cell.left).toBeGreaterThanOrEqual(stickyGeometry!.resourceCell.right - 1);
+  expect(stickyGeometry!.hits).toEqual({ dateHeader: true, resourceHeader: true, resourceCell: true, cell: true });
+  await expectFullyHitTestable(target, "focused end-of-grid cell");
+  await page.screenshot({ path: testInfo.outputPath("room-status-sticky-grid-end-viewport.png") });
+});
+
+test("a short 200 percent reflow keeps critical controls reachable outside intentional scrollports", async ({ browser }, testInfo: TestInfo) => {
+  test.skip(testInfo.project.name !== "desktop", "single dedicated 2x desktop context for 200 percent zoom");
+  test.setTimeout(90_000);
+  const zoomContext = await browser.newContext({
+    baseURL: process.env.ROOM_STATUS_E2E_BASE_URL ?? "http://127.0.0.1:4173",
+    viewport: { width: 720, height: 450 },
+    screen: { width: 1440, height: 900 },
+    deviceScaleFactor: 2,
+    isMobile: false,
+    hasTouch: false
+  });
+  const page = await zoomContext.newPage();
+  try {
+    const board = await login(page);
+    expect(await page.evaluate(() => ({
+      width: window.innerWidth,
+      height: window.innerHeight,
+      pixelRatio: window.devicePixelRatio,
+      visualWidth: window.visualViewport?.width,
+      visualHeight: window.visualViewport?.height,
+      compactShell: window.matchMedia("(max-width: 860px)").matches,
+      tabletRoomStatus: window.matchMedia("(max-width: 767px) and (min-width: 576px)").matches
+    }))).toEqual({
+      width: 720,
+      height: 450,
+      pixelRatio: 2,
+      visualWidth: 720,
+      visualHeight: 450,
+      compactShell: true,
+      tabletRoomStatus: true
+    });
+    await expect(page.getByRole("grid")).toBeVisible();
+    expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(721);
+
+    const search = page.getByLabel("搜索房间或床位", { exact: true });
+    await page.locator("#main-content").focus();
+    await tabTo(page, search, "200 percent keyboard search input", 20);
+    expect(await search.evaluate((element) => element.matches(":focus-visible"))).toBe(true);
+    await expectFullyHitTestable(search, "200 percent keyboard search input");
+
+    const criticalToolbarControls = [
+      { target: page.locator(".page-heading-actions").getByRole("button", { name: "刷新", exact: true }), label: "page refresh action" },
+      { target: page.getByTestId("arrival-date"), label: "arrival date input" },
+      { target: page.getByRole("button", { name: "查看后一日期窗口", exact: true }), label: "next date-window action" },
+      { target: page.locator(".room-status-filter-row > label").nth(3).locator("select"), label: "room-status status filter" },
+      { target: page.getByRole("button", { name: /^(刷新房态|正在刷新)$/ }), label: "room-status refresh action" }
+    ];
+    for (const { target, label } of criticalToolbarControls) {
+      await expect(target, `200 percent ${label}`).toBeVisible({ timeout: 5_000 });
+      await target.evaluate((element) => element.scrollIntoView({ block: "center", inline: "center" }));
+      await expectFullyHitTestable(target, `200 percent ${label}`);
+    }
+    await page.screenshot({ path: testInfo.outputPath("room-status-200-percent-short-toolbar-viewport.png") });
+
+    const candidate = findWritableNight(board);
+    const cell = roomCell(page, candidate.unitId, candidate.arrivalDate);
+    await expect(cell).toBeVisible({ timeout: 5_000 });
+    await page.keyboard.press("Tab");
+    await cell.focus();
+    await expect(cell).toBeFocused();
+    expect(await cell.evaluate((element) => element.matches(":focus-visible"))).toBe(true);
+    await expectFullyHitTestable(cell, "200 percent focused room-status cell");
+
+    await cell.click();
+    const applySelection = page.getByRole("button", { name: "应用选区", exact: true });
+    await expect(applySelection).toBeEnabled();
+    await page.getByTestId("room-status-unit-select").focus();
+    await tabTo(page, applySelection, "200 percent keyboard context selection action", 24);
+    expect(await applySelection.evaluate((element) => element.matches(":focus-visible"))).toBe(true);
+    await expectFullyHitTestable(applySelection, "200 percent context selection action");
+    const activeNavigation = page.locator(".mobile-navigation").getByRole("link", { name: "房态", exact: true });
+    await expectFullyHitTestable(activeNavigation, "200 percent fixed room-status navigation");
+    await page.screenshot({ path: testInfo.outputPath("room-status-200-percent-short-context-viewport.png") });
+  } finally {
+    await zoomContext.close();
+  }
+});
+
+test("mouse drag selection keeps extending while the pointer crosses a continuous interval overlay", async ({ page }, testInfo: TestInfo) => {
+  test.setTimeout(120_000);
+  await page.setViewportSize({ width: 1440, height: 900 });
+  const board = await login(page);
+  await expect(page.getByRole("grid")).toBeVisible();
+  const candidate = findFiveNightDragCandidate(board);
+  const businessReason = `Room-status overlay drag ${randomUUID()}`;
+
+  const row = roomRow(page, candidate.unitId);
+  try {
+    await page.getByTestId("room-status-unit-select").selectOption(candidate.unitId);
+    await page.getByLabel("入住日期", { exact: true }).fill(candidate.blockStart);
+    await page.getByLabel("退房日期", { exact: true }).fill(candidate.blockEnd);
+    await page.getByRole("button", { name: "应用选区", exact: true }).click();
+    await page.getByRole("button", { name: "放置内部占用", exact: true }).click();
+    await page.getByLabel("内部占用原因").fill(businessReason);
+    await page.getByRole("button", { name: "继续生成 Preview", exact: true }).click();
+    const placementReceipt = await previewAndConfirm(page, "Create a typed Block for interval-overlay drag evidence");
+    await expect(placementReceipt.locator("code").filter({ hasText: /^block_/ })).toHaveCount(1);
+    await finishReceipt(page);
+
+    const interval = row.locator(".room-status-interval-internal-use");
+    const startCell = roomCell(page, candidate.unitId, candidate.dragStart);
+    const endCell = roomCell(page, candidate.unitId, candidate.dragEnd);
+    await expect(interval).toHaveCount(1);
+    await expect(startCell).toHaveAccessibleName(/可售.*服务端标记可售/);
+    await expect(endCell).toHaveAccessibleName(/可售.*服务端标记可售/);
+
+    await endCell.evaluate((element) => element.scrollIntoView({ block: "nearest", inline: "end" }));
+    await expectFullyHitTestable(startCell, "drag selection start cell before pointer input");
+    await expectFullyHitTestable(endCell, "drag selection end cell before pointer input");
+
+    const boxes = {
+      start: await startCell.boundingBox(),
+      interval: await interval.boundingBox(),
+      end: await endCell.boundingBox()
+    };
+    expect(boxes.start).not.toBeNull();
+    expect(boxes.interval).not.toBeNull();
+    expect(boxes.end).not.toBeNull();
+    const pointerY = boxes.interval!.y + boxes.interval!.height / 2;
+    const overlayHit = await page.evaluate(({ x, y }) => (
+      document.elementFromPoint(x, y)?.closest(".room-status-interval")?.classList.contains("room-status-interval-internal-use") ?? false
+    ), { x: boxes.interval!.x + boxes.interval!.width / 2, y: pointerY });
+    expect(overlayHit, "the pointer path must cross the actual interval button, not a bare date cell").toBe(true);
+
+    await page.mouse.move(boxes.start!.x + boxes.start!.width / 2, pointerY);
+    await page.mouse.down();
+    await page.mouse.move(boxes.interval!.x + boxes.interval!.width / 2, pointerY, { steps: 8 });
+    await page.mouse.move(boxes.end!.x + boxes.end!.width / 2, pointerY, { steps: 8 });
+    await page.mouse.up();
+
+    await expect(page.getByLabel("入住日期", { exact: true })).toHaveValue(candidate.dragStart);
+    await expect(page.getByLabel("退房日期", { exact: true })).toHaveValue(addDays(candidate.dragEnd, 1));
+    for (const date of board.dates.filter((date) => date >= candidate.dragStart && date <= candidate.dragEnd)) {
+      await expect(roomCell(page, candidate.unitId, date)).toHaveAttribute("aria-selected", "true");
+    }
+    await expectFullyHitTestable(startCell, "drag selection start cell");
+    await expectFullyHitTestable(endCell, "drag selection end cell");
+    await page.screenshot({ path: testInfo.outputPath("mouse-drag-crosses-interval-overlay.png") });
+  } finally {
+    const interval = row.locator(".room-status-interval-internal-use");
+    if (await interval.count() === 1) {
+      await interval.click();
+      await page.locator(".room-status-context-actions").getByRole("button", { name: "释放内部占用", exact: true }).click();
+      const releaseReceipt = await previewAndConfirm(page, "Release the typed Block after interval-overlay drag evidence");
+      await expect(releaseReceipt.locator("code").filter({ hasText: /^block_/ })).toHaveCount(1);
+      await finishReceipt(page);
+      await expect(interval).toHaveCount(0);
+    }
+  }
+});
+
+test("Block drafts cannot leave the server-validated room-status selection", async ({ page }, testInfo: TestInfo) => {
+  test.skip(testInfo.project.name !== "desktop", "desktop Block draft boundary coverage");
+  await page.setViewportSize({ width: 1440, height: 900 });
+  const board = await login(page);
+  const candidate = findWritableNight(board);
+  let previewRequestCount = 0;
+  page.on("request", (request) => {
+    if (request.method() === "POST" && new URL(request.url()).pathname === "/api/v1/command-previews") {
+      previewRequestCount += 1;
+    }
+  });
+
+  await page.getByTestId("room-status-unit-select").selectOption(candidate.unitId);
+  await page.getByLabel("入住日期", { exact: true }).fill(candidate.arrivalDate);
+  await page.getByLabel("退房日期", { exact: true }).fill(candidate.departureDate);
+  await page.getByRole("button", { name: "应用选区", exact: true }).click();
+  await page.getByRole("button", { name: "放置内部占用", exact: true }).click();
+
+  const dialog = page.getByRole("dialog", { name: /^内部占用 ·/ });
+  const from = dialog.getByLabel("开始日期");
+  const to = dialog.getByLabel("结束日期");
+  await expect(from).toHaveAttribute("min", candidate.arrivalDate);
+  await expect(from).toHaveAttribute("max", candidate.arrivalDate);
+  await expect(to).toHaveAttribute("min", candidate.departureDate);
+  await expect(to).toHaveAttribute("max", candidate.departureDate);
+
+  await from.fill(addDays(candidate.arrivalDate, -1));
+  await dialog.getByLabel("内部占用原因").fill(`Out-of-window draft ${randomUUID()}`);
+  expect(await from.evaluate((element: HTMLInputElement) => element.validity.valid)).toBe(false);
+  await dialog.getByRole("button", { name: "继续生成 Preview", exact: true }).click();
+  await expect(dialog).toBeVisible();
+  expect(previewRequestCount).toBe(0);
+});
+
+test("an internal-use draft survives stale query conditions at 320px and resumes after fresh room status returns", async ({ page }, testInfo: TestInfo) => {
+  test.setTimeout(120_000);
+  await page.setViewportSize({ width: 1440, height: 900 });
+  const board = await login(page);
+  await expect(page.getByRole("grid")).toBeVisible();
+  const candidate = findWritableNight(board);
+
+  await page.getByTestId("room-status-unit-select").selectOption(candidate.unitId);
+  await page.getByLabel("入住日期", { exact: true }).fill(candidate.arrivalDate);
+  await page.getByLabel("退房日期", { exact: true }).fill(candidate.departureDate);
+  await page.getByRole("button", { name: "应用选区", exact: true }).click();
+  await page.getByRole("button", { name: "放置内部占用", exact: true }).click();
+
+  let dialog = page.getByRole("dialog", { name: /^内部占用 ·/ });
+  const businessReason = `Preserved at 320px ${randomUUID()}`;
+  const reason = dialog.getByLabel("内部占用原因");
+  const submit = dialog.getByRole("button", { name: "继续生成 Preview", exact: true });
+  await reason.fill(businessReason);
+  await expect(submit).toBeEnabled();
+
+  await page.setViewportSize({ width: 320, height: 700 });
+  dialog = page.getByRole("dialog", { name: /^内部占用 ·/ });
+  await expect(dialog).toBeVisible();
+  await expect(reason).toHaveValue(businessReason);
+
+  const compactMetrics = await dialog.evaluate((element) => {
+    const visible = (candidate: Element): candidate is HTMLElement => {
+      if (!(candidate instanceof HTMLElement)) return false;
+      const style = getComputedStyle(candidate);
+      return style.visibility !== "hidden" && style.display !== "none" && candidate.getClientRects().length > 0;
+    };
+    const controls = [...element.querySelectorAll("input, select, textarea")].filter(visible).map((control) => ({
+      tag: control.tagName,
+      fontSize: Number.parseFloat(getComputedStyle(control).fontSize),
+      height: control.getBoundingClientRect().height
+    }));
+    const buttons = [...element.querySelectorAll("button")].filter(visible).map((button) => {
+      const box = button.getBoundingClientRect();
+      return { label: button.getAttribute("aria-label") ?? button.textContent?.trim() ?? "button", width: box.width, height: box.height };
+    });
+    const root = document.documentElement;
+    const dialogBox = element.getBoundingClientRect();
+    const viewport = window.visualViewport;
+    return {
+      controls,
+      buttons,
+      pageClientWidth: root.clientWidth,
+      pageScrollWidth: root.scrollWidth,
+      dialogClientWidth: element.clientWidth,
+      dialogScrollWidth: element.scrollWidth,
+      dialogLeft: dialogBox.left,
+      dialogTop: dialogBox.top,
+      dialogRight: dialogBox.right,
+      dialogBottom: dialogBox.bottom,
+      viewportLeft: viewport?.offsetLeft ?? 0,
+      viewportTop: viewport?.offsetTop ?? 0,
+      viewportRight: (viewport?.offsetLeft ?? 0) + (viewport?.width ?? window.innerWidth),
+      viewportBottom: (viewport?.offsetTop ?? 0) + (viewport?.height ?? window.innerHeight)
+    };
+  });
+  expect(compactMetrics.controls.length).toBeGreaterThanOrEqual(3);
+  for (const control of compactMetrics.controls) {
+    expect(control.fontSize, `${control.tag} font size at 320px`).toBeGreaterThanOrEqual(16);
+    expect(control.height, `${control.tag} touch height at 320px`).toBeGreaterThanOrEqual(44);
+  }
+  for (const button of compactMetrics.buttons) {
+    expect(button.width, `${button.label} touch width at 320px`).toBeGreaterThanOrEqual(44);
+    expect(button.height, `${button.label} touch height at 320px`).toBeGreaterThanOrEqual(44);
+  }
+  expect(compactMetrics.pageScrollWidth).toBeLessThanOrEqual(compactMetrics.pageClientWidth + 1);
+  expect(compactMetrics.dialogScrollWidth).toBeLessThanOrEqual(compactMetrics.dialogClientWidth + 1);
+  expect(compactMetrics.dialogLeft).toBeGreaterThanOrEqual(compactMetrics.viewportLeft - 1);
+  expect(compactMetrics.dialogTop).toBeGreaterThanOrEqual(compactMetrics.viewportTop - 1);
+  expect(compactMetrics.dialogRight).toBeLessThanOrEqual(compactMetrics.viewportRight + 1);
+  expect(compactMetrics.dialogBottom).toBeLessThanOrEqual(compactMetrics.viewportBottom + 1);
+
+  try {
+    await page.context().setOffline(true);
+    await page.evaluate(() => document.dispatchEvent(new Event("visibilitychange")));
+    await expect(dialog.getByRole("alert").filter({ hasText: "草稿已保留，写入已暂停" })).toBeVisible();
+    await expect(dialog.getByText("日期和原因草稿仍保留", { exact: false })).toBeVisible();
+    await expect(reason).toHaveValue(businessReason);
+    await expect(submit).toBeDisabled();
+    await page.screenshot({ path: testInfo.outputPath("draft-preserved-stale-at-320px.png") });
+
+    const cancel = dialog.getByRole("button", { name: "取消", exact: true });
+    await tabTo(page, cancel, "320px stale draft cancel action");
+    await expect(cancel).toBeFocused();
+    expect(await cancel.evaluate((element) => element.matches(":focus-visible"))).toBe(true);
+    const modalBody = dialog.locator(".modal-body");
+    await expectFullyHitTestable(cancel, "320px keyboard-reached stale draft cancel action");
+    const keyboardBodyScroll = await modalBody.evaluate((element) => ({
+      maximum: Math.max(0, element.scrollHeight - element.clientHeight),
+      position: element.scrollTop
+    }));
+    if (keyboardBodyScroll.maximum > 0) expect(keyboardBodyScroll.position).toBeGreaterThan(0);
+
+    await modalBody.evaluate((element) => element.scrollTo({ top: element.scrollHeight }));
+    await expect.poll(() => modalBody.evaluate((element) => (
+      Math.abs(element.scrollTop - Math.max(0, element.scrollHeight - element.clientHeight)) <= 1
+    ))).toBe(true);
+    const bodyScroll = await modalBody.evaluate((element) => ({
+      maximum: Math.max(0, element.scrollHeight - element.clientHeight),
+      position: element.scrollTop
+    }));
+    expect(bodyScroll.position).toBeGreaterThanOrEqual(bodyScroll.maximum - 1);
+    await expectFullyHitTestable(cancel, "320px scroll-end stale draft cancel action");
+    await page.screenshot({ path: testInfo.outputPath("draft-preserved-stale-actions-at-320px.png") });
+
+    await page.context().setOffline(false);
+    const recoveredPromise = roomStatusResponse(page);
+    await page.evaluate(() => document.dispatchEvent(new Event("visibilitychange")));
+    await recoveredPromise;
+    await expect(dialog.getByRole("alert").filter({ hasText: "草稿已保留，写入已暂停" })).toBeHidden();
+    await expect(reason).toHaveValue(businessReason);
+    await expect(submit).toBeEnabled();
+
+    await tabTo(page, submit, "320px resumed Preview action");
+    await expect(submit).toBeFocused();
+    expect(await submit.evaluate((element) => element.matches(":focus-visible"))).toBe(true);
+    await expectFullyHitTestable(submit, "320px resumed Preview action");
+    await page.keyboard.press("Enter");
+    await expect(dialog).toBeHidden();
+
+    const commandDialog = page.getByRole("dialog", { name: /^放置内部占用 ·/ });
+    await expect(commandDialog).toBeVisible();
+    const previewButton = page.getByTestId("create-command-preview");
+    await tabTo(page, previewButton, "320px server Preview action");
+    expect(await previewButton.evaluate((element) => element.matches(":focus-visible"))).toBe(true);
+    await expectFullyHitTestable(previewButton, "320px server Preview action");
+    await page.keyboard.press("Enter");
+    await expect(page.getByTestId("command-effect")).toBeVisible();
+    await page.screenshot({ path: testInfo.outputPath("server-preview-at-320px.png") });
+    await page.keyboard.press("Escape");
+    await expect(commandDialog).toBeHidden();
+  } finally {
+    await page.context().setOffline(false);
+  }
+});

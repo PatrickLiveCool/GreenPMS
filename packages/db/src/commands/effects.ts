@@ -392,11 +392,9 @@ export async function buildCommandEffect(db: DbExecutor, commandType: CommandTyp
     });
   }
 
-  if (commandType === "LOCK_MAINTENANCE") {
+  if (commandType === "LOCK_MAINTENANCE" || commandType === "PLACE_INTERNAL_USE") {
     const arrivalDate = requireString(input, "arrivalDate");
     const departureDate = requireString(input, "departureDate");
-    parseLocalDate(arrivalDate);
-    parseLocalDate(departureDate);
     enumerateServiceDates(arrivalDate, departureDate);
   }
   if (commandType === "EXTEND_STAY") {
@@ -464,6 +462,56 @@ export async function buildCommandEffect(db: DbExecutor, commandType: CommandTyp
     if (!lock) throw new DomainError("NOT_FOUND", "Maintenance lock not found", 404);
     if (lock.status !== "ACTIVE") throw new DomainError("AGGREGATE_VERSION_CONFLICT", "Maintenance lock is already released", 409);
     return finalize(propertyId, { maintenanceLockId, inventoryUnitId: lock.inventory_unit_id, arrivalDate: lock.arrival_date, departureDate: lock.departure_date }, { maintenanceVersion: lock.version, status: lock.status });
+  }
+
+  if (commandType === "PLACE_INTERNAL_USE") {
+    const unitId = requireString(input, "inventoryUnitId");
+    const arrivalDate = requireString(input, "arrivalDate");
+    const departureDate = requireString(input, "departureDate");
+    const reason = requireString(input, "reason");
+    const unit = await loadInventoryUnit(db, propertyId, unitId);
+    const fingerprint = await inventoryFingerprint(db, propertyId, unitId, arrivalDate, departureDate);
+    if (fingerprint.length > 0) throw new DomainError("INVENTORY_CONFLICT", "Inventory cannot be placed into internal use", 409);
+    return finalize(propertyId, { inventoryUnit: unit, arrivalDate, departureDate, reason }, { inventory: fingerprint });
+  }
+
+  if (commandType === "RELEASE_INTERNAL_USE") {
+    const internalUseBlockId = requireString(input, "internalUseBlockId");
+    const block = await db.selectFrom("internal_use_blocks").selectAll()
+      .where("id", "=", internalUseBlockId)
+      .where("property_id", "=", propertyId)
+      .executeTakeFirst();
+    if (!block) throw new DomainError("NOT_FOUND", "Internal-use Block not found", 404);
+    if (block.status !== "ACTIVE") throw new DomainError("AGGREGATE_VERSION_CONFLICT", "Internal-use Block is already released", 409);
+    return finalize(propertyId, {
+      internalUseBlockId,
+      inventoryUnitId: block.inventory_unit_id,
+      arrivalDate: block.arrival_date,
+      departureDate: block.departure_date,
+      reason: block.reason,
+      fromStatus: block.status,
+      toStatus: "RELEASED"
+    }, { blockVersion: block.version, status: block.status });
+  }
+
+  if (commandType === "COMPLETE_CLEANING") {
+    const cleaningTaskId = requireString(input, "cleaningTaskId");
+    const task = await db.selectFrom("cleaning_tasks").selectAll()
+      .where("id", "=", cleaningTaskId)
+      .where("property_id", "=", propertyId)
+      .executeTakeFirst();
+    if (!task) throw new DomainError("NOT_FOUND", "Cleaning task not found", 404);
+    if (task.status !== "PENDING") throw new DomainError("AGGREGATE_VERSION_CONFLICT", "Cleaning task is already completed", 409);
+    return finalize(propertyId, {
+      cleaningTaskId,
+      orderId: task.order_id,
+      stayId: task.stay_id,
+      inventoryUnitId: task.inventory_unit_id,
+      roomId: task.room_id,
+      serviceDate: task.service_date,
+      fromStatus: task.status,
+      toStatus: "COMPLETED"
+    }, { cleaningTaskVersion: task.version, status: task.status });
   }
 
   if (commandType === "ADD_MEMBER_ENTITLEMENT_LOT") {
@@ -801,6 +849,25 @@ export async function buildCommandEffect(db: DbExecutor, commandType: CommandTyp
 
   if (commandType === "CHECK_IN") {
     if (context.order.status !== "RESERVED") throw new DomainError("INVALID_ORDER_STATE", "Only a reserved order can check in", 409);
+    const businessDate = await propertyLocalToday(db, propertyId);
+    const expiredReservation = context.order.departure_date <= businessDate;
+    const currentBusinessDateInventory = expiredReservation
+      ? await inventoryFingerprint(
+        db,
+        propertyId,
+        context.currentSegment.inventoryUnitId,
+        businessDate,
+        nextServiceDate(businessDate),
+        context.segmentIds
+      )
+      : [];
+    if (currentBusinessDateInventory.length > 0) {
+      throw new DomainError(
+        "INVENTORY_CONFLICT",
+        `Expired reservation inventory is unavailable on the current business date ${businessDate}`,
+        409
+      );
+    }
     const heldCoverage = await db.selectFrom("coverage_items").select("id")
       .where("order_id", "=", orderId).where("status", "=", "HELD").orderBy("id").execute();
     return finalize(propertyId, {
@@ -809,7 +876,11 @@ export async function buildCommandEffect(db: DbExecutor, commandType: CommandTyp
       toStatus: "CHECKED_IN",
       inventoryUnitId: context.currentSegment.inventoryUnitId,
       entitlementTransition: { from: "HELD", to: "CONSUMED", coverageCount: heldCoverage.length }
-    }, { ...baseBasis, heldCoverageIds: heldCoverage.map((coverage) => coverage.id) });
+    }, {
+      ...baseBasis,
+      heldCoverageIds: heldCoverage.map((coverage) => coverage.id),
+      checkInInventory: { businessDate, expiredReservation, fingerprint: currentBusinessDateInventory }
+    });
   }
 
   if (commandType === "CHECK_OUT") {
@@ -817,7 +888,30 @@ export async function buildCommandEffect(db: DbExecutor, commandType: CommandTyp
     const heldCoverage = await db.selectFrom("coverage_items").select("id")
       .where("order_id", "=", orderId).where("status", "=", "HELD").orderBy("id").execute();
     if (heldCoverage.length > 0) throw new DomainError("ENTITLEMENT_CONFLICT", "In-house member coverage must be consumed before check-out", 409);
-    return finalize(propertyId, { orderId, fromStatus: context.order.status, toStatus: "CHECKED_OUT", inventoryUnitId: context.currentSegment.inventoryUnitId, amounts: await orderAmountSummary(db, context) }, { ...baseBasis, heldCoverageIds: [] });
+    const existingCleaningTask = await db.selectFrom("cleaning_tasks").select(["id", "status"])
+      .where("order_id", "=", orderId).executeTakeFirst();
+    if (existingCleaningTask) {
+      throw new DomainError("AGGREGATE_VERSION_CONFLICT", "Check-out already has a cleaning task", 409, false, {
+        cleaningTaskId: existingCleaningTask.id,
+        status: existingCleaningTask.status
+      });
+    }
+    const businessDate = await propertyLocalToday(db, propertyId);
+    const cleaningServiceDate = businessDate < context.currentSegment.arrivalDate
+      ? context.order.departure_date
+      : businessDate;
+    return finalize(propertyId, {
+      orderId,
+      fromStatus: context.order.status,
+      toStatus: "CHECKED_OUT",
+      inventoryUnitId: context.currentSegment.inventoryUnitId,
+      amounts: await orderAmountSummary(db, context),
+      cleaningTask: {
+        inventoryUnitId: context.currentSegment.inventoryUnitId,
+        serviceDate: cleaningServiceDate,
+        status: "PENDING"
+      }
+    }, { ...baseBasis, heldCoverageIds: [], cleaningTask: null, businessDate });
   }
 
   if (commandType === "CANCEL_ORDER" || commandType === "MARK_NO_SHOW") {

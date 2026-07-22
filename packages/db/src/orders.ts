@@ -157,6 +157,7 @@ export async function appendAmendment(trx: Transaction<Database>, options: {
   reasonNote: string;
   priorVersion: number;
   payload: Record<string, unknown>;
+  commandId?: string;
 }): Promise<string> {
   const id = newId("amend");
   await trx.insertInto("amendments").values({
@@ -168,7 +169,8 @@ export async function appendAmendment(trx: Transaction<Database>, options: {
     reason_note: options.reasonNote,
     prior_version: options.priorVersion,
     new_version: options.priorVersion + 1,
-    payload: options.payload
+    payload: options.payload,
+    command_id: options.commandId ?? null
   }).execute();
   return id;
 }

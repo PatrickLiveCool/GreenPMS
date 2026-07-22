@@ -236,6 +236,12 @@ textarea:focus-visible {
   border-color: var(--danger-hover);
 }
 
+.command-confirm-button {
+  max-width: 100%;
+  white-space: normal;
+  text-align: center;
+}
+
 .button-compact {
   min-height: 40px;
   padding: 5px 10px;
@@ -483,7 +489,7 @@ textarea:focus-visible {
   align-items: center;
   gap: 14px;
   padding: 8px 22px;
-  background: rgba(255, 255, 255, 0.96);
+  background: var(--surface);
   border-bottom: 1px solid var(--border);
 }
 
@@ -1524,6 +1530,20 @@ thead .sticky-column {
   font-size: 11px;
 }
 
+.command-recovered-original {
+  display: grid;
+  gap: 4px;
+  margin-bottom: 12px;
+  padding: 12px 14px;
+  border: 1px solid #b5d4bf;
+  border-radius: 6px;
+  background: var(--success-soft);
+}
+
+.command-recovered-original p {
+  color: var(--muted);
+}
+
 .raw-details,
 .table-details {
   margin-top: 12px;
@@ -2222,6 +2242,11 @@ pre {
 }
 
 @media (max-width: 860px) {
+  html {
+    scroll-padding-top: 116px;
+    scroll-padding-bottom: calc(76px + env(safe-area-inset-bottom));
+  }
+
   .app-shell {
     display: block;
   }
@@ -2291,6 +2316,11 @@ pre {
 
   .main-content {
     padding: 20px 18px 90px;
+  }
+
+  .main-content :focus-visible {
+    scroll-margin-top: 12px;
+    scroll-margin-bottom: calc(76px + env(safe-area-inset-bottom));
   }
 
   .detail-grid {
@@ -2470,6 +2500,34 @@ pre {
   .modal-wide {
     width: calc(100vw - 16px);
     max-height: calc(100dvh - 16px);
+  }
+
+  .modal-mobile-fullscreen {
+    inset: 0;
+    width: 100vw;
+    height: 100dvh;
+    max-height: none;
+    margin: 0;
+    border: 0;
+    border-radius: 0;
+  }
+
+  .modal-mobile-fullscreen .modal-shell {
+    height: 100dvh;
+    max-height: none;
+  }
+
+  .modal-mobile-fullscreen .modal-header {
+    padding-top: max(12px, env(safe-area-inset-top));
+  }
+
+  .modal-mobile-fullscreen .modal-body {
+    padding: 0;
+    overscroll-behavior: contain;
+  }
+
+  .modal-mobile-fullscreen .modal-footer {
+    padding-bottom: max(12px, env(safe-area-inset-bottom));
   }
 
   .modal-shell {

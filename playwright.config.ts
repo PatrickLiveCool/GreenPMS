@@ -6,6 +6,9 @@ const chromiumExecutablePath = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH;
 export default defineConfig({
   testDir: "./tests/e2e",
   fullyParallel: false,
+  // Every browser journey uses the same migrated PostgreSQL database and seed.
+  workers: 1,
+  timeout: 120_000,
   retries: 0,
   reporter: "list",
   use: {

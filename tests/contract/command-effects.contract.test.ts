@@ -25,11 +25,14 @@ const expectedEffectKeys: Record<CommandType, string[]> = {
   MARK_NO_SHOW: ["currentContractAmount", "entitlementTransition", "freeStayReason", "fromStatus", "inventoryUnitId", "orderId", "toStatus"],
   LOCK_MAINTENANCE: ["arrivalDate", "departureDate", "inventoryUnit", "reason"],
   RELEASE_MAINTENANCE: ["arrivalDate", "departureDate", "inventoryUnitId", "maintenanceLockId"],
+  PLACE_INTERNAL_USE: ["arrivalDate", "departureDate", "inventoryUnit", "reason"],
+  RELEASE_INTERNAL_USE: ["arrivalDate", "departureDate", "fromStatus", "internalUseBlockId", "inventoryUnitId", "reason", "toStatus"],
+  COMPLETE_CLEANING: ["cleaningTaskId", "fromStatus", "inventoryUnitId", "orderId", "roomId", "serviceDate", "stayId", "toStatus"],
   RECORD_COLLECTION: ["amountMinor", "currency", "method", "note", "orderId", "transactionReference"],
   RECORD_REFUND: ["amountMinor", "currency", "method", "note", "orderId", "referencesFactId", "transactionReference"],
   REVERSE_FACT: ["amountMinor", "currency", "netEffectMinor", "note", "orderId", "reversesFactId"],
   CHECK_IN: ["entitlementTransition", "fromStatus", "inventoryUnitId", "orderId", "toStatus"],
-  CHECK_OUT: ["amounts", "fromStatus", "inventoryUnitId", "orderId", "toStatus"],
+  CHECK_OUT: ["amounts", "cleaningTask", "fromStatus", "inventoryUnitId", "orderId", "toStatus"],
   REFRESH_MEMBER_COVERAGE: ["before", "inventoryUnitId", "orderId", "pricing", "stayTimeline"],
   ADD_MEMBER_ENTITLEMENT_LOT: ["contractId", "expiresOn", "unitKind", "units"],
   ADJUST_MEMBER_ENTITLEMENT: ["adjustmentReason", "availableAfter", "availableBefore", "contractId", "entitlementLotId", "quantityDelta", "unitKind"],
@@ -160,6 +163,19 @@ describe("Command effect HTTP contract", () => {
     await capture("RELEASE_MAINTENANCE", {
       propertyId: demo.propertyId,
       maintenanceLockId: maintenanceResult.maintenanceLockId
+    });
+
+    const internalUse = await capture("PLACE_INTERNAL_USE", {
+      propertyId: demo.propertyId,
+      inventoryUnitId: demo.secondRoomId,
+      arrivalDate: "2028-03-10",
+      departureDate: "2028-03-12",
+      reason: "Effect contract internal use"
+    });
+    const internalUseResult = await confirm(internalUse);
+    await capture("RELEASE_INTERNAL_USE", {
+      propertyId: demo.propertyId,
+      internalUseBlockId: internalUseResult.internalUseBlockId
     });
 
     await capture("ADD_MEMBER_ENTITLEMENT_LOT", {
@@ -302,7 +318,9 @@ describe("Command effect HTTP contract", () => {
 
     const checkIn = await capture("CHECK_IN", { propertyId: demo.propertyId, orderId });
     await confirm(checkIn);
-    await capture("CHECK_OUT", { propertyId: demo.propertyId, orderId });
+    const checkOut = await capture("CHECK_OUT", { propertyId: demo.propertyId, orderId });
+    const checkOutResult = await confirm(checkOut);
+    await capture("COMPLETE_CLEANING", { propertyId: demo.propertyId, cleaningTaskId: checkOutResult.cleaningTaskId });
 
     expect([...covered].sort()).toEqual([...commandTypes].sort());
   }, 30_000);

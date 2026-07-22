@@ -1,4 +1,4 @@
-import { useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
+import { useEffect, useId, useMemo, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 import { AlertCircle, Check, ChevronRight, Clock3, Copy, LoaderCircle, RefreshCw, X } from "lucide-react";
 import { Link } from "react-router-dom";
 import { commandTypes, type CommandType, type MoneyDto } from "@qintopia/contracts";
@@ -98,7 +98,7 @@ interface ModalProps {
   onClose: () => void;
   children: ReactNode;
   footer?: ReactNode;
-  size?: "default" | "wide";
+  size?: "default" | "wide" | "mobile-fullscreen";
   closeDisabled?: boolean;
 }
 
@@ -113,11 +113,39 @@ export function Modal({ title, onClose, children, footer, size = "default", clos
     return () => previousFocus?.focus();
   }, []);
 
+  function trapFocus(event: KeyboardEvent<HTMLDialogElement>) {
+    if (event.key !== "Tab") return;
+    const dialog = dialogRef.current;
+    if (!dialog) return;
+    const focusable = [...dialog.querySelectorAll<HTMLElement>(
+      "a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex='-1'])"
+    )].filter((element) => !element.hidden
+      && element.getAttribute("aria-hidden") !== "true"
+      && element.getClientRects().length > 0);
+    if (focusable.length === 0) {
+      event.preventDefault();
+      dialog.focus();
+      return;
+    }
+    const first = focusable[0]!;
+    const last = focusable.at(-1)!;
+    const active = document.activeElement;
+    if (event.shiftKey && (active === first || !dialog.contains(active))) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && (active === last || !dialog.contains(active))) {
+      event.preventDefault();
+      first.focus();
+    }
+  }
+
   return (
     <dialog
       className={`modal modal-${size}`}
       ref={dialogRef}
+      tabIndex={-1}
       aria-labelledby={titleId}
+      onKeyDown={trapFocus}
       onCancel={(event) => {
         event.preventDefault();
         if (!closeDisabled) onClose();
@@ -217,6 +245,11 @@ function EffectSummary({ preview }: { preview: PreviewDto }) {
           {hasBookingChannel ? <><dt>订单来源渠道</dt><dd>{bookingChannelCode ? bookingChannelLabels[bookingChannelCode] ?? bookingChannelCode : "历史未记录"}</dd></> : null}
           {hasBookingChannel ? <><dt>渠道订单号</dt><dd>{bookingChannelCode === "WECOM" ? "不适用" : channelOrderReference ?? (bookingChannelCode ? "未填写" : "历史未记录")}</dd></> : null}
           {inventoryUnit ? <><dt>库存单元</dt><dd>{scalar(inventoryUnit.code)} · {scalar(inventoryUnit.name)}</dd></> : null}
+          {typeof effect.arrivalDate === "string" && typeof effect.departureDate === "string" ? <><dt>生效区间</dt><dd><code>[{effect.arrivalDate}, {effect.departureDate})</code></dd></> : null}
+          {typeof effect.serviceDate === "string" ? <><dt>营业日期</dt><dd>{effect.serviceDate}</dd></> : null}
+          {typeof effect.reason === "string" ? <><dt>业务原因</dt><dd>{effect.reason}</dd></> : null}
+          {typeof effect.internalUseBlockId === "string" ? <><dt>内部占用 Block</dt><dd><code>{effect.internalUseBlockId}</code></dd></> : null}
+          {typeof effect.cleaningTaskId === "string" ? <><dt>清洁任务</dt><dd><code>{effect.cleaningTaskId}</code></dd></> : null}
           {fromUnit && toUnit ? <><dt>换房</dt><dd>{scalar(fromUnit.code)} <ChevronRight aria-label="变更为" size={15} /> {scalar(toUnit.code)}</dd></> : null}
           {before ? Object.entries(before).map(([key, value]) => (
             <div className="difference-row" key={`before-${key}`}>
@@ -313,6 +346,8 @@ interface CommandDialogProps {
   initialPreviewMetadata?: ClientCommandMetadata;
   initialConfirmationKey?: string;
   initialReceipt?: ReceiptDto;
+  writeBlocked?: boolean;
+  writeBlockedReason?: string;
   onProgress?: (progress: CommandDialogProgress) => boolean | void;
 }
 
@@ -322,6 +357,7 @@ export type CommandDialogProgress =
   | { state: "PREVIEW_FAILED"; previewMetadata: ClientCommandMetadata }
   | { state: "PREVIEWED"; previewId: string; previewMetadata: ClientCommandMetadata }
   | { state: "CONFIRMING"; previewId: string; confirmationKey: string }
+  | { state: "FAILED_NOT_EXECUTED"; confirmationKey: string }
   | { state: "UNKNOWN"; confirmationKey: string }
   | { state: "RESOLVED"; confirmationKey: string; receipt: ReceiptDto };
 
@@ -368,6 +404,8 @@ const recoveryReferenceKeys = [
   "memberContractId",
   "inventoryUnitId",
   "maintenanceLockId",
+  "internalUseBlockId",
+  "cleaningTaskId",
   "entitlementLotId",
   "quoteId"
 ] as const;
@@ -475,7 +513,7 @@ export function transitionPersistedCommandRecovery(
   progress: CommandDialogProgress,
   updatedAt = new Date().toISOString()
 ): { accepted: boolean; recovery: PersistedCommandRecovery | undefined } {
-  if (progress.state !== "CONFIRMING" && progress.state !== "UNKNOWN" && progress.state !== "RESOLVED") {
+  if (progress.state !== "CONFIRMING" && progress.state !== "FAILED_NOT_EXECUTED" && progress.state !== "UNKNOWN" && progress.state !== "RESOLVED") {
     return { accepted: true, recovery: current };
   }
   if (progress.state === "CONFIRMING") {
@@ -500,6 +538,12 @@ export function transitionPersistedCommandRecovery(
       }
     };
   }
+  if (progress.state === "FAILED_NOT_EXECUTED") {
+    if (!current || current.confirmationKey !== progress.confirmationKey || isTerminalCommandRecovery(current.state)) {
+      return { accepted: true, recovery: current };
+    }
+    return { accepted: true, recovery: undefined };
+  }
   if (!current || current.confirmationKey !== progress.confirmationKey || isTerminalCommandRecovery(current.state)) {
     return { accepted: true, recovery: current };
   }
@@ -523,6 +567,8 @@ export function recoveryCommandRequest(recovery: PersistedCommandRecovery): Comm
 
 export function usePersistentCommandRecovery({ subjectId, scopeId }: { subjectId: string; scopeId: string }) {
   const storageScope = commandRecoveryStorageKey(subjectId, scopeId);
+  const activeStorageScopeRef = useRef(storageScope);
+  activeStorageScopeRef.current = storageScope;
   const [snapshot, setSnapshot] = useState<{ storageScope: string; read: CommandRecoveryReadResult }>(() => {
     const access = browserSessionStorage();
     const read = !scopeId
@@ -533,6 +579,10 @@ export function usePersistentCommandRecovery({ subjectId, scopeId }: { subjectId
     return { storageScope, read };
   });
 
+  function setActiveSnapshot(read: CommandRecoveryReadResult): void {
+    if (activeStorageScopeRef.current === storageScope) setSnapshot({ storageScope, read });
+  }
+
   useEffect(() => {
     const access = browserSessionStorage();
     const read = !scopeId
@@ -540,7 +590,7 @@ export function usePersistentCommandRecovery({ subjectId, scopeId }: { subjectId
       : access.kind === "AVAILABLE"
         ? readPersistedCommandRecovery(access.storage, subjectId, scopeId)
         : access;
-    setSnapshot({ storageScope, read });
+    setActiveSnapshot(read);
   }, [scopeId, storageScope, subjectId]);
 
   const ready = snapshot.storageScope === storageScope;
@@ -550,30 +600,38 @@ export function usePersistentCommandRecovery({ subjectId, scopeId }: { subjectId
   const blocked = !ready || read.kind !== "ABSENT";
 
   function track(request: CommandRequest, progress: CommandDialogProgress): boolean {
-    if (progress.state !== "CONFIRMING" && progress.state !== "UNKNOWN" && progress.state !== "RESOLVED") return true;
+    if (progress.state !== "CONFIRMING" && progress.state !== "FAILED_NOT_EXECUTED" && progress.state !== "UNKNOWN" && progress.state !== "RESOLVED") return true;
     const access = browserSessionStorage();
     if (access.kind === "READ_ERROR" || !scopeId) {
-      setSnapshot({ storageScope, read: access.kind === "READ_ERROR" ? access : { kind: "READ_ERROR", error: new Error("命令恢复作用域不可用") } });
+      setActiveSnapshot(access.kind === "READ_ERROR" ? access : { kind: "READ_ERROR", error: new Error("命令恢复作用域不可用") });
       return false;
     }
     const currentRead = readPersistedCommandRecovery(access.storage, subjectId, scopeId);
     if (currentRead.kind === "CORRUPT" || currentRead.kind === "READ_ERROR") {
-      setSnapshot({ storageScope, read: currentRead });
+      setActiveSnapshot(currentRead);
       return false;
     }
     const current = currentRead.kind === "VALID" ? currentRead.recovery : undefined;
     const transition = transitionPersistedCommandRecovery(current, { subjectId, scopeId, request }, progress);
     if (!transition.accepted) return false;
-    if (transition.recovery && transition.recovery !== current) {
-      if (!savePersistedCommandRecovery(access.storage, transition.recovery)) {
-        setSnapshot({ storageScope, read: { kind: "READ_ERROR", error: new Error("无法保存本地命令恢复记录；命令尚未发送，写入口已暂停") } });
+    if (progress.state === "FAILED_NOT_EXECUTED" && current && transition.recovery === undefined) {
+      if (!clearPersistedCommandRecovery(access.storage, subjectId, scopeId)) {
+        setActiveSnapshot({ kind: "READ_ERROR", error: new Error("命令已明确未执行，但无法清除本地恢复记录；写入口继续暂停") });
         return false;
       }
-      setSnapshot({ storageScope, read: { kind: "VALID", recovery: transition.recovery } });
+      setActiveSnapshot({ kind: "ABSENT" });
+      return true;
+    }
+    if (transition.recovery && transition.recovery !== current) {
+      if (!savePersistedCommandRecovery(access.storage, transition.recovery)) {
+        setActiveSnapshot({ kind: "READ_ERROR", error: new Error("无法保存本地命令恢复记录；命令尚未发送，写入口已暂停") });
+        return false;
+      }
+      setActiveSnapshot({ kind: "VALID", recovery: transition.recovery });
     } else if (transition.recovery) {
-      setSnapshot({ storageScope, read: { kind: "VALID", recovery: transition.recovery } });
+      setActiveSnapshot({ kind: "VALID", recovery: transition.recovery });
     } else {
-      setSnapshot({ storageScope, read: currentRead });
+      setActiveSnapshot(currentRead);
     }
     return true;
   }
@@ -581,19 +639,19 @@ export function usePersistentCommandRecovery({ subjectId, scopeId }: { subjectId
   function clearResolved(): boolean {
     const access = browserSessionStorage();
     if (access.kind === "READ_ERROR" || !scopeId) {
-      setSnapshot({ storageScope, read: access.kind === "READ_ERROR" ? access : { kind: "READ_ERROR", error: new Error("命令恢复作用域不可用") } });
+      setActiveSnapshot(access.kind === "READ_ERROR" ? access : { kind: "READ_ERROR", error: new Error("命令恢复作用域不可用") });
       return false;
     }
     const currentRead = readPersistedCommandRecovery(access.storage, subjectId, scopeId);
     if (currentRead.kind !== "VALID" || !isTerminalCommandRecovery(currentRead.recovery.state)) {
-      if (currentRead.kind === "CORRUPT" || currentRead.kind === "READ_ERROR") setSnapshot({ storageScope, read: currentRead });
+      if (currentRead.kind === "CORRUPT" || currentRead.kind === "READ_ERROR") setActiveSnapshot(currentRead);
       return false;
     }
     if (!clearPersistedCommandRecovery(access.storage, subjectId, scopeId)) {
-      setSnapshot({ storageScope, read: { kind: "READ_ERROR", error: new Error("无法清除已收口的本地命令恢复记录；写入口继续暂停") } });
+      setActiveSnapshot({ kind: "READ_ERROR", error: new Error("无法清除已收口的本地命令恢复记录；写入口继续暂停") });
       return false;
     }
-    setSnapshot({ storageScope, read: { kind: "ABSENT" } });
+    setActiveSnapshot({ kind: "ABSENT" });
     return true;
   }
 
@@ -628,7 +686,17 @@ function displayCommandInput(input: Record<string, unknown>): Record<string, unk
   return { ...input, tokenSecret: "[client-held secret]" };
 }
 
-export function CommandDialog({ request, onClose, onCommitted, initialPreviewMetadata, initialConfirmationKey, initialReceipt, onProgress }: CommandDialogProps) {
+export function CommandDialog({
+  request,
+  onClose,
+  onCommitted,
+  initialPreviewMetadata,
+  initialConfirmationKey,
+  initialReceipt,
+  writeBlocked = false,
+  writeBlockedReason = "当前事实不再满足安全写入条件。请关闭后刷新并重新生成 Preview。",
+  onProgress
+}: CommandDialogProps) {
   const [preview, setPreview] = useState<PreviewDto>();
   const [receipt, setReceipt] = useState<ReceiptDto | undefined>(initialReceipt);
   const [error, setError] = useState<unknown>();
@@ -637,33 +705,66 @@ export function CommandDialog({ request, onClose, onCommitted, initialPreviewMet
   const [reasonNote, setReasonNote] = useState("");
   const [confirmationKey, setConfirmationKey] = useState(initialConfirmationKey);
   const [networkUncertain, setNetworkUncertain] = useState(Boolean(initialConfirmationKey && !initialReceipt));
-  const [previewMetadata] = useState<ClientCommandMetadata>(() => initialPreviewMetadata ?? api.commandMetadata(`preview-${request.commandType.toLowerCase()}`));
+  const [failedNotExecuted, setFailedNotExecuted] = useState(false);
+  const [returnedOriginalReceipt, setReturnedOriginalReceipt] = useState(Boolean(initialReceipt));
+  const [expiryClock, setExpiryClock] = useState(() => Date.now());
+  const [previewMetadata, setPreviewMetadata] = useState<ClientCommandMetadata>(() => initialPreviewMetadata ?? api.commandMetadata(`preview-${request.commandType.toLowerCase()}`));
 
-  const canConfirm = Boolean(preview && reasonCode.trim() && reasonNote.trim() && !busy);
+  const previewExpiry = preview ? Date.parse(preview.expiresAt) : Number.POSITIVE_INFINITY;
+  const previewExpired = Boolean(preview && (!Number.isFinite(previewExpiry) || expiryClock >= previewExpiry));
+  const canConfirm = Boolean(preview
+    && reasonCode.trim()
+    && reasonNote.trim()
+    && !busy
+    && !writeBlocked
+    && !previewExpired
+    && !networkUncertain
+    && !confirmationKey);
   const currentKey = useMemo(() => confirmationKey ?? api.recoveryKey(request.commandType), [confirmationKey, request.commandType]);
 
-  async function loadPreview() {
+  useEffect(() => {
+    if (!preview || receipt || !Number.isFinite(previewExpiry)) return;
+    const delay = Math.max(0, previewExpiry - Date.now() + 20);
+    const timer = window.setTimeout(() => setExpiryClock(Date.now()), delay);
+    return () => window.clearTimeout(timer);
+  }, [preview, previewExpiry, receipt]);
+
+  async function loadPreview(metadata = previewMetadata) {
+    if (writeBlocked) return;
     setBusy(true);
     setError(undefined);
-    onProgress?.({ state: "PREVIEWING", previewMetadata });
+    setFailedNotExecuted(false);
+    onProgress?.({ state: "PREVIEWING", previewMetadata: metadata });
     try {
-      const response = await api.preview({ commandType: request.commandType, input: request.input }, previewMetadata);
+      const response = await api.preview({ commandType: request.commandType, input: request.input }, metadata);
       setPreview(response.preview);
       setReceipt(undefined);
-      onProgress?.({ state: "PREVIEWED", previewId: response.preview.previewId, previewMetadata });
+      setExpiryClock(Date.now());
+      onProgress?.({ state: "PREVIEWED", previewId: response.preview.previewId, previewMetadata: metadata });
     } catch (nextError) {
       setError(nextError);
       const uncertain = !(nextError instanceof ApiError)
         || nextError.status >= 500
         || nextError.code === "COMMAND_STATUS_UNKNOWN";
-      onProgress?.({ state: uncertain ? "PREVIEW_UNKNOWN" : "PREVIEW_FAILED", previewMetadata });
+      onProgress?.({ state: uncertain ? "PREVIEW_UNKNOWN" : "PREVIEW_FAILED", previewMetadata: metadata });
     } finally {
       setBusy(false);
     }
   }
 
+  function regeneratePreview() {
+    if (writeBlocked || busy || networkUncertain || confirmationKey) return;
+    const metadata = api.commandMetadata(`preview-${request.commandType.toLowerCase()}`);
+    setPreviewMetadata(metadata);
+    setPreview(undefined);
+    setReceipt(undefined);
+    setError(undefined);
+    setFailedNotExecuted(false);
+    void loadPreview(metadata);
+  }
+
   async function confirm() {
-    if (!preview || !reasonCode.trim() || !reasonNote.trim()) return;
+    if (!preview || !reasonCode.trim() || !reasonNote.trim() || writeBlocked || previewExpired || networkUncertain || confirmationKey) return;
     const propertyId = request.input.propertyId;
     if (typeof propertyId !== "string" || !propertyId) {
       setError(new Error("Command property scope is missing"));
@@ -674,6 +775,7 @@ export function CommandDialog({ request, onClose, onCommitted, initialPreviewMet
     setBusy(true);
     setError(undefined);
     setNetworkUncertain(false);
+    setFailedNotExecuted(false);
     try {
       const accepted = onProgress?.({ state: "CONFIRMING", previewId: preview.previewId, confirmationKey: key });
       if (accepted === false) {
@@ -692,12 +794,23 @@ export function CommandDialog({ request, onClose, onCommitted, initialPreviewMet
         note: reasonNote.trim()
       }, key);
       setReceipt(result);
+      setReturnedOriginalReceipt(false);
       onProgress?.({ state: "RESOLVED", confirmationKey: key, receipt: result });
       if (result.businessCommitted) onCommitted?.(result);
     } catch (nextError) {
       setError(nextError);
-      setNetworkUncertain(true);
-      onProgress?.({ state: "UNKNOWN", confirmationKey: key });
+      const uncertain = !(nextError instanceof ApiError)
+        || nextError.status >= 500
+        || nextError.code === "COMMAND_STATUS_UNKNOWN";
+      setNetworkUncertain(uncertain);
+      setFailedNotExecuted(!uncertain);
+      onProgress?.(uncertain
+        ? { state: "UNKNOWN", confirmationKey: key }
+        : { state: "FAILED_NOT_EXECUTED", confirmationKey: key });
+      if (!uncertain) {
+        setPreview(undefined);
+        setConfirmationKey(undefined);
+      }
     } finally {
       setBusy(false);
     }
@@ -717,9 +830,11 @@ export function CommandDialog({ request, onClose, onCommitted, initialPreviewMet
       setNetworkUncertain(result.executionStatus === "UNKNOWN");
       if (result.executionStatus === "UNKNOWN") {
         setReceipt(undefined);
+        setReturnedOriginalReceipt(false);
         onProgress?.({ state: "UNKNOWN", confirmationKey });
       } else {
         setReceipt(result);
+        setReturnedOriginalReceipt(true);
         onProgress?.({ state: "RESOLVED", confirmationKey, receipt: result });
       }
       if (result.businessCommitted) onCommitted?.(result);
@@ -741,18 +856,23 @@ export function CommandDialog({ request, onClose, onCommitted, initialPreviewMet
       footer={
         <>
           <button className="button button-secondary" type="button" onClick={onClose} disabled={busy}>{receipt ? "完成" : "取消"}</button>
-          {!preview && !receipt && !networkUncertain ? <button className="button button-primary" type="button" onClick={() => void loadPreview()} disabled={busy} data-testid="create-command-preview">
+          {!preview && !receipt && !networkUncertain ? <button className="button button-primary" type="button" onClick={() => void loadPreview()} disabled={busy || writeBlocked} data-testid="create-command-preview">
             {busy ? <LoaderCircle className="spin" aria-hidden="true" size={17} /> : null}生成服务端预览
           </button> : null}
-          {preview && !receipt ? <button className="button button-danger" type="button" onClick={() => void confirm()} disabled={!canConfirm} data-testid="confirm-command">
-            {busy ? <LoaderCircle className="spin" aria-hidden="true" size={17} /> : <Check aria-hidden="true" size={17} />}显式确认并提交
+          {preview && previewExpired && !receipt && !confirmationKey && !networkUncertain ? <button className="button button-primary" type="button" onClick={regeneratePreview} disabled={busy || writeBlocked} data-testid="regenerate-command-preview">
+            {busy ? <LoaderCircle className="spin" aria-hidden="true" size={17} /> : <RefreshCw aria-hidden="true" size={17} />}重新生成服务端预览
+          </button> : null}
+          {preview && !previewExpired && !receipt && !confirmationKey && !networkUncertain ? <button className="button button-danger command-confirm-button" type="button" onClick={() => void confirm()} disabled={!canConfirm} data-testid="confirm-command">
+            {busy ? <LoaderCircle className="spin" aria-hidden="true" size={17} /> : <Check aria-hidden="true" size={17} />}确认提交：{request.title}
           </button> : null}
         </>
       }
     >
       <p className="command-description">{request.description}</p>
       <div aria-live="polite" className="sr-status">{busy ? "正在处理命令" : receipt ? `命令状态 ${receipt.executionStatus}` : ""}</div>
-      <InlineError error={error} />
+      <InlineError error={error} title={failedNotExecuted ? "命令明确未执行" : "命令处理失败"} />
+      <InlineError error={writeBlocked && !receipt ? new Error(writeBlockedReason) : undefined} title="写入已暂停" />
+      <InlineError error={previewExpired && !receipt ? new Error("Preview 已过期。库存或授权可能已经变化，请关闭后刷新并重新生成 Preview。") : undefined} title="Preview 已过期" />
       {!preview && !receipt ? (
         <div className="command-pending">
           <p>命令类型</p>
@@ -774,6 +894,17 @@ export function CommandDialog({ request, onClose, onCommitted, initialPreviewMet
             </div>
           </section>
         </>
+      ) : null}
+      {receipt && returnedOriginalReceipt ? (
+        <div
+          className="command-recovered-original"
+          role="status"
+          data-testid="command-recovered-original"
+          data-command-state="duplicate-returned-original-receipt"
+        >
+          <strong>已返回原 Receipt</strong>
+          <p>服务端按原幂等键解析既有结果，没有重复执行业务命令。</p>
+        </div>
       ) : null}
       {receipt ? <ReceiptPanel receipt={receipt} onNavigateToResource={onClose} /> : null}
       {networkUncertain && confirmationKey ? (

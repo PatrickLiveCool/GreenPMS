@@ -15,6 +15,7 @@ import {
 } from "@qintopia/contracts";
 import { newId, sha256, stableHash } from "@qintopia/domain";
 import { createQuoteInTransaction } from "../pricing-service.ts";
+import { bumpRoomStatusRevision } from "../room-status.ts";
 import type { Database } from "../schema.ts";
 import { applyCommand, lockCommandResources } from "./apply.ts";
 import { buildCommandEffect, projectCommandEffectForRead } from "./effects.ts";
@@ -33,6 +34,24 @@ export interface UnknownCommandResult {
   businessCommitted: false;
   correlationId?: string;
 }
+
+const roomStatusVisibleCommands = new Set<CommandType>([
+  "CREATE_ORDER",
+  "SHORTEN_STAY",
+  "EXTEND_STAY",
+  "MOVE_UNIT",
+  "REPRICE_ORDER",
+  "REFRESH_MEMBER_COVERAGE",
+  "CANCEL_ORDER",
+  "MARK_NO_SHOW",
+  "CHECK_IN",
+  "CHECK_OUT",
+  "LOCK_MAINTENANCE",
+  "RELEASE_MAINTENANCE",
+  "PLACE_INTERNAL_USE",
+  "RELEASE_INTERNAL_USE",
+  "COMPLETE_CLEANING"
+]);
 
 function assertWriteMetadata(idempotencyKey: string | undefined, correlationId: string | undefined): { idempotencyKey: string; correlationId: string } {
   if (!idempotencyKey?.trim()) throw new DomainError("IDEMPOTENCY_KEY_REQUIRED", "Idempotency-Key header is required", 400);
@@ -720,6 +739,9 @@ export async function confirmCommandPreview(db: Kysely<Database>, principal: Aut
           reason: confirmation.reason,
           commandId: inserted.id
         });
+        if (roomStatusVisibleCommands.has(commandType)) {
+          await bumpRoomStatusRevision(trx, propertyId);
+        }
         await trx.updateTable("command_previews").set({ status: "USED", used_at: new Date() }).where("id", "=", previewId).execute();
         await trx.updateTable("command_executions").set({ state: "APPLIED", completed_at: new Date() }).where("id", "=", inserted.id).execute();
         const receiptId = newId("receipt");

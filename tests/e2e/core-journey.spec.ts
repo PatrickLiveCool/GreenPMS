@@ -10,12 +10,16 @@ async function login(page: Page) {
 }
 
 async function confirmCommand(page: Page, reason: string, expectedFactTexts: string[] = []) {
-  await page.getByTestId("create-command-preview").click();
+  const previewButton = page.getByTestId("create-command-preview");
+  await expect(previewButton).toBeEnabled({ timeout: 15_000 });
+  await previewButton.click();
   const effect = page.getByTestId("command-effect");
-  await expect(effect).toBeVisible();
+  await expect(effect).toBeVisible({ timeout: 15_000 });
   for (const text of expectedFactTexts) await expect(effect).toContainText(text);
   await page.getByTestId("reason-note").fill(reason);
-  await page.getByTestId("confirm-command").click();
+  const confirmButton = page.getByTestId("confirm-command");
+  await expect(confirmButton).toBeEnabled({ timeout: 15_000 });
+  await confirmButton.click();
   const receipt = page.getByTestId("command-receipt");
   await expect(receipt).toBeVisible();
   await expect(receipt).toContainText("EXECUTED");
@@ -28,11 +32,43 @@ async function closeReceipt(page: Page) {
   await expect(page.getByTestId("command-receipt")).toBeHidden();
 }
 
-async function chooseDatesAndUnit(page: Page, unitCode: string, departureDate: string, arrivalDate = "2026-07-21") {
+async function selectRoomStatusRange(
+  page: Page,
+  unitCode: string,
+  departureDate: string,
+  arrivalDate = "2026-07-21"
+): Promise<string> {
   await page.getByTestId("arrival-date").fill(arrivalDate);
   await page.getByTestId("departure-date").fill(departureDate);
-  await expect(page.getByTestId(`quote-unit-${unitCode}`)).toBeEnabled();
-  await page.getByTestId(`quote-unit-${unitCode}`).click();
+  if ((page.viewportSize()?.width ?? 0) < 576) {
+    const mobileCreate = page.getByRole("button", { name: "新建住宿或库存 Block", exact: true });
+    await expect(mobileCreate).toBeVisible();
+    await mobileCreate.click();
+    await expect(page.getByRole("dialog", { name: "新建住宿或库存 Block" })).toBeVisible();
+  }
+  const unitSelect = page.getByTestId("room-status-unit-select");
+  const unitId = `unit_room_${unitCode.toLowerCase()}`;
+  await unitSelect.selectOption(unitId);
+  await expect(unitSelect).toHaveValue(unitId);
+  await page.getByLabel("入住日期", { exact: true }).fill(arrivalDate);
+  await page.getByLabel("退房日期", { exact: true }).fill(departureDate);
+  await page.getByRole("button", { name: "应用选区", exact: true }).click();
+  return unitId;
+}
+
+async function chooseDatesAndUnit(
+  page: Page,
+  unitCode: string,
+  departureDate: string,
+  arrivalDate = "2026-07-21",
+  action: "NORMAL" | "FREE" = "NORMAL"
+) {
+  await selectRoomStatusRange(page, unitCode, departureDate, arrivalDate);
+  const actionName = action === "FREE" ? "创建免费入住" : "创建正常住宿订单";
+  const actionButton = page.getByRole("button", { name: actionName, exact: true });
+  await expect(actionButton).toBeEnabled();
+  await actionButton.click();
+  await expect(page.getByRole("heading", { name: "报价工作区", exact: true })).toBeVisible();
 }
 
 async function createOrder(page: Page, options: {
@@ -48,9 +84,15 @@ async function createOrder(page: Page, options: {
   bookingChannelCode?: "YOUMUDAO" | "CTRIP" | "MEITUAN" | "WECOM";
   channelOrderReference?: string;
 }) {
-  await chooseDatesAndUnit(page, options.unitCode, options.departureDate, options.arrivalDate);
   const memberIdentityCardNumber = options.memberIdentityCardNumber
     ?? (options.transientMember ? "DEMO-ID-310000199001010001" : undefined);
+  await chooseDatesAndUnit(
+    page,
+    options.unitCode,
+    options.departureDate,
+    options.arrivalDate,
+    memberIdentityCardNumber ? "NORMAL" : "FREE"
+  );
   if (memberIdentityCardNumber) {
     await page.getByLabel("住宿类型").selectOption("TRANSIENT");
     await page.getByLabel("计价政策版本").selectOption("policy_qintopia_public_2026_rev561_v1");
@@ -763,16 +805,37 @@ test("desktop delayed Quote callback cannot cross a same-page property scope swi
     });
     await route.fulfill({ response, json: body });
   });
-  await page.route(`**/api/v1/properties/${secondaryPropertyId}/availability?*`, async (route) => {
-    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ propertyId: secondaryPropertyId, units: [] }) });
-  });
-  await page.route("**/api/v1/maintenance-locks?*", async (route) => {
-    const requestedPropertyId = new URL(route.request().url()).searchParams.get("propertyId");
-    if (requestedPropertyId !== secondaryPropertyId) {
-      await route.fallback();
-      return;
+  await page.route(`**/api/v1/properties/${secondaryPropertyId}/room-status?*`, async (route) => {
+    const url = new URL(route.request().url());
+    const arrivalDate = url.searchParams.get("arrivalDate")!;
+    const departureDate = url.searchParams.get("departureDate")!;
+    const dates: string[] = [];
+    for (let cursor = arrivalDate; cursor < departureDate;) {
+      dates.push(cursor);
+      const next = new Date(`${cursor}T00:00:00.000Z`);
+      next.setUTCDate(next.getUTCDate() + 1);
+      cursor = next.toISOString().slice(0, 10);
     }
-    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ maintenanceLocks: [] }) });
+    const asOf = new Date().toISOString();
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        propertyId: secondaryPropertyId,
+        businessDate: arrivalDate,
+        range: { arrivalDate, departureDate },
+        dates,
+        asOf,
+        freshUntil: new Date(Date.parse(asOf) + 5_000).toISOString(),
+        revision: "0",
+        accessLevel: "WRITE",
+        projectionState: "READY",
+        filterOptions: { roomTypeCodes: [], salesModes: [], statuses: [], capacities: [], unitKinds: [] },
+        page: { index: 0, size: 200, totalRooms: 0, totalPages: 0 },
+        operationalTasks: [],
+        rooms: []
+      })
+    });
   });
   let quotePostCount = 0;
   page.on("request", (request) => {
@@ -791,7 +854,7 @@ test("desktop delayed Quote callback cannot cross a same-page property scope swi
 
   await page.getByTestId("property-select").selectOption(secondaryPropertyId);
   await expect(page.getByTestId("property-select")).toHaveValue(secondaryPropertyId);
-  await expect(page.getByText("没有库存结果", { exact: true })).toBeVisible();
+  await expect(page.getByText("当前页没有库存单元", { exact: true })).toBeVisible();
   await expect(page.getByTestId("quote-recovery")).toBeHidden();
   await releaseQuoteAndFlushOldCallback(page, delayed);
   await expect(page.getByText("本地报价恢复记录不可用", { exact: true })).toBeHidden();
@@ -838,6 +901,8 @@ test("desktop order command recovery survives close refresh and navigation witho
   }, { times: 1 });
   await page.getByTestId("confirm-command").click();
   await expect(page.getByText("执行状态需要恢复查询", { exact: true })).toBeVisible();
+  await expect(page.getByTestId("confirm-command")).toHaveCount(0);
+  await expect(page.getByTestId("regenerate-command-preview")).toHaveCount(0);
   expect(originalConfirmationKey).toMatch(/^web-confirm-record_collection-/);
   await page.getByRole("button", { name: "取消", exact: true }).click();
 
@@ -912,10 +977,19 @@ test("desktop quote workbench never applies a response for stale filter inputs",
   await page.getByTestId("request-quote").click();
   await intercepted;
   await page.getByTestId("departure-date").fill("2026-10-16");
+  const committedResponse = page.waitForResponse((response) => response.request().method() === "POST"
+    && new URL(response.url()).pathname === "/api/v1/quotes"
+    && response.status() === 200);
   releaseRequest();
-  await expect(page.getByText(/筛选条件在请求期间发生变化/)).toBeVisible();
+  await committedResponse;
+  const recovery = page.getByTestId("quote-recovery");
+  await expect(recovery).toContainText("报价命令处理中或响应待确认");
   await expect(page.getByTestId("quote-result")).toBeHidden();
-  await expect(page.getByTestId("request-quote")).toBeEnabled();
+  await expect(page.getByTestId("request-quote")).toHaveCount(0);
+  await recovery.getByRole("button", { name: "查询命令结果" }).click();
+  await expect(recovery).toBeHidden();
+  await expect(page.getByText(/当前筛选条件已变化/)).toBeVisible();
+  await expect(page.getByTestId("quote-result")).toBeHidden();
 });
 
 test("desktop Token lifecycle retains client secrets and uses Preview Confirm Receipt", async ({ page }, testInfo: TestInfo) => {
@@ -1034,6 +1108,38 @@ test("desktop Token lifecycle retains client secrets and uses Preview Confirm Re
   await expect(page.getByRole("row").filter({ has: page.locator("th code", { hasText: replacementTokenId! }) })).toContainText("REVOKED");
   await assertNoA11yViolations(page);
   await page.screenshot({ path: testInfo.outputPath("token-lifecycle.png"), fullPage: true });
+});
+
+test("desktop expired Token Preview rotates preview metadata without changing the retained secret", async ({ page }, testInfo: TestInfo) => {
+  test.skip(testInfo.project.name !== "desktop", "desktop-only Token Preview expiry recovery");
+  await page.clock.install();
+  await login(page);
+  await page.getByRole("link", { name: "Token", exact: true }).click();
+  await page.getByRole("button", { name: "签发 Token" }).click();
+  await page.getByLabel("标签").fill("E2E expired preview agent");
+  const secret = await page.getByLabel("一次性 Token secret").inputValue();
+  await page.getByLabel(/我已将一次性 secret 安全保存/).check();
+  await page.getByRole("button", { name: "继续生成 Preview" }).click();
+
+  const previewKeys: string[] = [];
+  page.on("request", (request) => {
+    if (request.method() === "POST" && new URL(request.url()).pathname === "/api/v1/command-previews") {
+      previewKeys.push(request.headers()["idempotency-key"] ?? "");
+    }
+  });
+  await page.getByTestId("create-command-preview").click();
+  await expect(page.getByTestId("command-effect")).toBeVisible();
+  await page.clock.fastForward(601_000);
+  await expect(page.getByTestId("regenerate-command-preview")).toBeVisible();
+
+  await page.clock.setSystemTime(Date.now());
+  await page.getByTestId("regenerate-command-preview").click();
+  await expect.poll(() => previewKeys.length).toBe(2);
+  expect(previewKeys[0]).toMatch(/^web-preview-issue_token-/);
+  expect(previewKeys[1]).toMatch(/^web-preview-issue_token-/);
+  expect(previewKeys[1]).not.toBe(previewKeys[0]);
+  await expect(page.getByRole("region", { name: /尚未清除的一次性 secret/ }).getByLabel("一次性 Token secret")).toHaveValue(secret);
+  await expect(page.getByTestId("confirm-command")).toBeVisible();
 });
 
 test("desktop Token lifecycle ignores deferred callbacks from unmounted command attempts", async ({ page }, testInfo: TestInfo) => {
@@ -1155,10 +1261,13 @@ test("keyboard-only navigation reaches a business Preview and cancels without co
   await page.keyboard.press("Enter");
   await expect(page.getByRole("heading", { name: "房态与可售" })).toBeVisible();
 
-  const maintenanceButton = page.getByRole("button", { name: "维修锁房 101", exact: true });
-  await tabTo(page, maintenanceButton);
+  const firstCell = page.getByRole("gridcell").first();
+  await tabTo(page, firstCell);
+  await page.keyboard.press("Space");
+  const maintenanceButton = page.getByRole("button", { name: "放置维修锁房", exact: true });
+  await tabTo(page, maintenanceButton, { limit: 120 });
   await page.keyboard.press("Enter");
-  await expect(page.getByRole("heading", { name: /^维修锁房 · 101(?: ·|$)/ })).toBeVisible();
+  await expect(page.getByRole("heading", { name: /^维修锁房 ·/ })).toBeVisible();
   const maintenanceReason = page.getByLabel("维修原因");
   await tabTo(page, maintenanceReason);
   await page.keyboard.type("Keyboard-only maintenance preview");
@@ -1222,8 +1331,8 @@ test("property timezone controls default operating dates across local midnight",
     return `${values.get("year")}-${values.get("month")}-${values.get("day")}`;
   });
   expect(browserLocalDate).toBe("2026-07-20");
-  await expect(page.getByTestId("arrival-date")).toHaveValue("2026-07-22");
-  await expect(page.getByTestId("departure-date")).toHaveValue("2026-07-23");
+  await expect(page.getByTestId("arrival-date")).toHaveValue("2026-07-21");
+  await expect(page.getByTestId("departure-date")).toHaveValue("2026-08-04");
 
   await page.getByRole("link", { name: "移动履约" }).click();
   await expect(page.getByLabel("营业日期")).toHaveValue("2026-07-21");
@@ -1232,25 +1341,26 @@ test("property timezone controls default operating dates across local midnight",
 test("maintenance lock can be listed and released", async ({ page }, testInfo: TestInfo) => {
   test.skip(testInfo.project.name !== "desktop", "desktop maintenance journey");
   await login(page);
-  await page.getByTestId("arrival-date").fill("2026-08-10");
-  await page.getByTestId("departure-date").fill("2026-08-11");
-  await expect(page.getByTestId("quote-unit-102")).toBeEnabled();
-
-  await page.getByRole("button", { name: "维修锁房 102", exact: true }).click();
+  const unitId = await selectRoomStatusRange(page, "102", "2026-08-11", "2026-08-10");
+  await page.getByRole("button", { name: "放置维修锁房", exact: true }).click();
   await page.getByLabel("维修原因").fill("E2E air conditioner service");
   await page.getByRole("button", { name: "继续生成 Preview" }).click();
   await confirmCommand(page, "Maintenance window approved");
   await closeReceipt(page);
 
-  const locks = page.getByTestId("maintenance-locks");
-  const lockRow = locks.getByRole("row").filter({ hasText: "E2E air conditioner service" });
-  await expect(lockRow).toBeVisible();
-  await expect(page.getByTestId("quote-unit-102")).toBeDisabled();
-  await lockRow.getByRole("button", { name: "释放维修锁 102" }).click();
+  const roomRow = page.locator(`[data-room-status-row="${unitId}"]`);
+  const maintenanceInterval = roomRow.getByRole("button", { name: /Maintenance lock，维修锁房/ }).first();
+  await expect(maintenanceInterval).toBeVisible();
+  await maintenanceInterval.click();
+  const sourceSection = page.locator("section.room-status-context-section").filter({
+    has: page.getByRole("heading", { name: "来源事实", exact: true })
+  });
+  await expect(sourceSection.getByText("E2E air conditioner service", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "释放维修锁房", exact: true }).click();
   await confirmCommand(page, "Maintenance work completed");
   await closeReceipt(page);
 
-  await expect(locks).not.toContainText("E2E air conditioner service");
-  await expect(page.getByTestId("quote-unit-102")).toBeEnabled();
+  await selectRoomStatusRange(page, "102", "2026-08-11", "2026-08-10");
+  await expect(page.getByRole("button", { name: "创建正常住宿订单", exact: true })).toBeEnabled();
   await assertNoA11yViolations(page);
 });

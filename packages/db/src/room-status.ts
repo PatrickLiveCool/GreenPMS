@@ -1,0 +1,1413 @@
+import { sql, type Kysely, type Transaction } from "kysely";
+import {
+  DomainError,
+  inventoryUnitKinds,
+  ROOM_STATUS_MAX_QUERY_NIGHTS,
+  ROOM_STATUS_OPERATIONAL_TASK_LIMIT,
+  roomStatusStatuses,
+  type AccessLevel,
+  type RoomStatusActionCode,
+  type RoomStatusActionDto,
+  type RoomStatusBoardDto,
+  type RoomStatusBoardQueryDto,
+  type RoomStatusBlockingFactKind,
+  type RoomStatusConflictDto,
+  type RoomStatusFilterOptionsDto,
+  type RoomStatusHistoryDto,
+  type RoomStatusIntervalDto,
+  type RoomStatusOperationalTaskDto,
+  type RoomStatusOperationalTaskKind,
+  type RoomStatusReferenceDto,
+  type RoomStatusSourceKind,
+  type RoomStatusStatus,
+  type RoomStatusUnitDto
+} from "@qintopia/contracts";
+import { enumerateServiceDates, stableHash, todayInTimeZone } from "@qintopia/domain";
+import type { Database } from "./schema.ts";
+
+const DEFAULT_PAGE_SIZE = 50;
+const MAX_PAGE_SIZE = 200;
+
+type RoomStatusTransaction = Transaction<Database>;
+
+interface ProjectionEvent {
+  actualInventoryUnitId: string;
+  roomId: string;
+  serviceDate: string;
+  sourceStartDate: string;
+  sourceEndDate: string;
+  sourceKey: string;
+  sourceKind: RoomStatusSourceKind;
+  status: RoomStatusStatus;
+  label: string;
+  primaryOccupantLabel: string | null;
+  reason: string | null;
+  blocking: boolean;
+  current: boolean;
+  blockingFactKind: RoomStatusBlockingFactKind | null;
+  claimId: string | null;
+  references: RoomStatusReferenceDto[];
+  histories: RoomStatusHistoryDto[];
+  commandIds: string[];
+  targetReference: RoomStatusReferenceDto | null;
+  orderId?: string;
+}
+
+interface CommandProjection {
+  history: RoomStatusHistoryDto;
+  receiptReference: RoomStatusReferenceDto | null;
+}
+
+interface OperationalTaskSeed {
+  taskKind: RoomStatusOperationalTaskKind;
+  businessDate: string;
+  startDate: string;
+  endDate: string;
+  event: ProjectionEvent;
+}
+
+interface IntervalBuilder {
+  event: ProjectionEvent;
+  displayInventoryUnitId: string;
+  startDate: string;
+  lastDate: string;
+  claimIds: string[];
+  claimIdsByServiceDate: Map<string, string[]>;
+  references: RoomStatusReferenceDto[];
+  histories: RoomStatusHistoryDto[];
+}
+
+interface BuiltIntervals {
+  byUnit: Map<string, RoomStatusIntervalDto[]>;
+  claimIdsByIntervalAndDate: Map<string, Map<string, string[]>>;
+}
+
+type RoomStatusFilters = Pick<RoomStatusBoardQueryDto,
+  "search" | "roomType" | "salesMode" | "status" | "minCapacity" | "unitKind">;
+
+function dateAfter(serviceDate: string): string {
+  const date = new Date(`${serviceDate}T00:00:00.000Z`);
+  date.setUTCDate(date.getUTCDate() + 1);
+  return date.toISOString().slice(0, 10);
+}
+
+function iso(value: Date | string): string {
+  return value instanceof Date ? value.toISOString() : new Date(value).toISOString();
+}
+
+function primaryOccupantLabel(snapshot: unknown): string | null {
+  if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot)) return null;
+  const fullName = (snapshot as Record<string, unknown>).fullName;
+  return typeof fullName === "string" && fullName.trim() ? fullName.trim() : null;
+}
+
+function validatePageValue(value: number | undefined, fallback: number, field: string, maximum?: number): number {
+  const resolved = value ?? fallback;
+  if (!Number.isSafeInteger(resolved) || resolved < 0 || (maximum !== undefined && resolved > maximum)) {
+    throw new DomainError("VALIDATION_ERROR", `${field} is outside the supported range`);
+  }
+  return resolved;
+}
+
+function validateFilterText(value: string | undefined, field: string): string | undefined {
+  if (value === undefined) return undefined;
+  const normalized = value.trim();
+  if (!normalized || normalized.length > 200) {
+    throw new DomainError("VALIDATION_ERROR", `${field} is outside the supported range`);
+  }
+  return normalized;
+}
+
+function validateFilters(options: RoomStatusFilters): RoomStatusFilters {
+  const search = validateFilterText(options.search, "search");
+  const roomType = validateFilterText(options.roomType, "roomType");
+  if (options.salesMode !== undefined && !["WHOLE_ROOM", "BED_SPLIT", "UNAVAILABLE"].includes(options.salesMode)) {
+    throw new DomainError("VALIDATION_ERROR", "salesMode is outside the supported vocabulary");
+  }
+  if (options.status !== undefined && !roomStatusStatuses.includes(options.status)) {
+    throw new DomainError("VALIDATION_ERROR", "status is outside the supported vocabulary");
+  }
+  if (options.unitKind !== undefined && !inventoryUnitKinds.includes(options.unitKind)) {
+    throw new DomainError("VALIDATION_ERROR", "unitKind is outside the supported vocabulary");
+  }
+  if (options.minCapacity !== undefined
+    && (!Number.isSafeInteger(options.minCapacity) || options.minCapacity < 1 || options.minCapacity > 1000)) {
+    throw new DomainError("VALIDATION_ERROR", "minCapacity is outside the supported range");
+  }
+  return {
+    ...(search !== undefined ? { search } : {}),
+    ...(roomType !== undefined ? { roomType } : {}),
+    ...(options.salesMode !== undefined ? { salesMode: options.salesMode } : {}),
+    ...(options.status !== undefined ? { status: options.status } : {}),
+    ...(options.minCapacity !== undefined ? { minCapacity: options.minCapacity } : {}),
+    ...(options.unitKind !== undefined ? { unitKind: options.unitKind } : {})
+  };
+}
+
+function reference(type: RoomStatusReferenceDto["type"], id: string, label: string, href: string | null = null): RoomStatusReferenceDto {
+  return { type, id, label, href };
+}
+
+function uniqueReferences(items: RoomStatusReferenceDto[]): RoomStatusReferenceDto[] {
+  return [...new Map(items.map((item) => [`${item.type}:${item.id}`, item])).values()];
+}
+
+function uniqueHistories(items: RoomStatusHistoryDto[]): RoomStatusHistoryDto[] {
+  return [...new Map(items.map((item) => [
+    `${item.action}:${item.occurredAt}:${item.commandId ?? "none"}:${item.receiptId ?? "none"}`,
+    item
+  ])).values()];
+}
+
+function action(code: RoomStatusActionCode, targetReference: RoomStatusReferenceDto | null, requiresFullInterval = false): RoomStatusActionDto {
+  return { code, enabled: true, disabledReason: null, requiresFullInterval, targetReference };
+}
+
+function uniqueActions(items: RoomStatusActionDto[]): RoomStatusActionDto[] {
+  return [...new Map(items.map((item) => [
+    `${item.code}:${item.targetReference?.type ?? "none"}:${item.targetReference?.id ?? "none"}`,
+    item
+  ])).values()];
+}
+
+function createActions(unit: RoomStatusUnitDto, accessLevel: AccessLevel): RoomStatusActionDto[] {
+  if (accessLevel !== "WRITE" || !unit.active) return [];
+  const target = reference("INVENTORY_UNIT", unit.id, unit.code);
+  return [
+    action("CREATE_ORDER", target),
+    action("CREATE_FREE_STAY", target),
+    action("PLACE_INTERNAL_USE", target),
+    action("LOCK_MAINTENANCE", target)
+  ];
+}
+
+function eventActions(event: ProjectionEvent, accessLevel: AccessLevel): RoomStatusActionDto[] {
+  if (event.status === "UNKNOWN") return [];
+  if ((event.sourceKind === "ORDER" || event.sourceKind === "FREE_STAY")) {
+    const order = event.references.find((item) => item.type === "ORDER");
+    return order ? [action("OPEN_ORDER", order)] : [];
+  }
+  if (accessLevel !== "WRITE" || !event.current || !event.targetReference) return [];
+  if (event.sourceKind === "MAINTENANCE") return [action("RELEASE_MAINTENANCE", event.targetReference, true)];
+  if (event.sourceKind === "INTERNAL_USE") return [action("RELEASE_INTERNAL_USE", event.targetReference, true)];
+  if (event.sourceKind === "CLEANING") return [action("COMPLETE_CLEANING", event.targetReference)];
+  return [];
+}
+
+function intervalActions(event: ProjectionEvent, accessLevel: AccessLevel, startDate: string, endDate: string): RoomStatusActionDto[] {
+  return eventActions(event, accessLevel).map((candidate) => candidate.requiresFullInterval
+    && (startDate !== event.sourceStartDate || endDate !== event.sourceEndDate)
+    ? {
+        ...candidate,
+        enabled: false,
+        disabledReason: `当前窗口只包含来源完整区间 [${event.sourceStartDate}, ${event.sourceEndDate}) 的一部分`
+      }
+    : candidate);
+}
+
+function commandSource(credentialId: string): RoomStatusHistoryDto["source"] {
+  if (credentialId.startsWith("session_")) return "WEB_SESSION";
+  if (credentialId.startsWith("token_")) return "API_TOKEN";
+  return "UNKNOWN";
+}
+
+async function loadCommandProjections(
+  trx: RoomStatusTransaction,
+  commandIds: string[],
+  requestingSubjectId: string
+): Promise<Map<string, CommandProjection>> {
+  if (commandIds.length === 0) return new Map();
+  const rows = await trx.selectFrom("command_executions as command")
+    .leftJoin("command_receipts as receipt", "receipt.command_id", "command.id")
+    .select([
+      "command.id",
+      "command.subject_id",
+      "command.credential_id",
+      "command.command_type",
+      "command.correlation_id",
+      "command.completed_at",
+      "command.created_at",
+      "receipt.id as receipt_id"
+    ])
+    .where("command.id", "in", commandIds)
+    .execute();
+  return new Map(rows.map((row) => {
+    const receiptVisible = row.subject_id === requestingSubjectId && row.receipt_id !== null;
+    return [row.id, {
+      history: {
+        action: row.command_type,
+        actorId: row.subject_id,
+        source: commandSource(row.credential_id),
+        occurredAt: iso(row.completed_at ?? row.created_at),
+        commandId: row.id,
+        receiptId: receiptVisible ? row.receipt_id : null,
+        correlationId: row.correlation_id
+      },
+      receiptReference: receiptVisible
+        ? reference("RECEIPT", row.receipt_id!, `Receipt ${row.receipt_id}`, `/api/v1/receipts/${row.receipt_id}`)
+        : null
+    }];
+  }));
+}
+
+function attachCommandProjection(event: ProjectionEvent, commands: Map<string, CommandProjection>): ProjectionEvent {
+  const commandProjections = event.commandIds.map((id) => commands.get(id)).filter((item): item is CommandProjection => Boolean(item));
+  return {
+    ...event,
+    references: uniqueReferences([
+      ...event.references,
+      ...commandProjections.flatMap((item) => item.receiptReference ? [item.receiptReference] : [])
+    ]),
+    histories: uniqueHistories([
+      ...event.histories,
+      ...commandProjections.map((item) => item.history)
+    ])
+  };
+}
+
+function operationalTaskFromSeed(
+  seed: OperationalTaskSeed,
+  commands: Map<string, CommandProjection>,
+  accessLevel: AccessLevel
+): RoomStatusOperationalTaskDto {
+  const event = attachCommandProjection(seed.event, commands);
+  const task: RoomStatusOperationalTaskDto = {
+    taskKind: seed.taskKind,
+    businessDate: seed.businessDate,
+    id: `task_${stableHash({ taskKind: seed.taskKind, sourceKey: event.sourceKey, businessDate: seed.businessDate }).slice(0, 24)}`,
+    displayInventoryUnitId: event.actualInventoryUnitId,
+    actualInventoryUnitId: event.actualInventoryUnitId,
+    roomId: event.roomId,
+    startDate: seed.startDate,
+    endDate: seed.endDate,
+    sourceStartDate: event.sourceStartDate,
+    sourceEndDate: event.sourceEndDate,
+    status: event.status,
+    available: !event.blocking,
+    blocking: event.blocking,
+    sourceKind: event.sourceKind,
+    label: event.label,
+    primaryOccupantLabel: event.primaryOccupantLabel,
+    reason: event.reason,
+    claimIds: event.claimId ? [event.claimId] : [],
+    references: uniqueReferences(event.references),
+    conflicts: [],
+    history: uniqueHistories(event.histories),
+    allowedActions: eventActions(event, accessLevel)
+  };
+  const conflict = conflictFor(task, event.blockingFactKind, {
+    startDate: seed.businessDate,
+    endDate: dateAfter(seed.businessDate)
+  });
+  if (conflict) task.conflicts.push(conflict);
+  return task;
+}
+
+function intervalGroupKey(event: ProjectionEvent, displayInventoryUnitId: string): string {
+  return [
+    displayInventoryUnitId,
+    event.actualInventoryUnitId,
+    event.sourceKind,
+    event.sourceKey,
+    event.status,
+    event.blocking ? "blocking" : "nonblocking",
+    event.blockingFactKind ?? "no-blocking-fact",
+    event.current ? "current" : "history"
+  ].join(":");
+}
+
+function addBuilderItem(builder: IntervalBuilder, event: ProjectionEvent): void {
+  builder.lastDate = event.serviceDate;
+  if (event.claimId) {
+    builder.claimIds.push(event.claimId);
+    const dayClaims = builder.claimIdsByServiceDate.get(event.serviceDate) ?? [];
+    dayClaims.push(event.claimId);
+    builder.claimIdsByServiceDate.set(event.serviceDate, dayClaims);
+  }
+  builder.references.push(...event.references);
+  builder.histories.push(...event.histories);
+}
+
+function conflictFor(
+  interval: RoomStatusIntervalDto,
+  blockingFactKind: RoomStatusBlockingFactKind | null,
+  range: { startDate: string; endDate: string } = interval
+): RoomStatusConflictDto | null {
+  if (!interval.blocking) {
+    if (blockingFactKind !== null) throw new DomainError("VALIDATION_ERROR", "nonblocking room-status event cannot expose a blocking fact");
+    return null;
+  }
+  if (!blockingFactKind) throw new DomainError("VALIDATION_ERROR", "blocking room-status event is missing its explicit blocking fact kind");
+  if (blockingFactKind === "CLAIM" && interval.claimIds.length === 0) {
+    throw new DomainError("VALIDATION_ERROR", "Claim-backed room-status conflict is missing its Claim ID");
+  }
+  if (blockingFactKind !== "CLAIM" && interval.claimIds.length > 0) {
+    throw new DomainError("VALIDATION_ERROR", "non-Claim room-status conflict cannot expose a Claim ID");
+  }
+  const sourceReference = blockingFactKind === "UNIT_UNSELLABLE"
+    ? interval.references.find((item) => item.type === "INVENTORY_UNIT")
+    : blockingFactKind === "LODGING_ORDER" || blockingFactKind === "OVERDUE_IN_HOUSE"
+      ? interval.references.find((item) => item.type === "ORDER")
+      : interval.references.find((item) => item.type !== "CLAIM")
+        ?? interval.references.find((item) => item.type === "CLAIM");
+  if (!sourceReference) throw new DomainError("VALIDATION_ERROR", "room-status conflict is missing its stable source reference");
+  return {
+    id: `conflict_${stableHash({
+      intervalId: interval.id,
+      requestedInventoryUnitId: interval.displayInventoryUnitId,
+      actualInventoryUnitId: interval.actualInventoryUnitId,
+      blockingFactKind
+    }).slice(0, 24)}`,
+    blockingFactKind,
+    claimId: interval.claimIds[0] ?? null,
+    claimIds: interval.claimIds,
+    requestedInventoryUnitId: interval.displayInventoryUnitId,
+    actualInventoryUnitId: interval.actualInventoryUnitId,
+    roomId: interval.roomId,
+    startDate: range.startDate,
+    endDate: range.endDate,
+    sourceKind: interval.sourceKind,
+    sourceReference,
+    reason: interval.reason ?? interval.label,
+    blocking: true
+  };
+}
+
+function conflictForDay(conflict: RoomStatusConflictDto, serviceDate: string, claimId: string | null): RoomStatusConflictDto {
+  return {
+    ...conflict,
+    id: `conflict_${stableHash({ conflictId: conflict.id, serviceDate, blockingFactKind: conflict.blockingFactKind, claimId }).slice(0, 24)}`,
+    claimId,
+    claimIds: claimId ? [claimId] : [],
+    startDate: serviceDate,
+    endDate: dateAfter(serviceDate)
+  };
+}
+
+function buildIntervals(
+  events: ProjectionEvent[],
+  unitsById: Map<string, RoomStatusUnitDto>,
+  accessLevel: AccessLevel
+): BuiltIntervals {
+  const expanded = events.flatMap((event) => {
+    const actual = unitsById.get(event.actualInventoryUnitId);
+    if (!actual) return [{ event, displayInventoryUnitId: event.actualInventoryUnitId }];
+    const displayIds = new Set([actual.id]);
+    if (actual.kind === "BED" && actual.parentRoomId) displayIds.add(actual.parentRoomId);
+    if (actual.kind === "ROOM") actual.childUnitIds.forEach((id) => displayIds.add(id));
+    return [...displayIds].filter((id) => unitsById.has(id)).map((displayInventoryUnitId) => ({ event, displayInventoryUnitId }));
+  }).sort((left, right) => {
+    const keyOrder = intervalGroupKey(left.event, left.displayInventoryUnitId)
+      .localeCompare(intervalGroupKey(right.event, right.displayInventoryUnitId));
+    return keyOrder || left.event.serviceDate.localeCompare(right.event.serviceDate);
+  });
+
+  const builders: IntervalBuilder[] = [];
+  for (const item of expanded) {
+    const key = intervalGroupKey(item.event, item.displayInventoryUnitId);
+    const current = builders.at(-1);
+    if (current
+      && intervalGroupKey(current.event, current.displayInventoryUnitId) === key
+      && dateAfter(current.lastDate) === item.event.serviceDate) {
+      addBuilderItem(current, item.event);
+      continue;
+    }
+    builders.push({
+      event: item.event,
+      displayInventoryUnitId: item.displayInventoryUnitId,
+      startDate: item.event.serviceDate,
+      lastDate: item.event.serviceDate,
+      claimIds: item.event.claimId ? [item.event.claimId] : [],
+      claimIdsByServiceDate: new Map(item.event.claimId ? [[item.event.serviceDate, [item.event.claimId]]] : []),
+      references: [...item.event.references],
+      histories: [...item.event.histories]
+    });
+  }
+
+  const byUnit = new Map<string, RoomStatusIntervalDto[]>();
+  const claimIdsByIntervalAndDate = new Map<string, Map<string, string[]>>();
+  for (const builder of builders) {
+    const endDate = dateAfter(builder.lastDate);
+    const id = `interval_${stableHash({
+      displayInventoryUnitId: builder.displayInventoryUnitId,
+      actualInventoryUnitId: builder.event.actualInventoryUnitId,
+      sourceKey: builder.event.sourceKey,
+      startDate: builder.startDate,
+      endDate
+    }).slice(0, 24)}`;
+    const interval: RoomStatusIntervalDto = {
+      id,
+      displayInventoryUnitId: builder.displayInventoryUnitId,
+      actualInventoryUnitId: builder.event.actualInventoryUnitId,
+      roomId: builder.event.roomId,
+      startDate: builder.startDate,
+      endDate,
+      sourceStartDate: builder.event.sourceStartDate,
+      sourceEndDate: builder.event.sourceEndDate,
+      status: builder.event.status,
+      available: !builder.event.blocking,
+      blocking: builder.event.blocking,
+      sourceKind: builder.event.sourceKind,
+      label: builder.event.label,
+      primaryOccupantLabel: builder.event.primaryOccupantLabel,
+      reason: builder.event.reason,
+      claimIds: [...new Set(builder.claimIds)],
+      references: uniqueReferences(builder.references),
+      conflicts: [],
+      history: uniqueHistories(builder.histories),
+      allowedActions: intervalActions(builder.event, accessLevel, builder.startDate, endDate)
+    };
+    const conflict = conflictFor(interval, builder.event.blockingFactKind);
+    if (conflict) interval.conflicts.push(conflict);
+    claimIdsByIntervalAndDate.set(id, builder.claimIdsByServiceDate);
+    const list = byUnit.get(builder.displayInventoryUnitId) ?? [];
+    list.push(interval);
+    byUnit.set(builder.displayInventoryUnitId, list);
+  }
+  return { byUnit, claimIdsByIntervalAndDate };
+}
+
+function dayStatus(intervals: RoomStatusIntervalDto[], unitActive: boolean): RoomStatusStatus {
+  if (!unitActive) return "UNAVAILABLE";
+  const current = intervals.filter((interval) => interval.blocking || interval.sourceKind === "CLEANING");
+  if (current.some((interval) => interval.status === "UNKNOWN")) return "UNKNOWN";
+  const priority: RoomStatusStatus[] = ["UNAVAILABLE", "IN_HOUSE", "RESERVED", "MAINTENANCE", "INTERNAL_USE", "CLEANING"];
+  return priority.find((status) => current.some((interval) => interval.status === status)) ?? "AVAILABLE";
+}
+
+function assembleUnit(
+  unit: RoomStatusUnitDto,
+  dates: string[],
+  intervals: RoomStatusIntervalDto[],
+  claimIdsByIntervalAndDate: Map<string, Map<string, string[]>>,
+  accessLevel: AccessLevel
+): RoomStatusUnitDto {
+  const unitConflicts = intervals.flatMap((interval) => interval.conflicts);
+  const days = dates.map((serviceDate) => {
+    const dayIntervals = intervals.filter((interval) => interval.startDate <= serviceDate && serviceDate < interval.endDate);
+    const blocking = dayIntervals.some((interval) => interval.blocking);
+    const unknown = dayIntervals.some((interval) => interval.status === "UNKNOWN");
+    const available = unit.active && !blocking && !unknown;
+    const conflicts = dayIntervals.flatMap((interval) => {
+      const exactClaimIds = claimIdsByIntervalAndDate.get(interval.id)?.get(serviceDate) ?? [];
+      return interval.conflicts.flatMap((conflict) => conflict.blockingFactKind === "CLAIM"
+        ? exactClaimIds.map((claimId) => conflictForDay(conflict, serviceDate, claimId))
+        : [conflictForDay(conflict, serviceDate, null)]);
+    });
+    return {
+      serviceDate,
+      status: dayStatus(dayIntervals, unit.active),
+      available,
+      intervalIds: dayIntervals.map((interval) => interval.id),
+      conflicts
+    };
+  });
+  return {
+    ...unit,
+    days,
+    intervals,
+    conflicts: unitConflicts,
+    allowedActions: uniqueActions([
+      ...(days.some((day) => day.available) ? createActions(unit, accessLevel) : []),
+      ...intervals.flatMap((interval) => interval.allowedActions)
+    ])
+  };
+}
+
+function normalizedSearchText(value: string): string {
+  return value.toLocaleUpperCase("zh-CN");
+}
+
+function unitMatchesFilters(unit: RoomStatusUnitDto, room: RoomStatusUnitDto, filters: RoomStatusFilters): boolean {
+  if (filters.search) {
+    const searchText = [
+      room.code,
+      room.name,
+      room.buildingCode,
+      room.roomTypeCode,
+      room.pricingProductCode,
+      unit.code,
+      unit.name,
+      unit.buildingCode,
+      unit.roomTypeCode,
+      unit.pricingProductCode
+    ].filter((value): value is string => Boolean(value)).join(" ");
+    if (!normalizedSearchText(searchText).includes(normalizedSearchText(filters.search))) return false;
+  }
+  if (filters.roomType && (unit.roomTypeCode ?? room.roomTypeCode) !== filters.roomType) return false;
+  if (filters.salesMode && room.salesMode !== filters.salesMode) return false;
+  if (filters.status && !unit.days.some((day) => day.status === filters.status)) return false;
+  if (filters.minCapacity !== undefined && room.capacity < filters.minCapacity) return false;
+  if (filters.unitKind && unit.kind !== filters.unitKind) return false;
+  return true;
+}
+
+function filterRooms(rooms: RoomStatusUnitDto[], filters: RoomStatusFilters): RoomStatusUnitDto[] {
+  return rooms.flatMap((room) => {
+    const children = room.children.filter((child) => unitMatchesFilters(child, room, filters));
+    if (!unitMatchesFilters(room, room, filters) && children.length === 0) return [];
+    return [{ ...room, childUnitIds: children.map((child) => child.id), children }];
+  });
+}
+
+function roomStatusFilterOptions(rooms: RoomStatusUnitDto[]): RoomStatusFilterOptionsDto {
+  const units = rooms.flatMap((room) => [room, ...room.children]);
+  const salesModeOrder: RoomStatusUnitDto["salesMode"][] = ["WHOLE_ROOM", "BED_SPLIT", "UNAVAILABLE"];
+  return {
+    roomTypeCodes: [...new Set(rooms.flatMap((room) => room.roomTypeCode ? [room.roomTypeCode] : []))].sort(),
+    salesModes: salesModeOrder.filter((salesMode) => rooms.some((room) => room.salesMode === salesMode)),
+    statuses: roomStatusStatuses.filter((status) => units.some((unit) => unit.days.some((day) => day.status === status))),
+    capacities: [...new Set(rooms.map((room) => room.capacity).filter((capacity) => capacity > 0))]
+      .sort((left, right) => left - right),
+    unitKinds: inventoryUnitKinds.filter((kind) => units.some((unit) => unit.kind === kind))
+  };
+}
+
+export async function bumpRoomStatusRevision(trx: RoomStatusTransaction, propertyId: string): Promise<string> {
+  const row = await trx.insertInto("room_status_revisions")
+    .values({ property_id: propertyId, revision: 1, updated_at: new Date() })
+    .onConflict((conflict) => conflict.column("property_id").doUpdateSet({
+      revision: sql`room_status_revisions.revision + 1`,
+      updated_at: new Date()
+    }))
+    .returning("revision")
+    .executeTakeFirstOrThrow();
+  return String(row.revision);
+}
+
+export async function getRoomStatusBoard(db: Kysely<Database>, options: {
+  propertyId: string;
+  arrivalDate: string;
+  departureDate: string;
+  accessLevel: AccessLevel;
+  requestingSubjectId: string;
+  page?: number;
+  pageSize?: number;
+  search?: string;
+  roomType?: string;
+  salesMode?: RoomStatusUnitDto["salesMode"];
+  status?: RoomStatusStatus;
+  minCapacity?: number;
+  unitKind?: RoomStatusUnitDto["kind"];
+}): Promise<RoomStatusBoardDto> {
+  const dates = enumerateServiceDates(options.arrivalDate, options.departureDate);
+  if (dates.length > ROOM_STATUS_MAX_QUERY_NIGHTS) {
+    throw new DomainError("VALIDATION_ERROR", `room-status supports at most ${ROOM_STATUS_MAX_QUERY_NIGHTS} nights`);
+  }
+  const page = validatePageValue(options.page, 0, "page");
+  const pageSize = validatePageValue(options.pageSize, DEFAULT_PAGE_SIZE, "pageSize", MAX_PAGE_SIZE);
+  if (pageSize === 0) throw new DomainError("VALIDATION_ERROR", "pageSize must be at least 1");
+  const filters = validateFilters(options);
+
+  return db.transaction().setIsolationLevel("repeatable read").execute(async (trx) => {
+    await sql`set transaction read only`.execute(trx);
+    const property = await trx.selectFrom("properties").select(["id", "timezone"]).where("id", "=", options.propertyId).executeTakeFirst();
+    if (!property) throw new DomainError("NOT_FOUND", "Property not found", 404);
+    const clock = await sql<{ as_of: Date }>`select transaction_timestamp() as as_of`.execute(trx);
+    const asOf = iso(clock.rows[0]!.as_of);
+    const freshUntil = new Date(new Date(asOf).getTime() + 5_000).toISOString();
+    const businessDate = todayInTimeZone(property.timezone, new Date(asOf));
+    const revisionRow = await trx.selectFrom("room_status_revisions")
+      .select("revision")
+      .where("property_id", "=", options.propertyId)
+      .executeTakeFirst();
+
+    const roomRows = await trx.selectFrom("inventory_units")
+      .selectAll()
+      .where("property_id", "=", options.propertyId)
+      .where("kind", "=", "ROOM")
+      .orderBy("code")
+      .execute();
+    const roomIds = roomRows.map((room) => room.id);
+    const bedRows = await trx.selectFrom("inventory_units")
+      .selectAll()
+      .where("property_id", "=", options.propertyId)
+      .where("kind", "=", "BED")
+      .orderBy("code")
+      .execute();
+
+    const operationalOrderCandidates = await trx.selectFrom("orders as order")
+      .select("order.id")
+      .where("order.property_id", "=", options.propertyId)
+      .where((expression) => expression.or([
+        expression.and([
+          expression("order.status", "=", "RESERVED"),
+          expression("order.arrival_date", "<=", businessDate)
+        ]),
+        expression.and([
+          expression("order.status", "=", "CHECKED_IN"),
+          expression("order.arrival_date", "<=", businessDate)
+        ])
+      ]))
+      .orderBy("order.id")
+      .limit(ROOM_STATUS_OPERATIONAL_TASK_LIMIT + 1)
+      .execute();
+    const operationalOrdersTruncated = operationalOrderCandidates.length > ROOM_STATUS_OPERATIONAL_TASK_LIMIT;
+    const operationalOrderIds = operationalOrderCandidates
+      .slice(0, ROOM_STATUS_OPERATIONAL_TASK_LIMIT)
+      .map((row) => row.id);
+    const operationalOrderRows = operationalOrderIds.length === 0 ? [] : await trx.selectFrom("orders as order")
+      .innerJoin("stays as stay", "stay.order_id", "order.id")
+      .innerJoin("stay_segments as segment", "segment.stay_id", "stay.id")
+      .leftJoin("inventory_claims as operational_claim", (join) => join
+        .onRef("operational_claim.source_id", "=", "segment.id")
+        .on("operational_claim.source_type", "=", "ORDER_SEGMENT")
+        .on("operational_claim.service_date", "=", businessDate)
+        .on("operational_claim.active", "=", true))
+      .innerJoin("inventory_units as unit", "unit.id", "segment.inventory_unit_id")
+      .leftJoin("amendments as amendment", "amendment.id", "segment.amendment_id")
+      .select([
+        "order.id as order_id", "order.status as order_status", "order.stay_type", "order.arrival_date as order_arrival_date",
+        "order.departure_date as order_departure_date", "order.primary_guest_snapshot", "order.free_stay_reason",
+        "stay.id as stay_id", "stay.status as stay_status", "segment.id as segment_id", "segment.sequence as segment_sequence",
+        "segment.arrival_date as segment_arrival_date", "segment.departure_date as segment_departure_date",
+        "segment.inventory_unit_id", "segment.created_at as segment_created_at", "amendment.command_id as segment_command_id",
+        "unit.parent_room_id", "unit.code as unit_code", "unit.name as unit_name",
+        "operational_claim.id as operational_claim_id"
+      ])
+      .where("order.property_id", "=", options.propertyId)
+      .where("order.id", "in", operationalOrderIds)
+      .orderBy("order.id")
+      .orderBy("segment.sequence")
+      .execute();
+
+    const operationalOrderGroups = new Map<string, typeof operationalOrderRows>();
+    for (const row of operationalOrderRows) {
+      const rows = operationalOrderGroups.get(row.order_id) ?? [];
+      rows.push(row);
+      operationalOrderGroups.set(row.order_id, rows);
+    }
+    const operationalTaskSeeds: OperationalTaskSeed[] = [];
+    const syntheticOccupancyEvents: ProjectionEvent[] = [];
+    let missingOperationalClaim = false;
+    for (const rows of operationalOrderGroups.values()) {
+      const order = rows[0]!;
+      let taskKind: RoomStatusOperationalTaskKind | null = null;
+      let exceptionReason: string | null = null;
+      let blocking = false;
+      if (order.order_status === "RESERVED" && order.order_arrival_date === businessDate) taskKind = "ARRIVAL";
+      else if (order.order_status === "RESERVED" && order.order_arrival_date < businessDate) {
+        taskKind = "EXCEPTION";
+        exceptionReason = `计划到店日 ${order.order_arrival_date} 已早于营业日 ${businessDate}，订单仍处于 RESERVED`;
+      }
+      else if (order.order_status === "CHECKED_IN" && order.order_departure_date === businessDate) taskKind = "DEPARTURE";
+      else if (order.order_status === "CHECKED_IN" && order.order_departure_date < businessDate) {
+        taskKind = "EXCEPTION";
+        exceptionReason = `计划退房日 ${order.order_departure_date} 已早于营业日 ${businessDate}，订单仍处于 CHECKED_IN`;
+      }
+      else if (order.order_status === "CHECKED_IN" && order.order_arrival_date <= businessDate && businessDate < order.order_departure_date) taskKind = "IN_HOUSE";
+      if (!taskKind) continue;
+      const segment = [...rows].reverse().find((row) => row.segment_arrival_date <= businessDate && businessDate < row.segment_departure_date)
+        ?? rows.at(-1)!;
+      const overdueInHouse = order.order_status === "CHECKED_IN" && order.order_departure_date < businessDate;
+      const inHouseAtOrPastDeparture = order.order_status === "CHECKED_IN" && order.order_departure_date <= businessDate;
+      const dateCoveredByOrder = order.order_arrival_date <= businessDate && businessDate < order.order_departure_date;
+      const claimId = segment.operational_claim_id;
+      const missingCurrentClaim = dateCoveredByOrder && !claimId;
+      if (missingCurrentClaim) {
+        taskKind = "EXCEPTION";
+        exceptionReason = `营业日 ${businessDate} 的住宿订单库存 Claim 缺失`;
+        missingOperationalClaim = true;
+      }
+      blocking = inHouseAtOrPastDeparture || dateCoveredByOrder;
+      const orderRef = reference("ORDER", order.order_id, `Order ${order.order_id}`, `/orders/${order.order_id}`);
+      const sourceKind: RoomStatusSourceKind = order.stay_type === "FREE" ? "FREE_STAY" : "ORDER";
+      const freeStayReason = sourceKind === "FREE_STAY" ? order.free_stay_reason : null;
+      const taskReason = exceptionReason && freeStayReason
+        ? `${exceptionReason}；免费入住原因：${freeStayReason}`
+        : exceptionReason ?? freeStayReason;
+      const taskEvent: ProjectionEvent = {
+        actualInventoryUnitId: segment.inventory_unit_id,
+        roomId: segment.parent_room_id ?? segment.inventory_unit_id,
+        serviceDate: businessDate,
+        sourceStartDate: order.order_arrival_date,
+        sourceEndDate: order.order_departure_date,
+        sourceKey: `order-task:${order.order_id}:${taskKind}`,
+        sourceKind,
+        status: missingCurrentClaim ? "UNKNOWN" : order.order_status === "RESERVED" ? "RESERVED" : "IN_HOUSE",
+        label: `${sourceKind === "FREE_STAY" ? "免费入住" : "订单"} ${order.order_id}`,
+        primaryOccupantLabel: primaryOccupantLabel(order.primary_guest_snapshot),
+        reason: taskReason,
+        blocking,
+        current: true,
+        blockingFactKind: overdueInHouse
+          ? "OVERDUE_IN_HOUSE"
+          : claimId
+            ? "CLAIM"
+            : blocking
+              ? "LODGING_ORDER"
+              : null,
+        claimId: claimId ?? null,
+        references: [
+          ...(claimId ? [reference("CLAIM", claimId, `Claim ${claimId}`)] : []),
+          orderRef,
+          reference("STAY", order.stay_id, `Stay ${order.stay_id}`),
+          reference("INVENTORY_UNIT", segment.inventory_unit_id, `${segment.unit_code} · ${segment.unit_name}`)
+        ],
+        histories: [{
+          action: "ORDER_TASK_SOURCE",
+          actorId: null,
+          source: "UNKNOWN",
+          occurredAt: iso(segment.segment_created_at),
+          commandId: null,
+          receiptId: null,
+          correlationId: null
+        }],
+        commandIds: segment.segment_command_id ? [segment.segment_command_id] : [],
+        targetReference: orderRef,
+        orderId: order.order_id
+      };
+      if (!missingCurrentClaim) {
+        operationalTaskSeeds.push({
+          taskKind,
+          businessDate,
+          startDate: order.order_arrival_date,
+          endDate: order.order_departure_date,
+          event: taskEvent
+        });
+      }
+      if (inHouseAtOrPastDeparture) {
+        syntheticOccupancyEvents.push({
+          ...taskEvent,
+          sourceStartDate: businessDate,
+          sourceEndDate: dateAfter(businessDate),
+          sourceKey: `${overdueInHouse ? "overdue-stay" : "departure-day-in-house"}:${order.order_id}:${businessDate}`,
+          blockingFactKind: overdueInHouse ? "OVERDUE_IN_HOUSE" : "LODGING_ORDER",
+          claimId: null,
+          references: taskEvent.references.filter((item) => item.type !== "CLAIM")
+        });
+      }
+      else if (missingCurrentClaim) {
+        syntheticOccupancyEvents.push({
+          ...taskEvent,
+          sourceKey: `missing-order-claim:${order.order_id}:${businessDate}`
+        });
+      }
+    }
+
+    const inactiveTaskUnits = await trx.selectFrom("inventory_units")
+      .select(["id", "kind", "parent_room_id", "code", "name"])
+      .where("property_id", "=", options.propertyId)
+      .where("active", "=", false)
+      .orderBy("code")
+      .orderBy("id")
+      .limit(ROOM_STATUS_OPERATIONAL_TASK_LIMIT + 1)
+      .execute();
+    const inactiveUnitsTruncated = inactiveTaskUnits.length > ROOM_STATUS_OPERATIONAL_TASK_LIMIT;
+    for (const unit of inactiveTaskUnits.slice(0, ROOM_STATUS_OPERATIONAL_TASK_LIMIT)) {
+      const unitRef = reference("INVENTORY_UNIT", unit.id, `${unit.code} · ${unit.name}`);
+      operationalTaskSeeds.push({
+        taskKind: "EXCEPTION",
+        businessDate,
+        startDate: businessDate,
+        endDate: dateAfter(businessDate),
+        event: {
+          actualInventoryUnitId: unit.id,
+          roomId: unit.kind === "ROOM" ? unit.id : unit.parent_room_id!,
+          serviceDate: businessDate,
+          sourceStartDate: businessDate,
+          sourceEndDate: dateAfter(businessDate),
+          sourceKey: `unsellable:${unit.id}`,
+          sourceKind: "UNIT_UNSELLABLE",
+          status: "UNAVAILABLE",
+          label: "Unit unavailable",
+          primaryOccupantLabel: null,
+          reason: "The inventory unit is inactive",
+          blocking: true,
+          current: true,
+          blockingFactKind: "UNIT_UNSELLABLE",
+          claimId: null,
+          references: [unitRef],
+          histories: [],
+          commandIds: [],
+          targetReference: unitRef
+        }
+      });
+    }
+
+    const childrenByRoom = new Map<string, typeof bedRows>();
+    for (const bed of bedRows) {
+      const children = childrenByRoom.get(bed.parent_room_id!) ?? [];
+      children.push(bed);
+      childrenByRoom.set(bed.parent_room_id!, children);
+    }
+
+    const unitsById = new Map<string, RoomStatusUnitDto>();
+    for (const room of roomRows) {
+      const children = childrenByRoom.get(room.id) ?? [];
+      const roomUnit: RoomStatusUnitDto = {
+        id: room.id,
+        propertyId: room.property_id,
+        roomId: room.id,
+        parentRoomId: null,
+        kind: "ROOM",
+        code: room.code,
+        name: room.name,
+        active: room.active,
+        salesMode: !room.active ? "UNAVAILABLE" : children.length > 0 ? "BED_SPLIT" : "WHOLE_ROOM",
+        buildingCode: room.building_code,
+        roomTypeCode: room.room_type_code,
+        pricingProductCode: room.pricing_product_code,
+        capacity: room.physical_bed_count ?? Math.max(children.length, 1),
+        childUnitIds: children.map((bed) => bed.id),
+        children: [],
+        days: [],
+        intervals: [],
+        conflicts: [],
+        allowedActions: []
+      };
+      unitsById.set(room.id, roomUnit);
+      for (const bed of children) {
+        unitsById.set(bed.id, {
+          id: bed.id,
+          propertyId: bed.property_id,
+          roomId: room.id,
+          parentRoomId: room.id,
+          kind: "BED",
+          code: bed.code,
+          name: bed.name,
+          active: bed.active,
+          salesMode: bed.active ? "BED_SPLIT" : "UNAVAILABLE",
+          buildingCode: bed.building_code,
+          roomTypeCode: bed.room_type_code,
+          pricingProductCode: bed.pricing_product_code,
+          capacity: 1,
+          childUnitIds: [],
+          children: [],
+          days: [],
+          intervals: [],
+          conflicts: [],
+          allowedActions: []
+        });
+      }
+    }
+
+    const claimRows = await trx.selectFrom("inventory_claims as claim")
+      .leftJoin("stay_segments as segment", (join) => join
+        .onRef("segment.id", "=", "claim.source_id")
+        .on("claim.source_type", "=", "ORDER_SEGMENT"))
+      .leftJoin("stays as stay", "stay.id", "segment.stay_id")
+      .leftJoin("orders as order", "order.id", "stay.order_id")
+      .leftJoin("amendments as amendment", "amendment.id", "segment.amendment_id")
+      .leftJoin("maintenance_locks as maintenance", (join) => join
+        .onRef("maintenance.id", "=", "claim.source_id")
+        .on("claim.source_type", "=", "MAINTENANCE"))
+      .leftJoin("internal_use_blocks as internal", (join) => join
+        .onRef("internal.id", "=", "claim.source_id")
+        .on("claim.source_type", "=", "INTERNAL_USE"))
+      .select([
+        "claim.id as claim_id", "claim.room_id", "claim.inventory_unit_id", "claim.service_date",
+        "claim.source_type", "claim.source_id", "claim.active", "claim.created_at", "claim.released_at",
+        "segment.id as segment_id", "segment.stay_id", "segment.segment_type",
+        "segment.arrival_date as segment_arrival_date", "segment.departure_date as segment_departure_date",
+        "segment.created_at as segment_created_at",
+        "stay.status as stay_status", "order.id as order_id", "order.status as order_status", "order.stay_type",
+        "order.arrival_date as order_arrival_date", "order.departure_date as order_departure_date", "order.primary_guest_snapshot",
+        "order.free_stay_reason", "amendment.command_id as segment_command_id",
+        "maintenance.id as maintenance_id", "maintenance.arrival_date as maintenance_arrival_date",
+        "maintenance.departure_date as maintenance_departure_date", "maintenance.reason as maintenance_reason", "maintenance.status as maintenance_status",
+        "maintenance.created_by_command_id as maintenance_created_command_id",
+        "maintenance.released_by_command_id as maintenance_released_command_id",
+        "internal.id as internal_id", "internal.arrival_date as internal_arrival_date",
+        "internal.departure_date as internal_departure_date", "internal.reason as internal_reason", "internal.status as internal_status",
+        "internal.created_by_command_id as internal_created_command_id",
+        "internal.released_by_command_id as internal_released_command_id"
+      ])
+      .where("claim.property_id", "=", options.propertyId)
+      .where((expression) => expression.or([
+        expression("claim.service_date", "=", businessDate),
+        ...(roomIds.length > 0 ? [expression.and([
+          expression("claim.room_id", "in", roomIds),
+          expression("claim.service_date", ">=", options.arrivalDate),
+          expression("claim.service_date", "<", options.departureDate)
+        ])] : [])
+      ]))
+      .orderBy("claim.service_date")
+      .orderBy("claim.id")
+      .execute();
+
+    const activeOrderIds = [...new Set(claimRows.flatMap((row) => row.source_type === "ORDER_SEGMENT"
+      && row.active && row.order_id ? [row.order_id] : []))];
+    const activeOrderTimelineRows = activeOrderIds.length === 0 ? [] : await trx
+      .selectFrom("inventory_claims as claim")
+      .innerJoin("stay_segments as segment", (join) => join
+        .onRef("segment.id", "=", "claim.source_id")
+        .on("claim.source_type", "=", "ORDER_SEGMENT"))
+      .innerJoin("stays as stay", "stay.id", "segment.stay_id")
+      .select([
+        "claim.id as claim_id", "claim.inventory_unit_id", "claim.service_date",
+        "stay.order_id"
+      ])
+      .where("claim.property_id", "=", options.propertyId)
+      .where("claim.active", "=", true)
+      .where("stay.order_id", "in", activeOrderIds)
+      .orderBy("stay.order_id")
+      .orderBy("claim.service_date")
+      .orderBy("claim.id")
+      .execute();
+    const activeOrderRunByClaimId = new Map<string, { sourceKey: string; startDate: string; endDate: string }>();
+    const timelineByOrder = new Map<string, typeof activeOrderTimelineRows>();
+    for (const row of activeOrderTimelineRows) {
+      const rows = timelineByOrder.get(row.order_id) ?? [];
+      rows.push(row);
+      timelineByOrder.set(row.order_id, rows);
+    }
+    for (const [orderId, rows] of timelineByOrder) {
+      let run: typeof rows = [];
+      const flush = () => {
+        if (run.length === 0) return;
+        const startDate = run[0]!.service_date;
+        const endDate = dateAfter(run.at(-1)!.service_date);
+        const sourceKey = `order:${orderId}:unit:${run[0]!.inventory_unit_id}:run:${startDate}`;
+        for (const item of run) activeOrderRunByClaimId.set(item.claim_id, { sourceKey, startDate, endDate });
+        run = [];
+      };
+      for (const row of rows) {
+        const previous = run.at(-1);
+        if (previous && (previous.inventory_unit_id !== row.inventory_unit_id
+          || dateAfter(previous.service_date) !== row.service_date)) flush();
+        run.push(row);
+      }
+      flush();
+    }
+
+    const completedOrderIds = [...new Set(claimRows.flatMap((row) => row.source_type === "ORDER_SEGMENT"
+      && !row.active && row.stay_status === "COMPLETED" && row.order_id ? [row.order_id] : []))];
+    const completedOrderClaimCandidates = completedOrderIds.length === 0 ? [] : await trx
+      .selectFrom("inventory_claims as claim")
+      .innerJoin("stay_segments as segment", (join) => join
+        .onRef("segment.id", "=", "claim.source_id")
+        .on("claim.source_type", "=", "ORDER_SEGMENT"))
+      .innerJoin("stays as stay", "stay.id", "segment.stay_id")
+      .select([
+        "claim.id as claim_id", "claim.inventory_unit_id", "claim.service_date", "claim.created_at",
+        "stay.order_id"
+      ])
+      .where("claim.property_id", "=", options.propertyId)
+      .where("claim.active", "=", false)
+      .where("stay.status", "=", "COMPLETED")
+      .where("stay.order_id", "in", completedOrderIds)
+      .orderBy("stay.order_id")
+      .orderBy("claim.service_date")
+      .orderBy("claim.created_at")
+      .orderBy("claim.id")
+      .execute();
+    const completedLatestByOrderDate = new Map<string, typeof completedOrderClaimCandidates[number]>();
+    for (const row of completedOrderClaimCandidates) {
+      const key = `${row.order_id}:${row.service_date}`;
+      const previous = completedLatestByOrderDate.get(key);
+      if (!previous || iso(row.created_at) > iso(previous.created_at)
+        || (iso(row.created_at) === iso(previous.created_at) && row.claim_id > previous.claim_id)) {
+        completedLatestByOrderDate.set(key, row);
+      }
+    }
+    const completedOrderRunByClaimId = new Map<string, { sourceKey: string; startDate: string; endDate: string }>();
+    const completedTimelineByOrder = new Map<string, typeof completedOrderClaimCandidates>();
+    for (const row of completedLatestByOrderDate.values()) {
+      const rows = completedTimelineByOrder.get(row.order_id) ?? [];
+      rows.push(row);
+      completedTimelineByOrder.set(row.order_id, rows);
+    }
+    for (const [orderId, rows] of completedTimelineByOrder) {
+      rows.sort((left, right) => left.service_date.localeCompare(right.service_date) || left.claim_id.localeCompare(right.claim_id));
+      let run: typeof rows = [];
+      const flush = () => {
+        if (run.length === 0) return;
+        const startDate = run[0]!.service_date;
+        const endDate = dateAfter(run.at(-1)!.service_date);
+        const sourceKey = `completed-order:${orderId}:unit:${run[0]!.inventory_unit_id}:run:${startDate}`;
+        for (const item of run) completedOrderRunByClaimId.set(item.claim_id, { sourceKey, startDate, endDate });
+        run = [];
+      };
+      for (const row of rows) {
+        const previous = run.at(-1);
+        if (previous && (previous.inventory_unit_id !== row.inventory_unit_id
+          || dateAfter(previous.service_date) !== row.service_date)) flush();
+        run.push(row);
+      }
+      flush();
+    }
+
+    const orderIdsForHistory = [...new Set([
+      ...operationalOrderRows.map((row) => row.order_id),
+      ...claimRows.flatMap((row) => row.order_id ? [row.order_id] : [])
+    ])];
+    const amendmentRows = orderIdsForHistory.length === 0 ? [] : await trx.selectFrom("amendments")
+      .select(["order_id", "amendment_type", "command_id", "created_at"])
+      .where("order_id", "in", orderIdsForHistory)
+      .orderBy("order_id")
+      .orderBy("sequence")
+      .execute();
+    const amendmentsByOrder = new Map<string, typeof amendmentRows>();
+    for (const amendment of amendmentRows) {
+      const rows = amendmentsByOrder.get(amendment.order_id) ?? [];
+      rows.push(amendment);
+      amendmentsByOrder.set(amendment.order_id, rows);
+    }
+
+    const events: ProjectionEvent[] = [...syntheticOccupancyEvents];
+    let partial = missingOperationalClaim || operationalOrdersTruncated || inactiveUnitsTruncated;
+    for (const row of claimRows) {
+      const claimRef = reference("CLAIM", row.claim_id, `Claim ${row.claim_id}`);
+      const fallbackHistory: RoomStatusHistoryDto = {
+        action: row.source_type,
+        actorId: null,
+        source: "UNKNOWN",
+        occurredAt: iso(row.created_at),
+        commandId: null,
+        receiptId: null,
+        correlationId: null
+      };
+      if (row.source_type === "ORDER_SEGMENT") {
+        const resolved = Boolean(row.segment_id && row.stay_id && row.order_id && row.order_status && row.stay_status);
+        if (!resolved) {
+          if (!row.active) continue;
+          partial = true;
+          events.push({
+            actualInventoryUnitId: row.inventory_unit_id,
+            roomId: row.room_id,
+            serviceDate: row.service_date,
+            sourceStartDate: row.service_date,
+            sourceEndDate: dateAfter(row.service_date),
+            sourceKey: `unknown:${row.claim_id}`,
+            sourceKind: "ORDER",
+            status: "UNKNOWN",
+            label: "Unresolved order claim",
+            primaryOccupantLabel: null,
+            reason: "The order or Stay source could not be resolved",
+            blocking: true,
+            current: true,
+            blockingFactKind: "CLAIM",
+            claimId: row.claim_id,
+            references: [claimRef],
+            histories: [fallbackHistory],
+            commandIds: [],
+            targetReference: null
+          });
+          continue;
+        }
+        const historicalCompleted = !row.active
+          && completedLatestByOrderDate.get(`${row.order_id}:${row.service_date}`)?.claim_id === row.claim_id;
+        if (!row.active && !historicalCompleted) continue;
+        const invalidActiveTerminal = row.active
+          && (row.order_status === "CANCELLED" || row.order_status === "NO_SHOW" || row.order_status === "CHECKED_OUT");
+        if (invalidActiveTerminal) {
+          partial = true;
+        }
+        const orderRef = reference("ORDER", row.order_id!, `Order ${row.order_id}`, `/orders/${row.order_id}`);
+        const stayRef = reference("STAY", row.stay_id!, `Stay ${row.stay_id}`);
+        const sourceKind: RoomStatusSourceKind = row.stay_type === "FREE" ? "FREE_STAY" : "ORDER";
+        const status: RoomStatusStatus = historicalCompleted || row.order_status === "CHECKED_IN" ? "IN_HOUSE" : "RESERVED";
+        const occupantLabel = primaryOccupantLabel(row.primary_guest_snapshot);
+        const projectedRun = row.active
+          ? activeOrderRunByClaimId.get(row.claim_id)
+          : historicalCompleted ? completedOrderRunByClaimId.get(row.claim_id) : undefined;
+        if ((row.active || historicalCompleted) && !projectedRun) partial = true;
+        events.push({
+          actualInventoryUnitId: row.inventory_unit_id,
+          roomId: row.room_id,
+          serviceDate: row.service_date,
+          sourceStartDate: projectedRun?.startDate ?? row.segment_arrival_date!,
+          sourceEndDate: projectedRun?.endDate ?? row.segment_departure_date!,
+          sourceKey: projectedRun?.sourceKey ?? `segment:${row.segment_id}`,
+          sourceKind,
+          status: invalidActiveTerminal ? "UNKNOWN" : status,
+          label: `${sourceKind === "FREE_STAY" ? "免费入住" : "订单"} ${row.order_id}`,
+          primaryOccupantLabel: occupantLabel,
+          reason: sourceKind === "FREE_STAY" ? row.free_stay_reason : null,
+          blocking: row.active,
+          current: row.active,
+          blockingFactKind: row.active ? "CLAIM" : null,
+          claimId: row.claim_id,
+          references: [claimRef, orderRef, stayRef],
+          histories: [fallbackHistory],
+          commandIds: row.segment_command_id ? [row.segment_command_id] : [],
+          targetReference: orderRef,
+          orderId: row.order_id!
+        });
+        continue;
+      }
+      if (row.source_type === "MAINTENANCE") {
+        if (!row.active) continue;
+        if (!row.maintenance_id || !row.maintenance_status) {
+          partial = true;
+          events.push({
+            actualInventoryUnitId: row.inventory_unit_id,
+            roomId: row.room_id,
+            serviceDate: row.service_date,
+            sourceStartDate: row.service_date,
+            sourceEndDate: dateAfter(row.service_date),
+            sourceKey: `unknown:${row.claim_id}`,
+            sourceKind: "MAINTENANCE",
+            status: "UNKNOWN",
+            label: "Unresolved maintenance claim",
+            primaryOccupantLabel: null,
+            reason: "The maintenance source could not be resolved",
+            blocking: true,
+            current: true,
+            blockingFactKind: "CLAIM",
+            claimId: row.claim_id,
+            references: [claimRef],
+            histories: [fallbackHistory],
+            commandIds: [],
+            targetReference: null
+          });
+          continue;
+        }
+        const blockRef = reference("BLOCK", row.maintenance_id, `Maintenance ${row.maintenance_id}`);
+        const invalidActiveReleased = row.maintenance_status !== "ACTIVE";
+        if (invalidActiveReleased) partial = true;
+        events.push({
+          actualInventoryUnitId: row.inventory_unit_id,
+          roomId: row.room_id,
+          serviceDate: row.service_date,
+          sourceStartDate: row.maintenance_arrival_date!,
+          sourceEndDate: row.maintenance_departure_date!,
+          sourceKey: `maintenance:${row.maintenance_id}`,
+          sourceKind: "MAINTENANCE",
+          status: invalidActiveReleased ? "UNKNOWN" : "MAINTENANCE",
+          label: invalidActiveReleased ? "Inconsistent maintenance lock" : "Maintenance lock",
+          primaryOccupantLabel: null,
+          reason: row.maintenance_reason,
+          blocking: row.active,
+          current: row.active,
+          blockingFactKind: row.active ? "CLAIM" : null,
+          claimId: row.claim_id,
+          references: [claimRef, blockRef],
+          histories: [fallbackHistory],
+          commandIds: [row.maintenance_created_command_id, row.maintenance_released_command_id].filter((id): id is string => Boolean(id)),
+          targetReference: blockRef
+        });
+        continue;
+      }
+      if (!row.active) continue;
+      if (!row.internal_id || !row.internal_status) {
+        partial = true;
+        events.push({
+          actualInventoryUnitId: row.inventory_unit_id,
+          roomId: row.room_id,
+          serviceDate: row.service_date,
+          sourceStartDate: row.service_date,
+          sourceEndDate: dateAfter(row.service_date),
+          sourceKey: `unknown:${row.claim_id}`,
+          sourceKind: "INTERNAL_USE",
+          status: "UNKNOWN",
+          label: "Unresolved internal-use claim",
+          primaryOccupantLabel: null,
+          reason: "The internal-use Block source could not be resolved",
+          blocking: true,
+          current: true,
+          blockingFactKind: "CLAIM",
+          claimId: row.claim_id,
+          references: [claimRef],
+          histories: [fallbackHistory],
+          commandIds: [],
+          targetReference: null
+        });
+        continue;
+      }
+      const blockRef = reference("BLOCK", row.internal_id, `Internal use ${row.internal_id}`);
+      const invalidActiveReleased = row.internal_status !== "ACTIVE";
+      if (invalidActiveReleased) partial = true;
+      events.push({
+        actualInventoryUnitId: row.inventory_unit_id,
+        roomId: row.room_id,
+        serviceDate: row.service_date,
+        sourceStartDate: row.internal_arrival_date!,
+        sourceEndDate: row.internal_departure_date!,
+        sourceKey: `internal:${row.internal_id}`,
+        sourceKind: "INTERNAL_USE",
+        status: invalidActiveReleased ? "UNKNOWN" : "INTERNAL_USE",
+        label: invalidActiveReleased ? "Inconsistent internal use" : "Internal use",
+        primaryOccupantLabel: null,
+        reason: row.internal_reason,
+        blocking: row.active,
+        current: row.active,
+        blockingFactKind: row.active ? "CLAIM" : null,
+        claimId: row.claim_id,
+        references: [claimRef, blockRef],
+        histories: [fallbackHistory],
+        commandIds: [row.internal_created_command_id, row.internal_released_command_id].filter((id): id is string => Boolean(id)),
+        targetReference: blockRef
+      });
+    }
+
+    const cleaningCandidates = await trx.selectFrom("cleaning_tasks")
+      .selectAll()
+      .where("property_id", "=", options.propertyId)
+      .where((expression) => expression.or([
+        expression("service_date", "<=", businessDate),
+        ...(roomIds.length > 0 ? [expression.and([
+          expression("room_id", "in", roomIds),
+          expression("service_date", ">=", options.arrivalDate),
+          expression("service_date", "<", options.departureDate)
+        ])] : [])
+      ]))
+      .where("status", "=", "PENDING")
+      .orderBy("service_date")
+      .orderBy("id")
+      .limit(ROOM_STATUS_OPERATIONAL_TASK_LIMIT + 1)
+      .execute();
+    const cleaningRowsTruncated = cleaningCandidates.length > ROOM_STATUS_OPERATIONAL_TASK_LIMIT;
+    if (cleaningRowsTruncated) partial = true;
+    const cleaningRows = cleaningCandidates.slice(0, ROOM_STATUS_OPERATIONAL_TASK_LIMIT);
+    for (const task of cleaningRows) {
+      const taskRef = reference("OPERATIONS", task.id, `Cleaning ${task.id}`);
+      const orderRef = reference("ORDER", task.order_id, `Order ${task.order_id}`, `/orders/${task.order_id}`);
+      events.push({
+        actualInventoryUnitId: task.inventory_unit_id,
+        roomId: task.room_id,
+        serviceDate: task.service_date,
+        sourceStartDate: task.service_date,
+        sourceEndDate: dateAfter(task.service_date),
+        sourceKey: `cleaning:${task.id}`,
+        sourceKind: "CLEANING",
+        status: "CLEANING",
+        label: "Cleaning pending",
+        primaryOccupantLabel: null,
+        reason: null,
+        blocking: false,
+        current: true,
+        blockingFactKind: null,
+        claimId: null,
+        references: [taskRef, orderRef, reference("STAY", task.stay_id, `Stay ${task.stay_id}`)],
+        histories: [],
+        commandIds: [task.created_by_command_id],
+        targetReference: taskRef
+      });
+    }
+
+    for (const unit of unitsById.values()) {
+      if (unit.active) continue;
+      for (const serviceDate of dates) {
+        const unitRef = reference("INVENTORY_UNIT", unit.id, unit.name);
+        events.push({
+          actualInventoryUnitId: unit.id,
+          roomId: unit.roomId,
+          serviceDate,
+          sourceStartDate: options.arrivalDate,
+          sourceEndDate: options.departureDate,
+          sourceKey: `unsellable:${unit.id}`,
+          sourceKind: "UNIT_UNSELLABLE",
+          status: "UNAVAILABLE",
+          label: "Unit unavailable",
+          primaryOccupantLabel: null,
+          reason: "The inventory unit is inactive",
+          blocking: true,
+          current: true,
+          blockingFactKind: "UNIT_UNSELLABLE",
+          claimId: null,
+          references: [unitRef],
+          histories: [],
+          commandIds: [],
+          targetReference: unitRef
+        });
+      }
+    }
+
+    const attachAmendments = (event: ProjectionEvent): ProjectionEvent => {
+      if (!event.orderId) return event;
+      const amendments = amendmentsByOrder.get(event.orderId) ?? [];
+      return {
+        ...event,
+        histories: uniqueHistories([
+          ...event.histories,
+          ...amendments.map((amendment): RoomStatusHistoryDto => ({
+            action: amendment.amendment_type,
+            actorId: null,
+            source: "UNKNOWN",
+            occurredAt: iso(amendment.created_at),
+            commandId: amendment.command_id,
+            receiptId: null,
+            correlationId: null
+          }))
+        ]),
+        commandIds: [...new Set([
+          ...event.commandIds,
+          ...amendments.flatMap((amendment) => amendment.command_id ? [amendment.command_id] : [])
+        ])]
+      };
+    };
+    const eventsWithAmendments = events.map(attachAmendments);
+    const taskSeedsWithAmendments = operationalTaskSeeds.map((seed) => ({ ...seed, event: attachAmendments(seed.event) }));
+    const commandIds = [...new Set([
+      ...eventsWithAmendments.flatMap((event) => event.commandIds),
+      ...taskSeedsWithAmendments.flatMap((seed) => seed.event.commandIds)
+    ])];
+    const commandProjections = await loadCommandProjections(trx, commandIds, options.requestingSubjectId);
+    const projectedEvents = eventsWithAmendments.map((event) => attachCommandProjection(event, commandProjections));
+    const gridEvents = projectedEvents.filter((event) => options.arrivalDate <= event.serviceDate && event.serviceDate < options.departureDate);
+    const taskExceptionEvents = projectedEvents.filter((event) => event.current
+      && (event.serviceDate === businessDate || event.sourceKind === "CLEANING" && event.serviceDate < businessDate)
+      && event.sourceKind !== "UNIT_UNSELLABLE"
+      && (event.sourceKind !== "ORDER" && event.sourceKind !== "FREE_STAY" || event.status === "UNKNOWN"));
+    const builtIntervals = buildIntervals(gridEvents, unitsById, options.accessLevel);
+    const uniqueTaskExceptionEvents = [...new Map(taskExceptionEvents.map((event) => [
+      `${event.sourceKey}:${event.actualInventoryUnitId}`,
+      event
+    ])).values()];
+    const sortedOperationalTasks: RoomStatusOperationalTaskDto[] = [
+      ...taskSeedsWithAmendments.map((seed) => operationalTaskFromSeed(seed, commandProjections, options.accessLevel)),
+      ...uniqueTaskExceptionEvents.map((event) => operationalTaskFromSeed({
+        taskKind: "EXCEPTION",
+        businessDate,
+        startDate: event.sourceStartDate,
+        endDate: event.sourceEndDate,
+        event
+      }, new Map(), options.accessLevel))
+    ].sort((left, right) => left.taskKind.localeCompare(right.taskKind)
+      || left.startDate.localeCompare(right.startDate)
+      || left.id.localeCompare(right.id));
+    if (sortedOperationalTasks.length > ROOM_STATUS_OPERATIONAL_TASK_LIMIT) partial = true;
+    const operationalTasks = sortedOperationalTasks.slice(0, ROOM_STATUS_OPERATIONAL_TASK_LIMIT);
+
+    const allRooms = roomRows.map((roomRow) => {
+      const baseRoom = unitsById.get(roomRow.id)!;
+      const children = baseRoom.childUnitIds.map((childId) => {
+        const child = unitsById.get(childId)!;
+        return assembleUnit(
+          child,
+          dates,
+          builtIntervals.byUnit.get(child.id) ?? [],
+          builtIntervals.claimIdsByIntervalAndDate,
+          options.accessLevel
+        );
+      });
+      return {
+        ...assembleUnit(
+          baseRoom,
+          dates,
+          builtIntervals.byUnit.get(baseRoom.id) ?? [],
+          builtIntervals.claimIdsByIntervalAndDate,
+          options.accessLevel
+        ),
+        children
+      };
+    });
+    const filterOptions = roomStatusFilterOptions(allRooms);
+    const filteredRooms = filterRooms(allRooms, filters);
+    const totalRooms = filteredRooms.length;
+    const rooms = filteredRooms.slice(page * pageSize, (page + 1) * pageSize);
+
+    return {
+      propertyId: options.propertyId,
+      businessDate,
+      range: { arrivalDate: options.arrivalDate, departureDate: options.departureDate },
+      dates,
+      asOf,
+      freshUntil,
+      revision: String(revisionRow?.revision ?? "0"),
+      accessLevel: options.accessLevel,
+      projectionState: partial ? "PARTIAL" : "READY",
+      filterOptions,
+      page: {
+        index: page,
+        size: pageSize,
+        totalRooms,
+        totalPages: totalRooms === 0 ? 0 : Math.ceil(totalRooms / pageSize)
+      },
+      operationalTasks,
+      rooms
+    };
+  });
+}

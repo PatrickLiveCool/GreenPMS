@@ -4,4 +4,5 @@ export * from "./inventory.ts";
 export * from "./members.ts";
 export * from "./orders.ts";
 export * from "./reference-catalog.ts";
+export * from "./room-status.ts";
 export * from "./schema.ts";

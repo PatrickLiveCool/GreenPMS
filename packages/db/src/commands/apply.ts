@@ -1,7 +1,7 @@
 import { sql, type Transaction } from "kysely";
 import { DomainError, type CommandReason, type CommandType, type CoverageItemDto } from "@qintopia/contracts";
-import { enumerateServiceDates, newId, parseLocalDate, requireTransactionReference, validateBookingChannel } from "@qintopia/domain";
-import { createInventoryClaims, loadInventoryUnit, lockRoomDays, lockUnitDates, releaseInventoryClaims } from "../inventory.ts";
+import { enumerateServiceDates, newId, parseLocalDate, requireTransactionReference, todayInTimeZone, validateBookingChannel } from "@qintopia/domain";
+import { assertUnitAvailable, createInventoryClaims, loadInventoryUnit, loadInventoryUnitIncludingInactive, lockRoomDays, lockUnitDates, releaseInventoryClaims } from "../inventory.ts";
 import { appendAmendment, consumeCoverage, holdCoverage, incrementContractAndLotVersions, loadActiveStayTimeline, loadOrderContext, lockOrder, reconcileCoverage, releaseCoverage, type StayTimelineItem } from "../orders.ts";
 import { loadStoredQuote, lockEntitlementLots } from "../pricing-service.ts";
 import type { Database } from "../schema.ts";
@@ -133,7 +133,30 @@ export async function lockCommandResources(trx: Transaction<Database>, commandTy
   if (commandType === "RELEASE_MAINTENANCE") {
     const lock = await trx.selectFrom("maintenance_locks").selectAll().where("id", "=", requireString(input, "maintenanceLockId")).where("property_id", "=", propertyId).forUpdate().executeTakeFirst();
     if (!lock) throw new DomainError("NOT_FOUND", "Maintenance lock not found", 404);
-    await lockUnitDates(trx, propertyId, lock.inventory_unit_id, lock.arrival_date, lock.departure_date);
+    await lockUnitDates(trx, propertyId, lock.inventory_unit_id, lock.arrival_date, lock.departure_date, true);
+    return;
+  }
+  if (commandType === "PLACE_INTERNAL_USE") {
+    await lockUnitDates(trx, propertyId, requireString(input, "inventoryUnitId"), requireString(input, "arrivalDate"), requireString(input, "departureDate"));
+    return;
+  }
+  if (commandType === "RELEASE_INTERNAL_USE") {
+    const block = await trx.selectFrom("internal_use_blocks").selectAll()
+      .where("id", "=", requireString(input, "internalUseBlockId"))
+      .where("property_id", "=", propertyId)
+      .forUpdate()
+      .executeTakeFirst();
+    if (!block) throw new DomainError("NOT_FOUND", "Internal-use Block not found", 404);
+    await lockUnitDates(trx, propertyId, block.inventory_unit_id, block.arrival_date, block.departure_date, true);
+    return;
+  }
+  if (commandType === "COMPLETE_CLEANING") {
+    const task = await trx.selectFrom("cleaning_tasks").select("id")
+      .where("id", "=", requireString(input, "cleaningTaskId"))
+      .where("property_id", "=", propertyId)
+      .forUpdate()
+      .executeTakeFirst();
+    if (!task) throw new DomainError("NOT_FOUND", "Cleaning task not found", 404);
     return;
   }
   if (commandType === "ADD_MEMBER_ENTITLEMENT_LOT") {
@@ -353,7 +376,8 @@ export async function applyCommand(trx: Transaction<Database>, options: {
     await trx.insertInto("amendments").values({
       id: amendmentId, order_id: orderId, sequence: 1, amendment_type: "CREATE_ORDER",
       reason_code: options.reason.code, reason_note: options.reason.note, prior_version: 0, new_version: 1,
-      payload: { quoteId: effect.quoteId, inventoryUnitId: unitId, arrivalDate, departureDate, bookingChannelCode, channelOrderReference, freeStayReason }
+      payload: { quoteId: effect.quoteId, inventoryUnitId: unitId, arrivalDate, departureDate, bookingChannelCode, channelOrderReference, freeStayReason },
+      command_id: options.commandId
     }).execute();
     await trx.insertInto("stay_segments").values({
       id: segmentId, stay_id: stayId, sequence: 1, inventory_unit_id: unitId, arrival_date: arrivalDate,
@@ -384,7 +408,8 @@ export async function applyCommand(trx: Transaction<Database>, options: {
     const departureDate = requireString(effect, "departureDate");
     await trx.insertInto("maintenance_locks").values({
       id: maintenanceLockId, property_id: propertyId, inventory_unit_id: unitId, arrival_date: arrivalDate,
-      departure_date: departureDate, reason: requireString(effect, "reason"), status: "ACTIVE", version: 1, released_at: null
+      departure_date: departureDate, reason: requireString(effect, "reason"), status: "ACTIVE", version: 1,
+      created_by_command_id: options.commandId, released_by_command_id: null, released_at: null
     }).execute();
     const unit = await loadInventoryUnit(trx, propertyId, unitId);
     await createInventoryClaims(trx, { propertyId, unit, dates: enumerateServiceDates(arrivalDate, departureDate), sourceType: "MAINTENANCE", sourceId: maintenanceLockId });
@@ -394,8 +419,81 @@ export async function applyCommand(trx: Transaction<Database>, options: {
   if (options.commandType === "RELEASE_MAINTENANCE") {
     const maintenanceLockId = requireString(effect, "maintenanceLockId");
     await releaseInventoryClaims(trx, "MAINTENANCE", [maintenanceLockId]);
-    await trx.updateTable("maintenance_locks").set({ status: "RELEASED", version: sql`version + 1`, released_at: new Date() }).where("id", "=", maintenanceLockId).execute();
+    await trx.updateTable("maintenance_locks").set({
+      status: "RELEASED",
+      version: sql`version + 1`,
+      released_by_command_id: options.commandId,
+      released_at: new Date()
+    }).where("id", "=", maintenanceLockId).execute();
     return { persistedResult: { maintenanceLockId, status: "RELEASED" }, resourceRefs: [maintenanceLockId], factRefs: [] };
+  }
+
+  if (options.commandType === "PLACE_INTERNAL_USE") {
+    const internalUseBlockId = newId("block");
+    const unitObject = nestedObject(effect, "inventoryUnit");
+    const unitId = requireString(unitObject, "id");
+    const arrivalDate = requireString(effect, "arrivalDate");
+    const departureDate = requireString(effect, "departureDate");
+    const unit = await loadInventoryUnit(trx, propertyId, unitId);
+    await trx.insertInto("internal_use_blocks").values({
+      id: internalUseBlockId,
+      property_id: propertyId,
+      inventory_unit_id: unitId,
+      room_id: unit.roomId,
+      arrival_date: arrivalDate,
+      departure_date: departureDate,
+      reason: requireString(effect, "reason"),
+      status: "ACTIVE",
+      version: 1,
+      created_by_command_id: options.commandId,
+      released_by_command_id: null,
+      released_at: null
+    }).execute();
+    const claimIds = await createInventoryClaims(trx, {
+      propertyId,
+      unit,
+      dates: enumerateServiceDates(arrivalDate, departureDate),
+      sourceType: "INTERNAL_USE",
+      sourceId: internalUseBlockId
+    });
+    return {
+      persistedResult: { internalUseBlockId, inventoryUnitId: unitId, arrivalDate, departureDate, status: "ACTIVE" },
+      resourceRefs: [internalUseBlockId],
+      factRefs: claimIds
+    };
+  }
+
+  if (options.commandType === "RELEASE_INTERNAL_USE") {
+    const internalUseBlockId = requireString(effect, "internalUseBlockId");
+    const claimIds = await releaseInventoryClaims(trx, "INTERNAL_USE", [internalUseBlockId]);
+    const updated = await trx.updateTable("internal_use_blocks").set({
+      status: "RELEASED",
+      version: sql`version + 1`,
+      released_by_command_id: options.commandId,
+      released_at: new Date()
+    }).where("id", "=", internalUseBlockId).where("status", "=", "ACTIVE").returning("id").executeTakeFirst();
+    if (!updated) throw new DomainError("AGGREGATE_VERSION_CONFLICT", "Internal-use Block is already released", 409);
+    return {
+      persistedResult: { internalUseBlockId, status: "RELEASED" },
+      resourceRefs: [internalUseBlockId],
+      factRefs: claimIds
+    };
+  }
+
+  if (options.commandType === "COMPLETE_CLEANING") {
+    const cleaningTaskId = requireString(effect, "cleaningTaskId");
+    const updated = await trx.updateTable("cleaning_tasks").set({
+      status: "COMPLETED",
+      version: sql`version + 1`,
+      completed_by_command_id: options.commandId,
+      completed_at: new Date()
+    }).where("id", "=", cleaningTaskId).where("status", "=", "PENDING").returning("id").executeTakeFirst();
+    if (!updated) throw new DomainError("AGGREGATE_VERSION_CONFLICT", "Cleaning task is already completed", 409);
+    return {
+      persistedResult: { cleaningTaskId, status: "COMPLETED" },
+      resourceRefs: [cleaningTaskId],
+      factRefs: []
+    };
   }
 
   if (options.commandType === "ADD_MEMBER_ENTITLEMENT_LOT") {
@@ -526,7 +624,8 @@ export async function applyCommand(trx: Transaction<Database>, options: {
   if (["SHORTEN_STAY", "EXTEND_STAY", "MOVE_UNIT"].includes(options.commandType)) {
     const amendmentId = await appendAmendment(trx, {
       orderId, sequence: context.order.version + 1, amendmentType: options.commandType,
-      reasonCode: options.reason.code, reasonNote: options.reason.note, priorVersion: context.order.version, payload: effect
+      reasonCode: options.reason.code, reasonNote: options.reason.note, priorVersion: context.order.version, payload: effect,
+      commandId: options.commandId
     });
     const segmentId = newId("segment");
     const pricing = pricingSnapshot(effect);
@@ -539,14 +638,23 @@ export async function applyCommand(trx: Transaction<Database>, options: {
     const coverageIds: string[] = [];
     const coverageFactIds: string[] = [];
 
-    if (options.commandType === "SHORTEN_STAY") {
+    if (options.commandType === "SHORTEN_STAY" || options.commandType === "EXTEND_STAY") {
       departureDate = requireString(nestedObject(effect, "after"), "departureDate");
+    }
+    if (options.commandType === "MOVE_UNIT") segmentType = "MOVE";
+
+    await trx.insertInto("stay_segments").values({
+      id: segmentId, stay_id: context.stay.id, sequence: context.currentSegment.sequence + 1,
+      inventory_unit_id: unitId, arrival_date: segmentArrival, departure_date: departureDate,
+      segment_type: segmentType, supersedes_segment_id: context.currentSegment.id, amendment_id: amendmentId
+    }).execute();
+
+    if (options.commandType === "SHORTEN_STAY") {
       await releaseInventoryClaims(trx, "ORDER_SEGMENT", context.segmentIds, departureDate);
       const released = await releaseCoverage(trx, orderId, options.commandId, { fromDate: departureDate, reholdCoverageSet: pricing.coverageSet });
       coverageIds.push(...released.coverageIds);
       coverageFactIds.push(...released.factIds);
     } else if (options.commandType === "EXTEND_STAY") {
-      departureDate = requireString(nestedObject(effect, "after"), "departureDate");
       const unit = await loadInventoryUnit(trx, propertyId, unitId);
       await createInventoryClaims(trx, { propertyId, unit, dates: enumerateServiceDates(context.order.departure_date, departureDate), sourceType: "ORDER_SEGMENT", sourceId: segmentId });
     } else {
@@ -557,13 +665,7 @@ export async function applyCommand(trx: Transaction<Database>, options: {
       coverageFactIds.push(...released.factIds);
       const unit = await loadInventoryUnit(trx, propertyId, unitId);
       await createInventoryClaims(trx, { propertyId, unit, dates: enumerateServiceDates(effectiveDate, departureDate), sourceType: "ORDER_SEGMENT", sourceId: segmentId });
-      segmentType = "MOVE";
     }
-    await trx.insertInto("stay_segments").values({
-      id: segmentId, stay_id: context.stay.id, sequence: context.currentSegment.sequence + 1,
-      inventory_unit_id: unitId, arrival_date: segmentArrival, departure_date: departureDate,
-      segment_type: segmentType, supersedes_segment_id: context.currentSegment.id, amendment_id: amendmentId
-    }).execute();
     const revisionId = await insertRevision(trx, {
       orderId, revisionNo: context.revision.revisionNo + 1, amendmentId,
       policyVersionId: context.order.pricing_policy_version_id,
@@ -594,7 +696,8 @@ export async function applyCommand(trx: Transaction<Database>, options: {
   if (options.commandType === "REPRICE_ORDER" || options.commandType === "REFRESH_MEMBER_COVERAGE") {
     const amendmentId = await appendAmendment(trx, {
       orderId, sequence: context.order.version + 1, amendmentType: options.commandType,
-      reasonCode: options.reason.code, reasonNote: options.reason.note, priorVersion: context.order.version, payload: effect
+      reasonCode: options.reason.code, reasonNote: options.reason.note, priorVersion: context.order.version, payload: effect,
+      commandId: options.commandId
     });
     const pricing = pricingSnapshot(effect);
     const revisionId = await insertRevision(trx, {
@@ -661,10 +764,12 @@ export async function applyCommand(trx: Transaction<Database>, options: {
   if (target) {
     const amendmentId = await appendAmendment(trx, {
       orderId, sequence: context.order.version + 1, amendmentType: options.commandType,
-      reasonCode: options.reason.code, reasonNote: options.reason.note, priorVersion: context.order.version, payload: effect
+      reasonCode: options.reason.code, reasonNote: options.reason.note, priorVersion: context.order.version, payload: effect,
+      commandId: options.commandId
     });
     let coverageRefs = { coverageIds: [] as string[], factIds: [] as string[] };
     let statusPricingRevisionId: string | undefined;
+    let cleaningTaskId: string | undefined;
     if (context.order.stay_type === "FREE" && (options.commandType === "CANCEL_ORDER" || options.commandType === "MARK_NO_SHOW")) {
       const prior = await trx.selectFrom("pricing_revisions").selectAll().where("id", "=", context.revision.id).executeTakeFirstOrThrow();
       const coverageSet = prior.coverage_set as CoverageItemDto[];
@@ -692,10 +797,46 @@ export async function applyCommand(trx: Transaction<Database>, options: {
       });
     }
     if (options.commandType === "CHECK_IN") {
+      const property = await trx.selectFrom("properties")
+        .select("timezone")
+        .where("id", "=", propertyId)
+        .executeTakeFirstOrThrow();
+      const clock = await sql<{ as_of: Date }>`select transaction_timestamp() as as_of`.execute(trx);
+      const businessDate = todayInTimeZone(property.timezone, clock.rows[0]!.as_of);
+      if (context.order.departure_date <= businessDate) {
+        const nextBusinessDate = new Date(parseLocalDate(businessDate).getTime() + 86_400_000).toISOString().slice(0, 10);
+        const unit = await lockUnitDates(
+          trx,
+          propertyId,
+          context.currentSegment.inventoryUnitId,
+          businessDate,
+          nextBusinessDate
+        );
+        await assertUnitAvailable(trx, unit, [businessDate], context.segmentIds);
+      }
       coverageRefs = await consumeCoverage(trx, orderId, options.commandId);
     }
     if (options.commandType === "CHECK_OUT") {
       await releaseInventoryClaims(trx, "ORDER_SEGMENT", context.segmentIds);
+      const cleaningTask = nestedObject(effect, "cleaningTask");
+      const inventoryUnitId = requireString(cleaningTask, "inventoryUnitId");
+      const serviceDate = requireString(cleaningTask, "serviceDate");
+      const unit = await loadInventoryUnitIncludingInactive(trx, propertyId, inventoryUnitId);
+      cleaningTaskId = newId("cleaning");
+      await trx.insertInto("cleaning_tasks").values({
+        id: cleaningTaskId,
+        property_id: propertyId,
+        order_id: orderId,
+        stay_id: context.stay.id,
+        inventory_unit_id: inventoryUnitId,
+        room_id: unit.roomId,
+        service_date: serviceDate,
+        status: "PENDING",
+        version: 1,
+        created_by_command_id: options.commandId,
+        completed_by_command_id: null,
+        completed_at: null
+      }).execute();
     }
     if (options.commandType === "CANCEL_ORDER" || options.commandType === "MARK_NO_SHOW") {
       coverageRefs = await releaseCoverage(trx, orderId, options.commandId);
@@ -720,9 +861,10 @@ export async function applyCommand(trx: Transaction<Database>, options: {
             coverageCount: coverageRefs.coverageIds.length
           }
         } : {}),
-        ...(statusPricingRevisionId ? { pricingRevisionId: statusPricingRevisionId } : {})
+        ...(statusPricingRevisionId ? { pricingRevisionId: statusPricingRevisionId } : {}),
+        ...(cleaningTaskId ? { cleaningTaskId } : {})
       },
-      resourceRefs: [orderId, amendmentId, ...(statusPricingRevisionId ? [statusPricingRevisionId] : []), ...coverageRefs.coverageIds],
+      resourceRefs: [orderId, amendmentId, ...(statusPricingRevisionId ? [statusPricingRevisionId] : []), ...(cleaningTaskId ? [cleaningTaskId] : []), ...coverageRefs.coverageIds],
       factRefs: coverageRefs.factIds
     };
   }

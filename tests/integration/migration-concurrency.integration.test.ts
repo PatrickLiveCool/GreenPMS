@@ -1,8 +1,10 @@
 import { execFile } from "node:child_process";
-import { readdir } from "node:fs/promises";
+import { readFile, readdir } from "node:fs/promises";
 import { promisify } from "node:util";
 import pg from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { createDatabase } from "@qintopia/db";
+import { seedDemo } from "../../packages/db/src/seed.ts";
 
 const execFileAsync = promisify(execFile);
 const adminUrl = process.env.MIGRATION_CONCURRENCY_ADMIN_DATABASE_URL
@@ -22,7 +24,7 @@ async function dropDatabase(): Promise<void> {
   }
 }
 
-beforeAll(async () => {
+async function recreateDatabase(): Promise<void> {
   await dropDatabase();
   const admin = new pg.Client({ connectionString: adminUrl });
   await admin.connect();
@@ -31,18 +33,24 @@ beforeAll(async () => {
   } finally {
     await admin.end();
   }
+}
+
+function runMigration() {
+  return execFileAsync(
+    process.execPath,
+    ["--import", "tsx", "packages/db/src/migrate.ts"],
+    { cwd: process.cwd(), env: { ...process.env, DATABASE_URL: databaseUrl.toString() } }
+  );
+}
+
+beforeAll(async () => {
+  await recreateDatabase();
 });
 
 afterAll(dropDatabase);
 
 describe("database migration concurrency", () => {
   it("serializes two fresh-database migrators and applies every migration once", async () => {
-    const runMigration = () => execFileAsync(
-      process.execPath,
-      ["--import", "tsx", "packages/db/src/migrate.ts"],
-      { cwd: process.cwd(), env: { ...process.env, DATABASE_URL: databaseUrl.toString() } }
-    );
-
     const outcomes = await Promise.allSettled([runMigration(), runMigration()]);
     expect(outcomes.every((outcome) => outcome.status === "fulfilled")).toBe(true);
 
@@ -54,10 +62,89 @@ describe("database migration concurrency", () => {
         .sort();
       const rows = await client.query<{ name: string }>("SELECT name FROM schema_migrations ORDER BY name");
       expect(rows.rows.map((row) => row.name)).toEqual(expectedMigrations);
-      expect(expectedMigrations).toHaveLength(12);
-      expect(expectedMigrations).toContain("012_legacy_demo_inventory_catalog_backfill.sql");
+      expect(expectedMigrations).toHaveLength(13);
+      expect(expectedMigrations).toContain("013_room_status_operations.sql");
     } finally {
       await client.end();
+    }
+  });
+
+  it("upgrades a populated revision-010 database with a historical maintenance lock longer than 90 nights", async () => {
+    await recreateDatabase();
+    const migrationNames = (await readdir("packages/db/src/migrations"))
+      .filter((name) => /^\d+.*\.sql$/.test(name))
+      .sort();
+    const client = new pg.Client({ connectionString: databaseUrl.toString() });
+    await client.connect();
+    try {
+      for (const migrationName of migrationNames.slice(0, 10)) {
+        await client.query(await readFile(`packages/db/src/migrations/${migrationName}`, "utf8"));
+        await client.query("INSERT INTO schema_migrations(name) VALUES ($1)", [migrationName]);
+      }
+    } finally {
+      await client.end();
+    }
+
+    const seeded = createDatabase(databaseUrl.toString());
+    try {
+      await seedDemo(seeded);
+    } finally {
+      await seeded.destroy();
+    }
+
+    const legacy = new pg.Client({ connectionString: databaseUrl.toString() });
+    await legacy.connect();
+    try {
+      await legacy.query("ALTER TABLE inventory_units DISABLE TRIGGER inventory_units_protect_identity");
+      await legacy.query(`
+        UPDATE inventory_units
+        SET name = CASE id
+              WHEN 'unit_room_101' THEN 'Room 101'
+              WHEN 'unit_room_102' THEN 'Room 102'
+              WHEN 'unit_room_101_bed_a' THEN 'Room 101 / Bed A'
+              WHEN 'unit_room_101_bed_b' THEN 'Room 101 / Bed B'
+            END,
+            catalog_version = NULL,
+            building_code = NULL,
+            room_type_code = NULL,
+            pricing_product_code = NULL,
+            inventory_basis = NULL,
+            code_provenance = NULL,
+            physical_bed_count = NULL
+        WHERE id IN ('unit_room_101', 'unit_room_102', 'unit_room_101_bed_a', 'unit_room_101_bed_b')
+      `);
+      await legacy.query("ALTER TABLE inventory_units ENABLE TRIGGER inventory_units_protect_identity");
+      await legacy.query(`
+        INSERT INTO maintenance_locks (
+          id, property_id, inventory_unit_id, arrival_date, departure_date, reason, status, version, released_at
+        ) VALUES (
+          'maint_legacy_long_interval', 'prop_qintopia_demo', 'unit_room_102',
+          '2030-01-01', '2030-07-01', 'Historical long maintenance interval', 'ACTIVE', 1, NULL
+        )
+      `);
+    } finally {
+      await legacy.end();
+    }
+
+    const outcome = await runMigration();
+    expect(outcome.stderr).toBe("");
+
+    const upgraded = new pg.Client({ connectionString: databaseUrl.toString() });
+    await upgraded.connect();
+    try {
+      const rows = await upgraded.query<{ name: string }>("SELECT name FROM schema_migrations ORDER BY name");
+      expect(rows.rows.map((row) => row.name)).toEqual(migrationNames);
+      const catalog = await upgraded.query<{ catalog_version: string | null }>(
+        "SELECT catalog_version FROM inventory_units WHERE id = 'unit_room_101'"
+      );
+      expect(catalog.rows[0]?.catalog_version).not.toBeNull();
+      expect((await upgraded.query("SELECT 1 FROM room_status_revisions LIMIT 1")).rowCount).toBe(1);
+      const longMaintenance = await upgraded.query<{ nights: number }>(
+        "SELECT departure_date - arrival_date AS nights FROM maintenance_locks WHERE id = 'maint_legacy_long_interval'"
+      );
+      expect(longMaintenance.rows[0]?.nights).toBeGreaterThan(90);
+    } finally {
+      await upgraded.end();
     }
   });
 });

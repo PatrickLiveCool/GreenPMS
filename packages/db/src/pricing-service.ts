@@ -3,6 +3,7 @@ import { DomainError, type InventoryUnitKind, type QuoteDto, type StayType, type
 import { calculatePricing, entitlementKindFor, enumerateServiceDates, isTransientDuration, newId, stableHash, type CoverageCandidate, type DurationBandAnchors, type PricingPolicy } from "@qintopia/domain";
 import { entitlementAvailableBalance, parsePostgresBigInt } from "./entitlement-balance.ts";
 import { listAvailability, loadInventoryUnit, type DbExecutor } from "./inventory.ts";
+import { propertyLocalToday } from "./members.ts";
 import type { Database } from "./schema.ts";
 
 export interface QuoteRequest {
@@ -57,6 +58,7 @@ export async function allocateCoverageCandidates(db: DbExecutor, options: {
   if (!contract || contract.status !== "ACTIVE") throw new DomainError("ENTITLEMENT_CONFLICT", "Membership contract is not active", 409);
 
   const unitKind = entitlementKindFor(options.inventoryUnitKind);
+  const propertyToday = await propertyLocalToday(db, options.propertyId);
   const lots = await db.selectFrom("entitlement_lots")
     .leftJoin("entitlement_ledger", "entitlement_ledger.lot_id", "entitlement_lots.id")
     .select([
@@ -73,7 +75,8 @@ export async function allocateCoverageCandidates(db: DbExecutor, options: {
     .orderBy("entitlement_lots.id")
     .execute();
 
-  const eligibleLots = lots.filter((lot) => parsePostgresBigInt(lot.expire_count, "Entitlement expiration count") === 0n);
+  const eligibleLots = lots.filter((lot) => lot.expires_on >= propertyToday
+    && parsePostgresBigInt(lot.expire_count, "Entitlement expiration count") === 0n);
   const remaining = new Map(eligibleLots.map((lot) => [lot.id, entitlementAvailableBalance(lot.total_units, lot.ledger_delta)]));
   const result: CoverageCandidate[] = [];
   for (const preserved of options.preserved ?? []) {

@@ -26,6 +26,9 @@ const commandInputContract: Record<(typeof commandTypes)[number], { required: st
   MARK_NO_SHOW: { required: ["propertyId", "orderId"], properties: ["propertyId", "orderId"] },
   LOCK_MAINTENANCE: { required: ["propertyId", "inventoryUnitId", "arrivalDate", "departureDate", "reason"], properties: ["propertyId", "inventoryUnitId", "arrivalDate", "departureDate", "reason"] },
   RELEASE_MAINTENANCE: { required: ["propertyId", "maintenanceLockId"], properties: ["propertyId", "maintenanceLockId"] },
+  PLACE_INTERNAL_USE: { required: ["propertyId", "inventoryUnitId", "arrivalDate", "departureDate", "reason"], properties: ["propertyId", "inventoryUnitId", "arrivalDate", "departureDate", "reason"] },
+  RELEASE_INTERNAL_USE: { required: ["propertyId", "internalUseBlockId"], properties: ["propertyId", "internalUseBlockId"] },
+  COMPLETE_CLEANING: { required: ["propertyId", "cleaningTaskId"], properties: ["propertyId", "cleaningTaskId"] },
   RECORD_COLLECTION: { required: ["propertyId", "orderId", "amountMinor", "method", "transactionReference"], properties: ["propertyId", "orderId", "amountMinor", "method", "transactionReference", "note"] },
   RECORD_REFUND: { required: ["propertyId", "orderId", "amountMinor", "referencesFactId", "method", "transactionReference"], properties: ["propertyId", "orderId", "amountMinor", "referencesFactId", "method", "transactionReference", "note"] },
   REVERSE_FACT: { required: ["propertyId", "orderId", "reversesFactId", "note"], properties: ["propertyId", "orderId", "reversesFactId", "note"] },
@@ -223,7 +226,7 @@ describe("OpenAPI 3.1 command contract", () => {
 
     const errorSchema = document.paths["/api/v1/quotes"].post.responses["400"].content["application/json"].schema;
     expect(errorSchema.additionalProperties).toBe(false);
-    expect(errorSchema.properties.details.anyOf).toHaveLength(12);
+    expect(errorSchema.properties.details.anyOf).toHaveLength(13);
     const receiptSchema = document.paths["/api/v1/receipts/{id}"].get.responses["200"].content["application/json"].schema;
     expect(JSON.stringify(receiptSchema)).not.toContain("tokenSecret");
     expect(JSON.stringify(receiptSchema)).toContain("bookingChannelCode");

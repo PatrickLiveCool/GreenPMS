@@ -672,12 +672,12 @@ describe("PostgreSQL core operations", () => {
   });
 
   it("records a zero-quantity expiration marker and prevents release or adjustment from reviving the lot", async () => {
+    const created = await createOrder(demo.roomId, "expire-held", { member: true, arrival: "2026-01-01", departure: "2026-01-03" });
+    const orderId = created.result!.orderId as string;
     await db.updateTable("entitlement_lots")
       .set({ expires_on: "2026-01-02" })
       .where("id", "=", demo.roomLotId)
       .execute();
-    const created = await createOrder(demo.roomId, "expire-held", { member: true, arrival: "2026-01-01", departure: "2026-01-03" });
-    const orderId = created.result!.orderId as string;
     const expired = await previewAndConfirm({
       commandType: "EXPIRE_MEMBER_ENTITLEMENT",
       input: { propertyId: demo.propertyId, entitlementLotId: demo.roomLotId, asOfDate: "2026-01-03" }

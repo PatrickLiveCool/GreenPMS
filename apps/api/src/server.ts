@@ -1,5 +1,6 @@
 import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import compress from "@fastify/compress";
 import cookie from "@fastify/cookie";
 import cors from "@fastify/cors";
 import rateLimit from "@fastify/rate-limit";
@@ -14,6 +15,7 @@ import {
   type CommandEnvelope,
   type CreateQuoteCommandInputDto,
   type InventoryUnitKind,
+  type RoomStatusBoardQueryDto,
   type RecoverableCommandType
 } from "@qintopia/contracts";
 import {
@@ -25,6 +27,7 @@ import {
   getMemberView,
   getOrderView,
   getReceipt,
+  getRoomStatusBoard,
   listAvailability,
   listMemberSummaries,
   loadReferenceCatalog,
@@ -64,6 +67,8 @@ import {
   ReferenceCatalogResponseSchema,
   ReceiptSchema,
   RecoverableCommandTypeSchema,
+  RoomStatusBoardSchema,
+  RoomStatusQuerySchema,
   StoredPreviewResponseSchema,
   TokensResponseSchema,
   WriteHeaders
@@ -91,6 +96,7 @@ function missingWriteHeaderError(error: unknown): { code: "IDEMPOTENCY_KEY_REQUI
 
 export async function buildServer(db: Kysely<Database>) {
   const app = Fastify({ logger: { level: process.env.LOG_LEVEL ?? "info" }, genReqId: () => crypto.randomUUID() });
+  await app.register(compress, { global: true, threshold: 1_024 });
   await app.register(cookie);
   await app.register(cors, { origin: process.env.WEB_ORIGIN ?? "http://127.0.0.1:4173", credentials: true });
   await app.register(rateLimit, {
@@ -217,6 +223,44 @@ export async function buildServer(db: Kysely<Database>) {
     const principal = await requirePrincipal(db, request);
     requirePropertyAccess(principal, id, "READ");
     return { propertyId: id, units: await listAvailability(db, id, query.arrivalDate, query.departureDate, query.unitKind) };
+  });
+
+  app.get("/api/v1/properties/:id/room-status", {
+    schema: {
+      tags: ["queries"],
+      summary: "Read the authoritative room and bed status projection",
+      params: IdParams,
+      querystring: RoomStatusQuerySchema,
+      response: {
+        200: RoomStatusBoardSchema,
+        400: ErrorResponse,
+        401: ErrorResponse,
+        403: ErrorResponse,
+        404: ErrorResponse,
+        429: ErrorResponse,
+        ...InternalErrorResponses
+      }
+    }
+  }, async (request) => {
+    const { id } = request.params as { id: string };
+    const query = request.query as RoomStatusBoardQueryDto;
+    const principal = await requirePrincipal(db, request);
+    requirePropertyAccess(principal, id, "READ");
+    return getRoomStatusBoard(db, {
+      propertyId: id,
+      arrivalDate: query.arrivalDate,
+      departureDate: query.departureDate,
+      accessLevel: principal.propertyAccess.get(id)!,
+      requestingSubjectId: principal.subjectId,
+      ...(query.page !== undefined ? { page: query.page } : {}),
+      ...(query.pageSize !== undefined ? { pageSize: query.pageSize } : {}),
+      ...(query.search !== undefined ? { search: query.search } : {}),
+      ...(query.roomType !== undefined ? { roomType: query.roomType } : {}),
+      ...(query.salesMode !== undefined ? { salesMode: query.salesMode } : {}),
+      ...(query.status !== undefined ? { status: query.status } : {}),
+      ...(query.minCapacity !== undefined ? { minCapacity: query.minCapacity } : {}),
+      ...(query.unitKind !== undefined ? { unitKind: query.unitKind } : {})
+    });
   });
 
   app.get("/api/v1/properties/:id/reference-catalog", {

@@ -1,4 +1,4 @@
-import type { CommandEnvelope, CommandReason, CommandType, ReceiptDto } from "@qintopia/contracts";
+import type { CommandEnvelope, CommandReason, CommandType, ReceiptDto, RoomStatusBoardDto, RoomStatusBoardQueryDto } from "@qintopia/contracts";
 import type {
   AvailabilityDto,
   ClientCommandMetadata,
@@ -106,6 +106,28 @@ export const api = {
     const query = new URLSearchParams({ arrivalDate, departureDate });
     if (unitKind) query.set("unitKind", unitKind);
     return request<AvailabilityDto>(`/api/v1/properties/${encodeURIComponent(propertyId)}/availability?${query.toString()}`);
+  },
+  roomStatus: (
+    propertyId: string,
+    input: RoomStatusBoardQueryDto,
+    signal?: AbortSignal
+  ) => {
+    const query = new URLSearchParams({
+      arrivalDate: input.arrivalDate,
+      departureDate: input.departureDate,
+      page: String(input.page ?? 0),
+      pageSize: String(input.pageSize ?? 40)
+    });
+    if (input.search) query.set("search", input.search);
+    if (input.roomType) query.set("roomType", input.roomType);
+    if (input.salesMode) query.set("salesMode", input.salesMode);
+    if (input.status) query.set("status", input.status);
+    if (input.minCapacity !== undefined) query.set("minCapacity", String(input.minCapacity));
+    if (input.unitKind) query.set("unitKind", input.unitKind);
+    return request<RoomStatusBoardDto>(
+      `/api/v1/properties/${encodeURIComponent(propertyId)}/room-status?${query.toString()}`,
+      signal ? { signal } : {}
+    );
   },
   maintenanceLocks: (propertyId: string, status: "ACTIVE" | "RELEASED" = "ACTIVE") => {
     const query = new URLSearchParams({ propertyId, status });
