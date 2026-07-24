@@ -4,6 +4,7 @@ import {
   clearPersistedCommandRecovery,
   commandRecoveryStorageKey,
   readPersistedCommandRecovery,
+  recoveryCommandRequest,
   savePersistedCommandRecovery,
   transitionPersistedCommandRecovery,
   type CommandDialogProgress
@@ -185,6 +186,29 @@ describe("shared Web command recovery persistence", () => {
       scopeId: context.scopeId,
       request: tokenRequest
     }, { ...confirming, confirmationKey: "web-confirm-token" })).toEqual({ accepted: false, recovery: undefined });
+  });
+
+  it("retains the member-stay presentation without retaining guest or quote input", () => {
+    const memberStayRequest = {
+      commandType: "CREATE_ORDER",
+      title: "创建订单",
+      description: "核对会员住宿",
+      presentation: "MEMBER_STAY",
+      input: {
+        propertyId: "property_qintopia",
+        quoteId: "quote_member_stay",
+        primaryGuest: { fullName: "不应持久化", nickname: "不应持久化" }
+      }
+    } satisfies CommandRequest;
+    const recovery = transitionPersistedCommandRecovery(undefined, {
+      subjectId: context.subjectId,
+      scopeId: context.scopeId,
+      request: memberStayRequest
+    }, { ...confirming, confirmationKey: "web-confirm-member-stay" }).recovery!;
+
+    expect(recovery).toMatchObject({ commandType: "CREATE_ORDER", presentation: "MEMBER_STAY" });
+    expect(recoveryCommandRequest(recovery)).toMatchObject({ commandType: "CREATE_ORDER", presentation: "MEMBER_STAY", input: { propertyId: "property_qintopia" } });
+    expect(JSON.stringify(recovery)).not.toContain("不应持久化");
   });
 
   it("reports storage failure so Confirm can fail closed before sending", () => {

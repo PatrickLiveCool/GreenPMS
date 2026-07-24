@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useReducer, useRef, useState, type FormEvent } from "react";
-import { FilePlus2, RefreshCw, Search, ShieldCheck } from "lucide-react";
+import { FilePlus2, RefreshCw, X } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 import type {
   CreateOrderPrimaryGuestInputDto,
@@ -17,6 +17,8 @@ import { useWorkspace } from "../session";
 import type {
   BookingChannelCode,
   CommandRequest,
+  MemberContractDto,
+  MemberDto,
   PricingPolicyVersionDto,
   QuoteDto,
   ReceiptDto,
@@ -46,6 +48,7 @@ import {
   parseRoomStatusRestoration,
   reconcileRoomStatusRestoration,
   roomStatusFactFingerprint,
+  roomStatusUnitLabel,
   RoomStatusContext,
   RoomStatusGrid,
   RoomStatusMobileTasks,
@@ -63,17 +66,6 @@ import {
   type RoomStatusViewState
 } from "../room-status";
 
-const stayLabels: Record<StayType, string> = {
-  TRANSIENT: "临住",
-  WEEKLY: "周住",
-  MONTHLY: "月住",
-  CUSTOM: "自定义周期",
-  FIXED_TERM: "固定期限",
-  ROLLING: "滚动续期",
-  FREE: "免费住宿"
-};
-const paidStayTypes: StayType[] = ["TRANSIENT", "WEEKLY", "MONTHLY", "CUSTOM", "FIXED_TERM", "ROLLING"];
-
 const bookingChannelLabels: Record<BookingChannelCode, string> = {
   YOUMUDAO: "游牧岛",
   CTRIP: "携程",
@@ -81,14 +73,41 @@ const bookingChannelLabels: Record<BookingChannelCode, string> = {
   WECOM: "企业微信"
 };
 
+export function bookingChannelRequiredForStay(useMemberEntitlement: boolean): boolean {
+  return !useMemberEntitlement;
+}
+
 interface QuoteCommandInput {
   propertyId: string;
   inventoryUnitId: string;
-  stayType: StayType;
+  stayType?: StayType;
   arrivalDate: string;
   departureDate: string;
   pricingPolicyVersionId: string;
-  memberContractId?: string;
+  memberId?: string;
+}
+
+export function eligibleMemberProfiles(
+  members: MemberDto[],
+  contracts: Pick<MemberContractDto, "property_id" | "member_id">[],
+  propertyId: string,
+  query: string
+): MemberDto[] {
+  const propertyMemberIds = new Set(contracts
+    .filter((contract) => contract.property_id === propertyId && contract.member_id)
+    .map((contract) => contract.member_id));
+  const normalizedQuery = query.trim().toUpperCase();
+  return members.filter((member) => propertyMemberIds.has(member.id) && (
+    !normalizedQuery
+    || member.full_name.toUpperCase().includes(normalizedQuery)
+    || member.identity_card_number.toUpperCase().includes(normalizedQuery)
+    || member.phone.toUpperCase().includes(normalizedQuery)
+    || member.wechat.toUpperCase().includes(normalizedQuery)
+  ));
+}
+
+export function effectiveQuoteMemberId(members: MemberDto[], requestedMemberId: string): string {
+  return members.some((member) => member.id === requestedMemberId) ? requestedMemberId : "";
 }
 
 interface PendingQuoteCommand {
@@ -208,11 +227,12 @@ function validQuoteInput(value: unknown): value is QuoteCommandInput {
   const input = value as Record<string, unknown>;
   return typeof input.propertyId === "string"
     && typeof input.inventoryUnitId === "string"
-    && typeof input.stayType === "string"
+    && (input.stayType === undefined || typeof input.stayType === "string")
     && typeof input.arrivalDate === "string"
     && typeof input.departureDate === "string"
     && typeof input.pricingPolicyVersionId === "string"
-    && (input.memberContractId === undefined || typeof input.memberContractId === "string");
+    && !Object.hasOwn(input, "memberContractId")
+    && (input.memberId === undefined || typeof input.memberId === "string");
 }
 
 export function readQuoteCommandRecovery(storage: CommandRecoveryStorage, subjectId: string, propertyId: string): QuoteRecoveryReadResult {
@@ -284,6 +304,46 @@ function quoteInputSignature(input: QuoteCommandInput): string {
   return JSON.stringify(input);
 }
 
+export function paidStayTypeForDates(arrivalDate: string, departureDate: string): "TRANSIENT" | "CUSTOM" {
+  const nights = rangeNights({ arrivalDate, departureDate });
+  return nights < 7 ? "TRANSIENT" : "CUSTOM";
+}
+
+export function quotePricingSummary(quote: QuoteDto): {
+  nights: number;
+  pricingBasis: string;
+  amount: QuoteDto["currentContractAmount"];
+} {
+  const nights = rangeNights(quote);
+  const stayTotal = quote.cashLines.find((line) => line.lineKind === "STAY_TOTAL");
+  const anchor = stayTotal?.lineKind === "STAY_TOTAL" ? stayTotal.pricingBandAnchorNights : 1;
+  return {
+    nights,
+    pricingBasis: anchor === 1 ? "按临住价格" : `按 ${anchor} 夜价格档`,
+    amount: quote.currentContractAmount
+  };
+}
+
+export function membershipCoverageSummary(quote: QuoteDto) {
+  const totalNights = rangeNights(quote);
+  const coveredNights = quote.coverageSet.length;
+  return {
+    totalNights,
+    coveredNights,
+    uncoveredNights: totalNights - coveredNights,
+    uncoveredAmount: quote.cashRemainder
+  };
+}
+
+export function staffQuoteError(error: ApiError, unitCode: string, arrivalDate: string, departureDate: string): Error {
+  if (error.code === "PRICING_POLICY_UNCONFIGURED" || error.code === "POLICY_VERSION_NOT_FOUND") {
+    return new Error(`${unitCode} 在 ${arrivalDate} 至 ${departureDate} 暂无已生效价格，请调整日期。`);
+  }
+  if (error.code === "INVENTORY_CONFLICT") return new Error(error.message);
+  if (error.code === "VALIDATION_ERROR") return new Error(`入住和退房日期无效，请确认退房日期晚于入住日期。`);
+  return new Error(error.message);
+}
+
 function quoteFromReceipt(receipt: ReceiptDto): QuoteDto {
   const quote = receipt.result?.quote;
   if (!quote || typeof quote !== "object" || Array.isArray(quote)) {
@@ -301,11 +361,12 @@ interface InventoryActionUnit {
   kind: "ROOM" | "BED";
   code: string;
   name: string;
+  buildingCode: string | null;
   available: boolean;
 }
 
 function unitName(unit: InventoryActionUnit | undefined) {
-  return unit ? `${unit.code} · ${unit.name}` : "未选择库存单元";
+  return unit ? roomStatusUnitLabel(unit) : "未选择库存单元";
 }
 
 export function roomStatusBlockDraftWithinSelection(
@@ -425,6 +486,7 @@ function QuoteWorkbench({
   initialStayType,
   commandsBlocked,
   resetToken,
+  onClose,
   onRecoveryOutcome,
   onCommand
 }: {
@@ -435,26 +497,22 @@ function QuoteWorkbench({
   initialStayType?: StayType;
   commandsBlocked: boolean;
   resetToken: number;
+  onClose: () => void;
   onRecoveryOutcome: (outcome: Error | undefined) => void;
   onCommand: (request: CommandRequest) => void;
 }) {
   const { meta, principal, propertyId } = useWorkspace();
   const quoteRecoveryScope = quoteRecoveryStorageKey(principal.subjectId, propertyId);
-  const productPolicies = policies;
-  const stayTypes = useMemo(() => {
-    const supported = new Set(productPolicies.flatMap((policy) => policy.stay_type ? [policy.stay_type] : []));
-    if (productPolicies.some((policy) => policy.stay_type === null)) paidStayTypes.forEach((stayType) => supported.add(stayType));
-    const ordered = paidStayTypes.filter((stayType) => supported.has(stayType));
-    if (supported.has("FREE")) ordered.push("FREE");
-    return ordered;
-  }, [productPolicies]);
-  const [stayType, setStayType] = useState<StayType>(initialStayType && stayTypes.includes(initialStayType) ? initialStayType : stayTypes[0] ?? "TRANSIENT");
-  const matchingPolicies = productPolicies.filter((policy) => policy.stay_type === stayType || (policy.stay_type === null && stayType !== "FREE"));
-  const [policyId, setPolicyId] = useState(matchingPolicies[0]?.id ?? "");
-  const [memberContractId, setMemberContractId] = useState("");
+  const stayType: StayType = initialStayType === "FREE" ? "FREE" : paidStayTypeForDates(arrivalDate, departureDate);
+  const selectedPolicy = policies.find((policy) => stayType === "FREE"
+    ? policy.calculation_kind === "FREE" && policy.stay_type === "FREE"
+    : policy.calculation_kind === "DURATION_BAND_TOTAL" && policy.stay_type === null);
+  const policyId = selectedPolicy?.id ?? "";
+  const [useMemberEntitlement, setUseMemberEntitlement] = useState(false);
+  const [memberId, setMemberId] = useState("");
   const [memberSearch, setMemberSearch] = useState("");
   const [quote, setQuote] = useState<QuoteDto>();
-  const [quoteReceipt, setQuoteReceipt] = useState<ReceiptDto>();
+  const [quoteSignature, setQuoteSignature] = useState("");
   const [quoteRecoverySnapshot, setQuoteRecoverySnapshot] = useState<{ scope: string; read: QuoteRecoveryReadResult }>(() => ({
     scope: quoteRecoveryScope,
     read: browserQuoteRecovery(principal.subjectId, propertyId).read
@@ -469,6 +527,7 @@ function QuoteWorkbench({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<unknown>();
   const latestQuoteSignature = useRef("");
+  const settledQuoteSignature = useRef("");
   const quoteRequestGuardRef = useRef<QuoteRequestGuard | null>(null);
   if (!quoteRequestGuardRef.current) quoteRequestGuardRef.current = new QuoteRequestGuard(quoteRecoveryScope);
   const quoteRequestGuard = quoteRequestGuardRef.current;
@@ -496,8 +555,34 @@ function QuoteWorkbench({
 
   useEffect(() => {
     if (resetToken === 0) return;
+    settledQuoteSignature.current = "";
     setQuote(undefined);
-    setQuoteReceipt(undefined);
+    setQuoteSignature("");
+    setGuestName("");
+    setGuestNickname("");
+    setGuestPhone("");
+    setGuestDocument("");
+    setBookingChannelCode("");
+    setChannelOrderReference("");
+    setFreeStayReason("");
+    setUseMemberEntitlement(false);
+    setMemberId("");
+    setMemberSearch("");
+    setError(undefined);
+  }, [resetToken]);
+
+  useEffect(() => {
+    if (stayType === "FREE") {
+      setUseMemberEntitlement(false);
+      setMemberId("");
+      setMemberSearch("");
+    }
+  }, [stayType]);
+
+  useEffect(() => {
+    setUseMemberEntitlement(false);
+    setMemberId("");
+    setMemberSearch("");
     setGuestName("");
     setGuestNickname("");
     setGuestPhone("");
@@ -506,51 +591,39 @@ function QuoteWorkbench({
     setChannelOrderReference("");
     setFreeStayReason("");
     setError(undefined);
-  }, [resetToken]);
+  }, [unit?.id, arrivalDate, departureDate, stayType, policyId]);
 
   useEffect(() => {
-    const firstStay = stayTypes[0];
-    if (firstStay && !stayTypes.includes(stayType)) setStayType(firstStay);
-  }, [stayType, stayTypes]);
-
-  useEffect(() => {
-    const firstPolicy = matchingPolicies[0];
-    if (!matchingPolicies.some((policy) => policy.id === policyId)) setPolicyId(firstPolicy?.id ?? "");
-  }, [matchingPolicies, policyId]);
-
-  useEffect(() => {
-    if (stayType === "FREE") setMemberContractId("");
-  }, [stayType]);
-
-  useEffect(() => {
-    setQuote(undefined);
-    setQuoteReceipt(undefined);
     setError(undefined);
-  }, [unit?.id, arrivalDate, departureDate, stayType, policyId, memberContractId]);
+  }, [memberId, useMemberEntitlement]);
 
-  const selectedPolicy = policies.find((policy) => policy.id === policyId);
-  const memberProfiles = new Map(meta.members.map((member) => [member.id, member]));
-  const normalizedMemberSearch = memberSearch.trim().toUpperCase();
-  const memberContracts = meta.memberContracts.filter((contract) => {
-    if (contract.property_id !== propertyId || contract.status !== "ACTIVE") return false;
-    if (!normalizedMemberSearch) return true;
-    const member = contract.member_id ? memberProfiles.get(contract.member_id) : undefined;
-    return contract.id.toUpperCase().includes(normalizedMemberSearch)
-      || contract.member_name.toUpperCase().includes(normalizedMemberSearch)
-      || Boolean(member?.identity_card_number.toUpperCase().includes(normalizedMemberSearch));
-  });
-  const currentQuoteInput: QuoteCommandInput | undefined = unit && policyId ? {
+  useEffect(() => {
+    if (!useMemberEntitlement) return;
+    setBookingChannelCode("");
+    setChannelOrderReference("");
+  }, [useMemberEntitlement]);
+
+  const memberProfiles = eligibleMemberProfiles(meta.members, meta.memberContracts, propertyId, memberSearch);
+  const quoteMemberId = effectiveQuoteMemberId(memberProfiles, memberId);
+
+  useEffect(() => {
+    if (memberId && !quoteMemberId) setMemberId("");
+  }, [memberId, quoteMemberId]);
+
+  const currentQuoteInput: QuoteCommandInput | undefined = unit && policyId && (!useMemberEntitlement || quoteMemberId) ? {
     propertyId,
     inventoryUnitId: unit.id,
-    stayType,
+    ...(stayType === "FREE" ? { stayType } : {}),
     arrivalDate,
     departureDate,
     pricingPolicyVersionId: policyId,
-    ...(memberContractId ? { memberContractId } : {})
+    ...(useMemberEntitlement && quoteMemberId ? { memberId: quoteMemberId } : {})
   } : undefined;
-  latestQuoteSignature.current = currentQuoteInput ? quoteInputSignature(currentQuoteInput) : "";
+  const currentQuoteSignature = currentQuoteInput ? quoteInputSignature(currentQuoteInput) : "";
+  const quoteIsCurrent = Boolean(quote && quoteSignature === currentQuoteSignature);
+  latestQuoteSignature.current = currentQuoteSignature;
 
-  async function createQuote() {
+  async function createQuote(signal?: AbortSignal) {
     if (!currentQuoteInput || quoteCommandsBlocked) return;
     onRecoveryOutcome(undefined);
     const input = currentQuoteInput;
@@ -582,7 +655,7 @@ function QuoteWorkbench({
     setBusy(true);
     setError(undefined);
     try {
-      const response = await api.quote(input, metadata);
+      const response = await api.quote(input, metadata, signal);
       if (!quoteRequestGuard.isActive(requestLease)) return;
       const completed = browserQuoteRecovery(principal.subjectId, propertyId);
       if (completed.storage && completed.read.kind === "VALID" && completed.read.pending.metadata.idempotencyKey === metadata.idempotencyKey) {
@@ -597,15 +670,25 @@ function QuoteWorkbench({
         setQuoteRecoverySnapshot({ scope: quoteRecoveryScope, read: { kind: "ABSENT" } });
       }
       if (latestQuoteSignature.current === inputSignature) {
+        settledQuoteSignature.current = inputSignature;
+        setQuoteSignature(inputSignature);
         setQuote(response.quote);
-        setQuoteReceipt(response.receipt);
       } else {
-        setError(new Error("报价已完成，但筛选条件在请求期间发生变化；旧结果未应用，请重新报价。"));
+        setError(undefined);
       }
     } catch (nextError) {
       if (!quoteRequestGuard.isActive(requestLease)) return;
-      setError(nextError);
       const current = browserQuoteRecovery(principal.subjectId, propertyId);
+      if (nextError instanceof ApiError) {
+        if (current.storage && current.read.kind === "VALID" && current.read.pending.metadata.idempotencyKey === metadata.idempotencyKey) {
+          clearQuoteCommandRecovery(current.storage, principal.subjectId, propertyId);
+        }
+        setQuoteRecoverySnapshot({ scope: quoteRecoveryScope, read: { kind: "ABSENT" } });
+        settledQuoteSignature.current = inputSignature;
+        setError(staffQuoteError(nextError, unit?.code ?? "所选房源", arrivalDate, departureDate));
+        return;
+      }
+      setError(nextError);
       if (current.storage && current.read.kind === "VALID" && current.read.pending.metadata.idempotencyKey === metadata.idempotencyKey) {
         const unknown = { ...current.read.pending, state: "UNKNOWN" as const };
         if (saveQuoteCommandRecovery(current.storage, unknown)) {
@@ -666,8 +749,9 @@ function QuoteWorkbench({
         onRecoveryOutcome(new Error("报价已恢复，但当前筛选条件已变化；旧结果未应用，请重新报价。"));
         return;
       }
+      settledQuoteSignature.current = pendingQuote.inputSignature;
+      setQuoteSignature(pendingQuote.inputSignature);
       setQuote(recoveredQuote);
-      setQuoteReceipt(receipt);
     } catch (nextError) {
       if (!quoteRequestGuard.isActive(requestLease)) return;
       setError(nextError);
@@ -678,8 +762,21 @@ function QuoteWorkbench({
     }
   }
 
+  useEffect(() => {
+    if (!pendingQuote || pendingQuote.state !== "SENDING" || busy) return;
+    const timeout = window.setTimeout(() => void recoverQuote(), 500);
+    return () => window.clearTimeout(timeout);
+  }, [pendingQuote?.metadata.idempotencyKey, pendingQuote?.state, busy]);
+
+  useEffect(() => {
+    if (!currentQuoteInput || quoteCommandsBlocked || settledQuoteSignature.current === currentQuoteSignature) return;
+    const timeout = window.setTimeout(() => void createQuote(), 300);
+    return () => window.clearTimeout(timeout);
+  }, [currentQuoteSignature, quoteCommandsBlocked]);
+
   function createOrder() {
-    if (quoteCommandsBlocked || !quote || !guestName.trim() || !guestNickname.trim() || !bookingChannelCode || (quote.stayType === "FREE" && !freeStayReason.trim())) return;
+    const channelRequired = bookingChannelRequiredForStay(useMemberEntitlement);
+    if (quoteCommandsBlocked || !quote || !quoteIsCurrent || !guestName.trim() || !guestNickname.trim() || (channelRequired && !bookingChannelCode) || (quote.stayType === "FREE" && !freeStayReason.trim())) return;
     const primaryGuest: CreateOrderPrimaryGuestInputDto = {
       fullName: guestName.trim(),
       nickname: guestNickname.trim()
@@ -690,12 +787,15 @@ function QuoteWorkbench({
       commandType: "CREATE_ORDER",
       title: "创建订单",
       description: "确认主要居住人快照、锁定计价政策版本、库存及会员覆盖差异。",
+      ...(useMemberEntitlement ? { presentation: "MEMBER_STAY" as const } : {}),
       input: {
         propertyId,
         quoteId: quote.quoteId,
         primaryGuest,
-        bookingChannelCode,
-        channelOrderReference: bookingChannelCode === "WECOM" ? null : channelOrderReference.trim() || null,
+        ...(!useMemberEntitlement && bookingChannelCode ? {
+          bookingChannelCode,
+          channelOrderReference: bookingChannelCode === "WECOM" ? null : channelOrderReference.trim() || null
+        } : {}),
         ...(quote.stayType === "FREE" ? { freeStayReason: freeStayReason.trim() } : {})
       }
     });
@@ -704,75 +804,93 @@ function QuoteWorkbench({
   return (
     <aside className="quote-workbench" aria-labelledby="quote-heading">
       <header className="panel-heading">
-        <div><p className="eyebrow">Quote</p><h2 id="quote-heading">报价工作区</h2></div>
-        {unit ? <span className={`unit-kind kind-${unit.kind.toLowerCase()}`}>{unit.kind === "ROOM" ? "整房" : "床位"}</span> : null}
+        <div><p className="eyebrow">办理住宿</p><h2 id="quote-heading">住宿金额</h2></div>
+        <button className="icon-button" type="button" onClick={onClose} disabled={busy || Boolean(pendingQuote)} title="关闭办理区域" aria-label="关闭办理区域"><X aria-hidden="true" size={18} /></button>
       </header>
       <InlineError error={error} title="报价失败" />
       <InlineError error={quoteRecoveryError} title="本地报价恢复记录不可用" />
-      {pendingQuote ? (
+      {pendingQuote?.state === "UNKNOWN" ? (
         <div className="recovery-bar" data-testid="quote-recovery">
-          <div><strong>{pendingQuote.state === "SENDING" ? "报价命令处理中或响应待确认" : "报价命令结果待恢复"}</strong><p>保留原幂等键，只查询执行结果，不创建第二个 Quote。</p><code>{pendingQuote.metadata.idempotencyKey}</code></div>
+          <div><strong>报价结果尚未确认</strong><p>系统不会重复报价；网络恢复后可重新查询本次结果。</p></div>
           <button className="button button-secondary" type="button" onClick={() => void recoverQuote()} disabled={busy}>
-            <RefreshCw aria-hidden="true" size={17} />查询命令结果
+            <RefreshCw aria-hidden="true" size={17} />重新查询报价结果
           </button>
         </div>
       ) : null}
       {!unit ? <EmptyState title="选择可售库存" detail="在房态表中选择整房或床位后开始报价。" /> : (
         <>
           <div className="selected-unit"><strong>{unitName(unit)}</strong><span>{arrivalDate} 至 {departureDate}</span></div>
-          <div className="form-grid quote-form">
-            <label>住宿类型
-              <select value={stayType} onChange={(event) => setStayType(event.target.value as StayType)} disabled={busy || quoteRecoveryRead.kind !== "ABSENT"}>
-                {stayTypes.map((type) => <option key={type} value={type}>{stayLabels[type]}</option>)}
-              </select>
-            </label>
-            <label>计价政策版本
-              <select value={policyId} onChange={(event) => setPolicyId(event.target.value)} required disabled={busy || quoteRecoveryRead.kind !== "ABSENT"}>
-                {matchingPolicies.map((policy) => <option key={policy.id} value={policy.id}>{policy.code} · v{policy.version}</option>)}
-              </select>
-            </label>
-            <label>搜索会员
-              <input value={memberSearch} onChange={(event) => setMemberSearch(event.target.value)} placeholder="身份证号 / 姓名" disabled={stayType === "FREE" || busy || quoteRecoveryRead.kind !== "ABSENT"} data-testid="member-search" />
-            </label>
-            <label>会员合同
-              <select value={memberContractId} onChange={(event) => setMemberContractId(event.target.value)} disabled={stayType === "FREE" || busy || quoteRecoveryRead.kind !== "ABSENT"}>
-                <option value="">不使用会员权益</option>
-                {memberContracts.map((contract) => {
-                  const member = contract.member_id ? memberProfiles.get(contract.member_id) : undefined;
-                  return <option key={contract.id} value={contract.id}>{member ? `${member.full_name} · ${member.identity_card_number}` : `${contract.member_name} · 历史未关联档案`} · ${contract.id}</option>;
-                })}
-              </select>
-            </label>
-            <button className="button button-primary" type="button" onClick={() => void createQuote()} disabled={busy || quoteCommandsBlocked || !policyId || !unit.available} data-testid="request-quote">
-              <Search aria-hidden="true" size={17} />{busy ? "正在报价" : "获取服务端报价"}
-            </button>
-          </div>
+          {stayType !== "FREE" ? <div className="member-benefit-controls">
+            <label className="checkbox-label"><input
+              type="checkbox"
+              checked={useMemberEntitlement}
+              onChange={(event) => {
+                const enabled = event.target.checked;
+                setUseMemberEntitlement(enabled);
+                if (enabled) {
+                  setBookingChannelCode("");
+                  setChannelOrderReference("");
+                } else {
+                  setMemberId("");
+                  setMemberSearch("");
+                }
+              }}
+              disabled={busy || quoteRecoveryRead.kind !== "ABSENT"}
+              data-testid="use-member-entitlement"
+            />本次住宿使用会员权益</label>
+            {useMemberEntitlement ? <div className="form-grid quote-form" data-testid="member-benefit-picker">
+              <label>搜索会员
+                <input value={memberSearch} onChange={(event) => setMemberSearch(event.target.value)} placeholder="姓名、身份证号、手机号或微信号" disabled={busy || quoteRecoveryRead.kind !== "ABSENT"} data-testid="member-search" />
+              </label>
+              <label>会员档案
+                <select
+                  value={quoteMemberId}
+                  onChange={(event) => {
+                    const selectedMemberId = event.target.value;
+                    setMemberId(selectedMemberId);
+                    const selectedMember = memberProfiles.find((member) => member.id === selectedMemberId);
+                    if (!selectedMember) return;
+                    setGuestNickname(selectedMember.full_name);
+                    setGuestName(selectedMember.full_name);
+                    setGuestPhone(selectedMember.phone);
+                    setGuestDocument(selectedMember.identity_card_number);
+                  }}
+                  disabled={busy || quoteRecoveryRead.kind !== "ABSENT"}
+                  data-testid="member-profile-select"
+                >
+                  <option value="">请选择会员</option>
+                  {memberProfiles.map((member) => <option key={member.id} value={member.id}>{member.full_name} · {member.identity_card_number} · {member.phone}</option>)}
+                </select>
+              </label>
+            </div> : null}
+          </div> : null}
+          <div
+            className={`room-status-pricing-progress${busy ? "" : " is-idle"}`}
+            {...(busy ? { role: "status" as const } : { "aria-hidden": true })}
+          >正在计算住宿金额</div>
           {quote ? (
-            <div className="quote-result" data-testid="quote-result">
-              <section className="locked-policy" aria-label="锁定计价政策">
-                <ShieldCheck aria-hidden="true" size={19} />
-                <div><span>锁定政策版本</span><strong>{selectedPolicy?.code} · v{selectedPolicy?.version}</strong><code>{quote.pricingPolicyVersionId}</code></div>
-              </section>
+            <div
+              className={`quote-result${quoteIsCurrent ? "" : " is-layout-placeholder"}`}
+              {...(quoteIsCurrent ? { "data-testid": "quote-result" } : { "aria-hidden": true })}
+            >
+              {(() => {
+                const summary = quotePricingSummary(quote);
+                const memberSummary = membershipCoverageSummary(quote);
+                return (
               <div className="quote-amounts">
-                <div><span>cashRemainder</span><strong>{formatMoney(quote.cashRemainder)}</strong></div>
-                <div><span>currentContractAmount</span><strong>{formatMoney(quote.currentContractAmount)}</strong></div>
+                {useMemberEntitlement ? <>
+                  <div><span>总住宿晚数</span><strong>{memberSummary.totalNights} 晚</strong></div>
+                  <div><span>覆盖晚数</span><strong>{memberSummary.coveredNights} 晚</strong></div>
+                  <div><span>未覆盖晚数</span><strong>{memberSummary.uncoveredNights} 晚</strong></div>
+                  <div><span>未覆盖金额</span><strong>{formatMoney(memberSummary.uncoveredAmount)}</strong></div>
+                </> : <>
+                  <div><span>住宿晚数</span><strong>{summary.nights} 晚</strong></div>
+                  <div><span>计价依据</span><strong>{summary.pricingBasis}</strong></div>
+                  <div><span>住宿金额</span><strong>{formatMoney(summary.amount)}</strong></div>
+                </>}
               </div>
-              <section className="quote-lines" aria-labelledby="coverage-heading">
-                <div className="section-title-row"><h3 id="coverage-heading">coverageSet</h3><span>{quote.coverageSet.length} 晚</span></div>
-                {quote.coverageSet.length ? (
-                  <div className="compact-list">
-                    {quote.coverageSet.map((item) => <div key={`${item.serviceDate}-${item.inventoryUnitId}`}><span>{item.serviceDate}</span><span>{item.unitKind}</span><code>{item.entitlementLotId}</code></div>)}
-                  </div>
-                ) : <p className="muted compact">本次报价没有会员覆盖。</p>}
-              </section>
-              <section className="quote-lines" aria-labelledby="cash-lines-heading">
-                <div className="section-title-row"><h3 id="cash-lines-heading">现金计价行</h3><span>{quote.cashLines.length}</span></div>
-                {quote.cashLines.map((line) => {
-                  const period = "serviceDate" in line ? line.serviceDate : `${line.arrivalDate} 至 ${line.departureDate}`;
-                  return <div className="cash-line" key={`${period}-${line.inventoryUnitId}`}><span>{period}</span><span>{line.description}</span><strong>{formatMoney(line.amount)}</strong></div>;
-                })}
-              </section>
-              <div className="quote-expiry">Quote ID <code>{quote.quoteId}</code><span>有效至 {formatDateTime(quote.expiresAt)}</span>{quoteReceipt ? <><span>Receipt</span><code>{quoteReceipt.receiptId}</code></> : null}</div>
+                );
+              })()}
               <section className="guest-section" aria-labelledby="guest-heading">
                 <h3 id="guest-heading">主要居住人快照</h3>
                 <div className="form-grid">
@@ -780,7 +898,7 @@ function QuoteWorkbench({
                   <label>姓名<input value={guestName} onChange={(event) => setGuestName(event.target.value)} required maxLength={160} data-testid="primary-guest-name" /></label>
                   <label>联系电话<input value={guestPhone} onChange={(event) => setGuestPhone(event.target.value)} inputMode="tel" maxLength={80} /></label>
                   <label>证件号码<input value={guestDocument} onChange={(event) => setGuestDocument(event.target.value)} maxLength={120} /></label>
-                  <label>订单来源渠道
+                  {!useMemberEntitlement ? <label>订单来源渠道
                     <select
                       value={bookingChannelCode}
                       onChange={(event) => {
@@ -793,12 +911,12 @@ function QuoteWorkbench({
                       <option value="">请选择渠道</option>
                       {Object.entries(bookingChannelLabels).map(([code, label]) => <option key={code} value={code}>{label}</option>)}
                     </select>
-                  </label>
-                  {bookingChannelCode && bookingChannelCode !== "WECOM" ? <label>渠道订单号（可选）<input value={channelOrderReference} onChange={(event) => setChannelOrderReference(event.target.value)} maxLength={200} data-testid="channel-order-reference" /></label> : null}
+                  </label> : null}
+                  {!useMemberEntitlement && bookingChannelCode && bookingChannelCode !== "WECOM" ? <label>渠道订单号（可选）<input value={channelOrderReference} onChange={(event) => setChannelOrderReference(event.target.value)} maxLength={200} data-testid="channel-order-reference" /></label> : null}
                   {quote.stayType === "FREE" ? <label className="span-two">免费入住原因<textarea rows={3} value={freeStayReason} onChange={(event) => setFreeStayReason(event.target.value)} required maxLength={1000} data-testid="free-stay-reason" /></label> : null}
                 </div>
-                <button className="button button-primary full-width" type="button" onClick={createOrder} disabled={quoteCommandsBlocked || !guestName.trim() || !guestNickname.trim() || !bookingChannelCode || (quote.stayType === "FREE" && !freeStayReason.trim())} data-testid="create-order">
-                  <FilePlus2 aria-hidden="true" size={17} />Preview 创建订单
+                <button className="button button-primary full-width" type="button" onClick={createOrder} disabled={quoteCommandsBlocked || !quoteIsCurrent || !guestName.trim() || !guestNickname.trim() || (bookingChannelRequiredForStay(useMemberEntitlement) && !bookingChannelCode) || (quote.stayType === "FREE" && !freeStayReason.trim())} data-testid="create-order">
+                  <FilePlus2 aria-hidden="true" size={17} />核对并创建订单
                 </button>
               </section>
             </div>
@@ -981,7 +1099,7 @@ function intervalActions(interval: RoomStatusIntervalDto | null, selection: Room
 }
 
 function actionUnit(unit: RoomStatusUnitDto, available: boolean): InventoryActionUnit {
-  return { id: unit.id, kind: unit.kind, code: unit.code, name: unit.name, available };
+  return { id: unit.id, kind: unit.kind, code: unit.code, name: unit.name, buildingCode: unit.buildingCode, available };
 }
 
 function buildMobileGroups(board: RoomStatusBoardDto): RoomStatusMobileGroups {
@@ -1387,16 +1505,7 @@ export function InventoryPage() {
   const quoteUnit = findRoomStatusUnit(renderedBoard, quoteTarget?.unitId);
   const pageQuoteRecovery = browserQuoteRecovery(principal.subjectId, propertyId).read;
   const showQuoteWorkbench = Boolean(quoteTarget) || pageQuoteRecovery.kind !== "ABSENT";
-  const quoteActionUnit = quoteTarget && quoteUnit ? actionUnit(
-    quoteUnit,
-    projectionWritable && selectionActions(quoteUnit, {
-      unitId: quoteTarget.unitId,
-      anchorDate: quoteTarget.arrivalDate,
-      focusDate: addLocalDateDays(quoteTarget.departureDate, -1),
-      arrivalDate: quoteTarget.arrivalDate,
-      departureDate: quoteTarget.departureDate
-    }).some((action) => action.code === (quoteTarget.initialStayType === "FREE" ? "CREATE_FREE_STAY" : "CREATE_ORDER"))
-  ) : undefined;
+  const quoteActionUnit = quoteTarget && quoteUnit ? actionUnit(quoteUnit, projectionWritable) : undefined;
 
   function clearTransientRoomStatusContext() {
     setSelectedUnitId(undefined);
@@ -1491,32 +1600,39 @@ export function InventoryPage() {
   function inspectDay(unit: RoomStatusUnitDto, day: RoomStatusDayDto | null) {
     setQuoteRecoveryOutcome(undefined);
     setSelectedUnitId(unit.id);
+    if (day) selectRange(selectionFromCells(unit.id, day.serviceDate, day.serviceDate));
     setSelectedDayDate(day?.serviceDate);
     setSelectedIntervalId(undefined);
-    if (day) dispatchView({ type: "SET_SELECTION", selection: selectionFromCells(unit.id, day.serviceDate, day.serviceDate) });
   }
 
   function inspectInterval(unit: RoomStatusUnitDto, interval: RoomStatusIntervalDto) {
     setQuoteRecoveryOutcome(undefined);
     setSelectedUnitId(unit.id);
+    selectRange({
+      unitId: unit.id,
+      anchorDate: interval.startDate,
+      focusDate: addLocalDateDays(interval.endDate, -1),
+      arrivalDate: interval.startDate,
+      departureDate: interval.endDate
+    });
     setSelectedDayDate(undefined);
     setSelectedIntervalId(interval.id);
-    dispatchView({
-      type: "SET_SELECTION",
-      selection: {
-        unitId: unit.id,
-        anchorDate: interval.startDate,
-        focusDate: addLocalDateDays(interval.endDate, -1),
-        arrivalDate: interval.startDate,
-        departureDate: interval.endDate
-      }
-    });
   }
 
   function selectRange(selection: RoomStatusSelection | null) {
     setQuoteRecoveryOutcome(undefined);
     dispatchView({ type: "SET_SELECTION", selection });
-    if (selection) setSelectedUnitId(selection.unitId);
+    if (selection) {
+      setSelectedUnitId(selection.unitId);
+      setQuoteTarget((current) => ({
+        unitId: selection.unitId,
+        arrivalDate: selection.arrivalDate,
+        departureDate: selection.departureDate,
+        initialStayType: current?.initialStayType === "FREE" ? "FREE" : "TRANSIENT"
+      }));
+    } else {
+      setQuoteTarget(undefined);
+    }
     setSelectedDayDate(undefined);
     setSelectedIntervalId(undefined);
   }
@@ -1723,7 +1839,7 @@ export function InventoryPage() {
       <InlineError error={restorationError} title="房态位置未保存" />
       <InlineError error={actionError} title="动作未开始" />
       <InlineError error={quoteRecoveryOutcome} title="报价恢复结果" />
-      {queryPhase !== "PERMISSION_DENIED" && commandRecovery.pending ? <CommandRecoveryBar recovery={commandRecovery.pending} onOpen={openRecoveryDialog} testId="inventory-command-recovery" /> : null}
+      {queryPhase !== "PERMISSION_DENIED" && commandRecovery.pending ? <CommandRecoveryBar recovery={commandRecovery.pending} onOpen={openRecoveryDialog} testId="inventory-command-recovery" businessFacing={commandRecovery.pending.presentation === "MEMBER_STAY"} /> : null}
       {returnNotice ? <div className="room-status-return-notice" role="status">{returnNotice}</div> : null}
       {boardStale ? <div className="room-status-stale-notice" role="alert">当前房态已陈旧或刷新失败。页面保留最后一次来源事实，但所有依赖新鲜度的写动作已暂停。</div> : null}
       {queryError ? <InlineError error={queryError} title={board ? "房态刷新失败" : "无法查询房态"} /> : null}
@@ -1806,7 +1922,7 @@ export function InventoryPage() {
                 }}
               />
             </div>
-            {!isMobile ? <RoomStatusContext
+            {!isMobile ? <div className="room-status-side-column"><RoomStatusContext
                 board={renderedBoard}
                 selectedUnit={selectedUnit}
                 selectedDay={selectedDay}
@@ -1817,14 +1933,29 @@ export function InventoryPage() {
                 allowedActions={contextActions}
                 onSelectedUnitChange={(unit) => {
                   inspectUnit(unit);
-                  const firstDate = renderedBoard.dates[0];
-                  if (firstDate) selectRange(selectionFromCells(unit.id, firstDate, firstDate));
                 }}
                 onSelectionChange={selectRange}
                 onOpenReference={openReference}
                 onOpenReceipt={(receiptId) => window.open(`/api/v1/receipts/${encodeURIComponent(receiptId)}`, "_blank", "noopener,noreferrer")}
                 onAction={handleAction}
-              /> : null}
+              />
+              {showQuoteWorkbench ? (
+                <div className="room-status-quote-section" ref={quoteSectionRef}>
+                  <QuoteWorkbench
+                    unit={quoteActionUnit}
+                    arrivalDate={quoteTarget?.arrivalDate ?? range.arrivalDate}
+                    departureDate={quoteTarget?.departureDate ?? range.departureDate}
+                    policies={policies}
+                    {...(quoteTarget ? { initialStayType: quoteTarget.initialStayType } : {})}
+                    commandsBlocked={commandsBlocked}
+                    resetToken={quoteResetToken}
+                    onClose={() => setQuoteTarget(undefined)}
+                    onRecoveryOutcome={setQuoteRecoveryOutcome}
+                    onCommand={startCommand}
+                  />
+                </div>
+              ) : null}
+            </div> : null}
           </div>
 
           {isMobile ? roomStatusToolbar : null}
@@ -1842,8 +1973,6 @@ export function InventoryPage() {
                 allowedActions={contextActions}
                 onSelectedUnitChange={(unit) => {
                   inspectUnit(unit);
-                  const firstDate = renderedBoard.dates[0];
-                  if (firstDate) selectRange(selectionFromCells(unit.id, firstDate, firstDate));
                 }}
                 onSelectionChange={selectRange}
                 onOpenReference={openReference}
@@ -1855,10 +1984,9 @@ export function InventoryPage() {
             </Modal>
           ) : null}
 
-          {showQuoteWorkbench ? (
+          {isMobile && showQuoteWorkbench ? (
             <div className="room-status-quote-section" ref={quoteSectionRef}>
               <QuoteWorkbench
-                key={`${quoteTarget?.unitId ?? "recovery"}:${quoteTarget?.arrivalDate ?? range.arrivalDate}:${quoteTarget?.departureDate ?? range.departureDate}:${quoteTarget?.initialStayType ?? "recover"}:${quoteResetToken}`}
                 unit={quoteActionUnit}
                 arrivalDate={quoteTarget?.arrivalDate ?? range.arrivalDate}
                 departureDate={quoteTarget?.departureDate ?? range.departureDate}
@@ -1866,6 +1994,7 @@ export function InventoryPage() {
                 {...(quoteTarget ? { initialStayType: quoteTarget.initialStayType } : {})}
                 commandsBlocked={commandsBlocked}
                 resetToken={quoteResetToken}
+                onClose={() => setQuoteTarget(undefined)}
                 onRecoveryOutcome={setQuoteRecoveryOutcome}
                 onCommand={startCommand}
               />
@@ -1881,7 +2010,7 @@ export function InventoryPage() {
         request={command}
         onClose={closeCommandDialog}
         writeBlocked={!recoveryDialogOpen && (commandsBlocked || commandContextInvalidated)}
-        writeBlockedReason="房态权限、查询范围、数据新鲜度、投影完整性或命令恢复状态已经变化。未重新取得当前获权事实前不能生成或确认 Preview。"
+        writeBlockedReason="房态权限、查询范围、数据新鲜度或操作恢复状态已经变化。请关闭后刷新，再重新核对本次操作。"
         onCommitted={refreshCommittedRoomStatus}
         {...(recoveryDialogOpen && commandRecovery.pending ? {
           initialConfirmationKey: commandRecovery.pending.confirmationKey,

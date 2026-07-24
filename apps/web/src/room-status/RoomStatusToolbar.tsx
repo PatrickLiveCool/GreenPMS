@@ -9,7 +9,7 @@ import {
 
 const salesModeLabels = {
   WHOLE_ROOM: "整房销售",
-  BED_SPLIT: "拆床销售",
+  BED_SPLIT: "可按床销售",
   UNAVAILABLE: "不可售"
 } as const;
 

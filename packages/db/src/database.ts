@@ -33,7 +33,12 @@ export async function databaseReady(db: Kysely<Database>): Promise<boolean> {
       && applied.has("011_core_fact_shape_guards.sql")
       && applied.has("012_legacy_demo_inventory_catalog_backfill.sql")
       && applied.has("013_room_status_operations.sql")
-      && applied.has("014_new_order_primary_guest_nickname.sql");
+      && applied.has("014_new_order_primary_guest_nickname.sql")
+      && applied.has("015_generated_room_operational_codes.sql")
+      && applied.has("016_member_property_links.sql")
+      && applied.has("017_membership_orders.sql")
+      && applied.has("018_member_stay_identity_and_coverage_guards.sql")
+      && applied.has("019_member_stay_booking_channel_rules.sql");
   } catch {
     return false;
   }

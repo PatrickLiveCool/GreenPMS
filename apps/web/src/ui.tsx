@@ -68,16 +68,21 @@ export function StatusBadge({ value }: { value: string }) {
   return <span className={`status-badge status-${normalized}`}>{value.replaceAll("_", " ")}</span>;
 }
 
-export function InlineError({ error, title = "操作未完成" }: { error: unknown; title?: string }) {
+export function InlineError({ error, title = "操作未完成", hideTechnicalDetails = false }: {
+  error: unknown;
+  title?: string;
+  hideTechnicalDetails?: boolean;
+}) {
   if (!error) return null;
   const apiError = error instanceof ApiError ? error : undefined;
+  const message = hideTechnicalDetails && error instanceof Error ? error.message : errorMessage(error);
   return (
     <div className="inline-error" role="alert" tabIndex={-1}>
       <AlertCircle aria-hidden="true" size={18} />
       <div>
         <strong>{title}</strong>
-        <p>{errorMessage(error)}</p>
-        {apiError?.correlationId ? <small>Correlation ID: {apiError.correlationId}</small> : null}
+        <p>{message}</p>
+        {!hideTechnicalDetails && apiError?.correlationId ? <small>Correlation ID: {apiError.correlationId}</small> : null}
       </div>
     </div>
   );
@@ -185,6 +190,23 @@ function moneyFrom(value: unknown): MoneyDto | undefined {
   return { currency: value.currency, minorUnits: value.minorUnits };
 }
 
+const membershipBusinessCommands = new Set<CommandType>([
+  "CREATE_MEMBERSHIP_ORDER",
+  "RECORD_MEMBERSHIP_PAYMENT",
+  "CORRECT_MEMBERSHIP_PAYMENT",
+  "ACTIVATE_MEMBERSHIP_ORDER",
+  "CORRECT_MEMBER_ENTITLEMENT_BALANCE"
+]);
+
+function membershipCommandLabel(commandType: CommandType): string {
+  if (commandType === "CREATE_MEMBERSHIP_ORDER") return "创建会员订单";
+  if (commandType === "RECORD_MEMBERSHIP_PAYMENT") return "登记企微收款";
+  if (commandType === "CORRECT_MEMBERSHIP_PAYMENT") return "更正企微收款";
+  if (commandType === "ACTIVATE_MEMBERSHIP_ORDER") return "生效会员订单";
+  if (commandType === "CORRECT_MEMBER_ENTITLEMENT_BALANCE") return "更正会员余额";
+  return "会员操作";
+}
+
 function scalar(value: unknown): string {
   if (value === null || value === undefined) return "-";
   if (typeof value === "boolean") return value ? "是" : "否";
@@ -209,6 +231,14 @@ function pricingFromEffect(effect: Record<string, unknown>): Record<string, unkn
   if (isRecord(effect.pricing)) return effect.pricing;
   if (isRecord(effect.after) && isRecord(effect.after.pricing)) return effect.after.pricing;
   return undefined;
+}
+
+function localDateNightCount(arrivalDate: unknown, departureDate: unknown): number | undefined {
+  if (typeof arrivalDate !== "string" || typeof departureDate !== "string") return undefined;
+  const arrival = Date.parse(`${arrivalDate}T00:00:00Z`);
+  const departure = Date.parse(`${departureDate}T00:00:00Z`);
+  if (!Number.isFinite(arrival) || !Number.isFinite(departure) || departure <= arrival) return undefined;
+  return Math.round((departure - arrival) / 86_400_000);
 }
 
 export function receiptTransactionReferenceLabel(result: Record<string, unknown>): string {
@@ -239,6 +269,95 @@ function EffectSummary({ preview }: { preview: PreviewDto }) {
   const bookingChannelCode = typeof effect.bookingChannelCode === "string" ? effect.bookingChannelCode : null;
   const channelOrderReference = typeof effect.channelOrderReference === "string" ? effect.channelOrderReference : null;
   const hasTransactionReference = Object.hasOwn(effect, "transactionReference");
+
+  if (preview.commandType === "CREATE_MEMBER" && member) {
+    return <div className="effect-summary member-create-summary" data-testid="command-effect">
+      <section className="effect-section" aria-labelledby="member-create-summary-heading">
+        <h3 id="member-create-summary-heading">请核对会员资料</h3>
+        <dl className="difference-grid">
+          <dt>姓名</dt><dd>{scalar(member.fullName)}</dd>
+          <dt>身份证号</dt><dd>{scalar(member.identityCardNumber)}</dd>
+          <dt>手机号</dt><dd>{scalar(member.phone)}</dd>
+          <dt>微信号</dt><dd>{scalar(member.wechat)}</dd>
+        </dl>
+        <p className="muted compact">确认后只创建会员档案并加入当前门店，不创建会员订单或权益。</p>
+      </section>
+    </div>;
+  }
+
+  if (membershipBusinessCommands.has(preview.commandType)) {
+    const product = isRecord(effect.product) ? effect.product : undefined;
+    const membershipPricing = isRecord(effect.pricing) ? effect.pricing : undefined;
+    const payment = isRecord(effect.payment) ? effect.payment : undefined;
+    const original = isRecord(effect.original) ? effect.original : undefined;
+    const replacement = isRecord(effect.replacement) ? effect.replacement : undefined;
+    const totals = isRecord(effect.totals) ? effect.totals : undefined;
+    return <div className="effect-summary membership-command-summary" data-testid="command-effect">
+      <section className="effect-section" aria-labelledby="membership-command-summary-heading">
+        <h3 id="membership-command-summary-heading">请核对{membershipCommandLabel(preview.commandType)}</h3>
+        <dl className="difference-grid">
+          {member ? <><dt>会员</dt><dd>{scalar(member.fullName)}</dd></> : null}
+          {typeof effect.memberName === "string" ? <><dt>会员</dt><dd>{effect.memberName}</dd></> : null}
+          {product ? <>
+            <dt>会员产品</dt><dd>{scalar(product.name)}</dd>
+            <dt>发放权益</dt><dd>{scalar(product.entitlementUnits)} {product.entitlementUnitKind === "ROOM_NIGHT" ? "间夜" : "床夜"}</dd>
+            <dt>适用范围</dt><dd>{product.allowedInventoryKind === "ROOM" ? "指定房型的独立房间" : "指定房型的单床"}</dd>
+          </> : null}
+          {typeof effect.productName === "string" ? <><dt>会员产品</dt><dd>{effect.productName}</dd></> : null}
+          {membershipPricing ? <>
+            <dt>标价</dt><dd>{formatMoney(moneyFrom(membershipPricing.listedPrice))}</dd>
+            <dt>成交价</dt><dd><strong>{formatMoney(moneyFrom(membershipPricing.agreedPrice))}</strong></dd>
+            <dt>调价差额</dt><dd>{formatMoney(moneyFrom(membershipPricing.adjustment))}</dd>
+            {membershipPricing.adjustmentReason ? <><dt>调价原因</dt><dd>{scalar(membershipPricing.adjustmentReason)}</dd></> : null}
+          </> : null}
+          {payment ? <><dt>本次收款</dt><dd>{formatMoney(moneyFrom(payment.amount))}</dd><dt>企微交易单号</dt><dd>{scalar(payment.transactionReference)}</dd></> : null}
+          {original && replacement ? <>
+            <dt>原收款</dt><dd>{formatMoney(moneyFrom(original.amount))} · {scalar(original.transactionReference)}</dd>
+            <dt>更正后收款</dt><dd>{formatMoney(moneyFrom(replacement.amount))} · {scalar(replacement.transactionReference)}</dd>
+          </> : null}
+          {totals ? <>
+            <dt>更正/登记前有效收款</dt><dd>{formatMoney(moneyFrom(totals.before))}</dd>
+            <dt>操作后有效收款</dt><dd><strong>{formatMoney(moneyFrom(totals.after))}</strong></dd>
+            <dt>操作后与成交价差额</dt><dd>{formatMoney(moneyFrom(totals.differenceAfter))}</dd>
+          </> : null}
+          {moneyFrom(effect.paymentTotal) ? <><dt>有效企微收款合计</dt><dd><strong>{formatMoney(moneyFrom(effect.paymentTotal))}</strong></dd></> : null}
+          {moneyFrom(effect.agreedPrice) ? <><dt>成交价</dt><dd>{formatMoney(moneyFrom(effect.agreedPrice))}</dd></> : null}
+          {moneyFrom(effect.paymentDifference) ? <><dt>收款与成交价差额</dt><dd>{formatMoney(moneyFrom(effect.paymentDifference))}</dd></> : null}
+          {typeof effect.validFrom === "string" && typeof effect.validUntil === "string" ? <><dt>有效期</dt><dd>{formatDate(effect.validFrom)} 至 {formatDate(effect.validUntil)}</dd></> : null}
+          {typeof effect.entitlementUnits === "number" ? <><dt>生效发放</dt><dd>{effect.entitlementUnits} {effect.entitlementUnitKind === "ROOM_NIGHT" ? "间夜" : "床夜"}</dd></> : null}
+          {preview.commandType === "CORRECT_MEMBER_ENTITLEMENT_BALANCE" ? <>
+            <dt>当前可用余额</dt><dd>{scalar(effect.availableBefore)} {effect.unitKind === "ROOM_NIGHT" ? "间夜" : "床夜"}</dd>
+            <dt>更正后可用余额</dt><dd><strong>{scalar(effect.availableAfter)} {effect.unitKind === "ROOM_NIGHT" ? "间夜" : "床夜"}</strong></dd>
+            <dt>本次变动</dt><dd>{typeof effect.quantityDelta === "number" && effect.quantityDelta > 0 ? "+" : ""}{scalar(effect.quantityDelta)}</dd>
+            <dt>更正原因</dt><dd>{scalar(effect.adjustmentReason)}</dd>
+          </> : null}
+        </dl>
+        {preview.commandType === "ACTIVATE_MEMBERSHIP_ORDER" ? <p className="muted compact">收款差额只作提示。确认生效不会自动改价，也不代表支付平台已对账或结清。</p> : null}
+        {preview.commandType === "CORRECT_MEMBERSHIP_PAYMENT" ? <p className="muted compact">确认后保留原收款，追加一笔冲销和一笔更正后收款。</p> : null}
+      </section>
+    </div>;
+  }
+
+  if (preview.commandType === "CREATE_ORDER" && (typeof effect.memberId === "string" || typeof effect.memberContractId === "string")) {
+    const totalNights = localDateNightCount(effect.arrivalDate, effect.departureDate);
+    const coveredNights = coverage.length;
+    const uncoveredNights = totalNights === undefined ? undefined : Math.max(0, totalNights - coveredNights);
+    return <div className="effect-summary membership-command-summary" data-testid="command-effect">
+      <section className="effect-section" aria-labelledby="member-stay-summary-heading">
+        <h3 id="member-stay-summary-heading">请核对会员住宿</h3>
+        <dl className="difference-grid">
+          {guest ? <><dt>居住人昵称</dt><dd>{guestNicknameLabel(guest)}</dd><dt>主要居住人姓名</dt><dd>{scalar(guest.fullName)}</dd></> : null}
+          {inventoryUnit ? <><dt>住宿位置</dt><dd>{scalar(inventoryUnit.code)} · {scalar(inventoryUnit.name)}</dd></> : null}
+          {typeof effect.arrivalDate === "string" && typeof effect.departureDate === "string" ? <><dt>住宿日期</dt><dd>{formatDate(effect.arrivalDate)} 至 {formatDate(effect.departureDate)}</dd></> : null}
+          {totalNights !== undefined ? <><dt>总住宿晚数</dt><dd>{totalNights} 晚</dd></> : null}
+          <dt>会员权益覆盖</dt><dd>{coveredNights} 晚</dd>
+          {uncoveredNights !== undefined ? <><dt>未覆盖晚数</dt><dd>{uncoveredNights} 晚</dd></> : null}
+          <dt>未覆盖金额</dt><dd><strong>{formatMoney(pricing ? moneyFrom(pricing.cashRemainder) : undefined)}</strong></dd>
+        </dl>
+        <p className="muted compact">确认后创建会员住宿订单，并按本次核对结果冻结可用会员权益。</p>
+      </section>
+    </div>;
+  }
 
   return (
     <div className="effect-summary" data-testid="command-effect">
@@ -310,7 +429,7 @@ function copyText(value: string) {
   void navigator.clipboard?.writeText(value);
 }
 
-function ReceiptPanel({ receipt, onNavigateToResource }: { receipt: ReceiptDto; onNavigateToResource?: () => void }) {
+function ReceiptPanel({ receipt, onNavigateToResource, businessCommand }: { receipt: ReceiptDto; onNavigateToResource?: () => void; businessCommand?: CommandType }) {
   const result = isRecord(receipt.result) ? receipt.result : undefined;
   const orderId = result && typeof result.orderId === "string" ? result.orderId : undefined;
   const primaryGuest = result && isRecord(result.primaryGuest) ? result.primaryGuest : undefined;
@@ -325,6 +444,57 @@ function ReceiptPanel({ receipt, onNavigateToResource }: { receipt: ReceiptDto; 
   const targetCurrentContractAmount = result ? moneyFrom(result.targetCurrentContractAmount) : undefined;
   const manualAdjustmentMinor = result && typeof result.manualAdjustmentMinor === "number" ? result.manualAdjustmentMinor : undefined;
   const committed = receipt.businessCommitted;
+  if (businessCommand === "CREATE_MEMBER") {
+    const memberErrorMessage = receipt.error?.code === "PREVIEW_STALE"
+      ? "会员资料已发生变化，请关闭后重新核对。"
+      : receipt.error?.code === "VALIDATION_ERROR"
+        ? receipt.error.message
+        : receipt.error
+          ? "会员档案未创建，请稍后重新核对。"
+          : undefined;
+    return <section className={`receipt-panel ${committed ? "receipt-success" : "receipt-rejected"}`} data-testid="command-receipt" aria-labelledby="receipt-heading">
+      <div className="receipt-title-row">
+        <span className="receipt-icon" aria-hidden="true">{committed ? <Check size={20} /> : <AlertCircle size={20} />}</span>
+        <div>
+          <h3 id="receipt-heading">{committed ? "会员档案已创建" : "会员档案未创建"}</h3>
+          <p>{committed ? "新会员已加入当前门店的会员列表。" : "本次操作没有写入会员资料。"}</p>
+        </div>
+      </div>
+      {memberErrorMessage ? <div className="receipt-error"><p>{memberErrorMessage}</p></div> : null}
+    </section>;
+  }
+  if (businessCommand && membershipBusinessCommands.has(businessCommand)) {
+    const label = membershipCommandLabel(businessCommand);
+    return <section className={`receipt-panel ${committed ? "receipt-success" : "receipt-rejected"}`} data-testid="command-receipt" aria-labelledby="receipt-heading">
+      <div className="receipt-title-row">
+        <span className="receipt-icon" aria-hidden="true">{committed ? <Check size={20} /> : <AlertCircle size={20} />}</span>
+        <div>
+          <h3 id="receipt-heading">{committed ? `${label}已完成` : `${label}未完成`}</h3>
+          <p>{committed
+            ? businessCommand === "ACTIVATE_MEMBERSHIP_ORDER"
+              ? "会员订单已生效，有效期和 30 夜权益已经生成。"
+              : businessCommand === "CORRECT_MEMBER_ENTITLEMENT_BALANCE"
+                ? "会员可住宿余额和权益变动历史已经更新。"
+                : "会员订单页面已更新。"
+            : "本次操作没有写入会员订单或收款事实。"}</p>
+        </div>
+      </div>
+      {receipt.error?.message ? <div className="receipt-error"><p>{receipt.error.message}</p></div> : null}
+    </section>;
+  }
+  if (businessCommand === "CREATE_ORDER") {
+    return <section className={`receipt-panel ${committed ? "receipt-success" : "receipt-rejected"}`} data-testid="command-receipt" aria-labelledby="receipt-heading">
+      <div className="receipt-title-row">
+        <span className="receipt-icon" aria-hidden="true">{committed ? <Check size={20} /> : <AlertCircle size={20} />}</span>
+        <div>
+          <h3 id="receipt-heading">{committed ? "会员住宿订单已创建" : "会员住宿订单未创建"}</h3>
+          <p>{committed ? "住宿日期、库存和会员权益覆盖已按核对结果记录。" : "本次操作没有写入住宿订单或会员权益变动。"}</p>
+        </div>
+      </div>
+      {receipt.error?.message ? <div className="receipt-error"><p>{receipt.error.message}</p></div> : null}
+      {orderId && committed ? <Link className="button button-secondary" to={`/orders/${encodeURIComponent(orderId)}`} onClick={onNavigateToResource}>查看订单 <ChevronRight aria-hidden="true" size={17} /></Link> : null}
+    </section>;
+  }
   return (
     <section className={`receipt-panel ${committed ? "receipt-success" : "receipt-rejected"}`} data-testid="command-receipt" aria-labelledby="receipt-heading">
       <div className="receipt-title-row">
@@ -386,6 +556,7 @@ export interface PersistedCommandRecovery {
   commandType: CommandType;
   confirmationKey: string;
   targetRefs: string[];
+  presentation?: "MEMBER_STAY";
   state: PersistedCommandRecoveryState;
   receipt?: ReceiptDto;
   updatedAt: string;
@@ -492,6 +663,7 @@ export function readPersistedCommandRecovery(storage: CommandRecoveryStorage, su
     || !value.confirmationKey
     || !Array.isArray(value.targetRefs)
     || !value.targetRefs.every((item) => typeof item === "string")
+    || (value.presentation !== undefined && value.presentation !== "MEMBER_STAY")
     || (value.state !== "CONFIRMING" && value.state !== "UNKNOWN" && value.state !== "EXECUTED" && value.state !== "NOT_EXECUTED")
     || typeof value.updatedAt !== "string") {
     return { kind: "CORRUPT", error: new Error("本地命令恢复记录版本或结构无效；无法确认原命令是否执行，已暂停本物业写命令") };
@@ -548,6 +720,7 @@ export function transitionPersistedCommandRecovery(
         commandType: context.request.commandType,
         confirmationKey: progress.confirmationKey,
         targetRefs: recoveryTargetRefs(context.request.input),
+        ...(context.request.presentation ? { presentation: context.request.presentation } : {}),
         state: "CONFIRMING",
         updatedAt
       }
@@ -572,10 +745,12 @@ export function transitionPersistedCommandRecovery(
 }
 
 export function recoveryCommandRequest(recovery: PersistedCommandRecovery): CommandRequest {
+  const memberStay = recovery.presentation === "MEMBER_STAY";
   return {
     commandType: recovery.commandType,
-    title: `${recovery.commandType} · 原命令恢复`,
-    description: "仅使用已保存的原幂等键查询服务端命令结果，不会发起新的业务写入。",
+    title: memberStay ? "恢复会员住宿结果" : `${recovery.commandType} · 原命令恢复`,
+    description: memberStay ? "系统只查询原住宿办理结果，不会重复创建订单或冻结会员权益。" : "仅使用已保存的原幂等键查询服务端命令结果，不会发起新的业务写入。",
+    ...(recovery.presentation ? { presentation: recovery.presentation } : {}),
     input: { propertyId: recovery.propertyId }
   };
 }
@@ -673,24 +848,48 @@ export function usePersistentCommandRecovery({ subjectId, scopeId }: { subjectId
   return { ready, pending, error, blocked, track, clearResolved };
 }
 
-export function CommandRecoveryBar({ recovery, onOpen, testId = "command-recovery" }: {
+export function CommandRecoveryBar({ recovery, onOpen, testId = "command-recovery", businessFacing = false }: {
   recovery: PersistedCommandRecovery;
   onOpen: () => void;
   testId?: string;
+  businessFacing?: boolean;
 }) {
   const resolved = isTerminalCommandRecovery(recovery.state);
+  const memberStay = recovery.presentation === "MEMBER_STAY";
+  const businessMode = businessFacing || memberStay;
+  const memberRegistration = businessMode && recovery.commandType === "CREATE_MEMBER";
   return (
-    <section className="recovery-bar" role="status" aria-live="polite" aria-label="待恢复命令" data-testid={testId}>
+    <section className="recovery-bar" role="status" aria-live="polite" aria-label={memberRegistration ? "待恢复会员建档" : memberStay ? "待恢复会员住宿" : businessMode ? "待恢复会员操作" : "待恢复命令"} data-testid={testId}>
       <div>
-        <strong>{resolved ? "原命令结果已确认" : "原命令执行状态需要恢复查询"}</strong>
-        <p><code>{recovery.commandType}</code> · {recovery.state} · Property <code>{recovery.propertyId}</code></p>
-        {recovery.targetRefs.length ? <p>业务目标 {recovery.targetRefs.map((reference) => <code key={reference}>{reference}</code>)}</p> : null}
-        <p>原幂等键 <code>{recovery.confirmationKey}</code></p>
-        {recovery.receipt ? <p>Command <code>{recovery.receipt.commandId || "-"}</code> · Receipt <code>{recovery.receipt.receiptId || "-"}</code></p> : null}
-        <p>{resolved ? "查看并关闭 Receipt 后恢复新的业务写入。" : "新的业务写入已暂停，必须继续查询原命令。"}</p>
+        <strong>{businessMode
+          ? memberRegistration
+            ? (resolved ? "原建档结果已确认" : "会员建档结果需要恢复查询")
+            : memberStay
+              ? (resolved ? "原会员住宿结果已确认" : "会员住宿结果需要恢复查询")
+              : (resolved ? "原会员操作结果已确认" : "会员操作结果需要恢复查询")
+          : (resolved ? "原命令结果已确认" : "原命令执行状态需要恢复查询")}</strong>
+        {!businessMode ? <>
+          <p><code>{recovery.commandType}</code> · {recovery.state} · Property <code>{recovery.propertyId}</code></p>
+          {recovery.targetRefs.length ? <p>业务目标 {recovery.targetRefs.map((reference) => <code key={reference}>{reference}</code>)}</p> : null}
+          <p>原幂等键 <code>{recovery.confirmationKey}</code></p>
+          {recovery.receipt ? <p>Command <code>{recovery.receipt.commandId || "-"}</code> · Receipt <code>{recovery.receipt.receiptId || "-"}</code></p> : null}
+        </> : null}
+        <p>{businessMode
+          ? memberRegistration
+            ? (resolved ? "查看并关闭原建档结果后，可继续新建会员。" : "新的会员建档已暂停，请先恢复查询原结果。")
+            : memberStay
+              ? (resolved ? "查看并关闭原住宿结果后，可继续办理住宿。" : "新的会员住宿已暂停，请先恢复查询原结果。")
+              : (resolved ? "查看并关闭原操作结果后，可继续处理会员业务。" : "新的会员操作已暂停，请先恢复查询原结果。")
+          : (resolved ? "查看并关闭 Receipt 后恢复新的业务写入。" : "新的业务写入已暂停，必须继续查询原命令。")}</p>
       </div>
       <button className="button button-secondary" type="button" onClick={onOpen} data-testid={`${testId}-open`}>
-        <RefreshCw aria-hidden="true" size={17} />{resolved ? "查看已确认结果" : "恢复原命令"}
+        <RefreshCw aria-hidden="true" size={17} />{businessMode
+          ? memberRegistration
+            ? (resolved ? "查看建档结果" : "恢复建档结果")
+            : memberStay
+              ? (resolved ? "查看住宿结果" : "恢复住宿结果")
+              : (resolved ? "查看会员操作结果" : "恢复会员操作结果")
+          : (resolved ? "查看已确认结果" : "恢复原命令")}
       </button>
     </section>
   );
@@ -716,14 +915,19 @@ export function CommandDialog({
   const [receipt, setReceipt] = useState<ReceiptDto | undefined>(initialReceipt);
   const [error, setError] = useState<unknown>();
   const [busy, setBusy] = useState(false);
-  const [reasonCode, setReasonCode] = useState("OPERATOR_CONFIRMED");
-  const [reasonNote, setReasonNote] = useState("");
+  const memberProfile = request.commandType === "CREATE_MEMBER";
+  const membershipBusiness = membershipBusinessCommands.has(request.commandType);
+  const memberLodging = request.commandType === "CREATE_ORDER" && request.presentation === "MEMBER_STAY";
+  const businessFacing = memberProfile || membershipBusiness || memberLodging;
+  const [reasonCode, setReasonCode] = useState(memberProfile ? "CREATE_MEMBER_PROFILE" : membershipBusiness ? request.commandType : memberLodging ? "CREATE_MEMBER_STAY" : "OPERATOR_CONFIRMED");
+  const [reasonNote, setReasonNote] = useState(memberProfile ? "创建会员档案" : membershipBusiness ? membershipCommandLabel(request.commandType) : memberLodging ? "创建会员住宿订单" : "");
   const [confirmationKey, setConfirmationKey] = useState(initialConfirmationKey);
   const [networkUncertain, setNetworkUncertain] = useState(Boolean(initialConfirmationKey && !initialReceipt));
   const [failedNotExecuted, setFailedNotExecuted] = useState(false);
   const [returnedOriginalReceipt, setReturnedOriginalReceipt] = useState(Boolean(initialReceipt));
   const [expiryClock, setExpiryClock] = useState(() => Date.now());
   const [previewMetadata, setPreviewMetadata] = useState<ClientCommandMetadata>(() => initialPreviewMetadata ?? api.commandMetadata(`preview-${request.commandType.toLowerCase()}`));
+  const automaticPreviewStarted = useRef(false);
 
   const previewExpiry = preview ? Date.parse(preview.expiresAt) : Number.POSITIVE_INFINITY;
   const previewExpired = Boolean(preview && (!Number.isFinite(previewExpiry) || expiryClock >= previewExpiry));
@@ -766,6 +970,12 @@ export function CommandDialog({
       setBusy(false);
     }
   }
+
+  useEffect(() => {
+    if (!businessFacing || receipt || confirmationKey || writeBlocked || automaticPreviewStarted.current) return;
+    automaticPreviewStarted.current = true;
+    void loadPreview();
+  }, [businessFacing, receipt, confirmationKey, writeBlocked]);
 
   function regeneratePreview() {
     if (writeBlocked || busy || networkUncertain || confirmationKey) return;
@@ -871,43 +1081,52 @@ export function CommandDialog({
       footer={
         <>
           <button className="button button-secondary" type="button" onClick={onClose} disabled={busy}>{receipt ? "完成" : "取消"}</button>
-          {!preview && !receipt && !networkUncertain ? <button className="button button-primary" type="button" onClick={() => void loadPreview()} disabled={busy || writeBlocked} data-testid="create-command-preview">
-            {busy ? <LoaderCircle className="spin" aria-hidden="true" size={17} /> : null}生成服务端预览
+          {!preview && !receipt && !networkUncertain && (!businessFacing || Boolean(error)) ? <button className="button button-primary" type="button" onClick={() => void loadPreview()} disabled={busy || writeBlocked} data-testid="create-command-preview">
+            {busy ? <LoaderCircle className="spin" aria-hidden="true" size={17} /> : null}{businessFacing ? "重新载入核对信息" : "生成服务端预览"}
           </button> : null}
           {preview && previewExpired && !receipt && !confirmationKey && !networkUncertain ? <button className="button button-primary" type="button" onClick={regeneratePreview} disabled={busy || writeBlocked} data-testid="regenerate-command-preview">
-            {busy ? <LoaderCircle className="spin" aria-hidden="true" size={17} /> : <RefreshCw aria-hidden="true" size={17} />}重新生成服务端预览
+            {busy ? <LoaderCircle className="spin" aria-hidden="true" size={17} /> : <RefreshCw aria-hidden="true" size={17} />}{businessFacing ? "重新载入核对信息" : "重新生成服务端预览"}
           </button> : null}
-          {preview && !previewExpired && !receipt && !confirmationKey && !networkUncertain ? <button className="button button-danger command-confirm-button" type="button" onClick={() => void confirm()} disabled={!canConfirm} data-testid="confirm-command">
-            {busy ? <LoaderCircle className="spin" aria-hidden="true" size={17} /> : <Check aria-hidden="true" size={17} />}确认提交：{request.title}
+          {preview && !previewExpired && !receipt && !confirmationKey && !networkUncertain ? <button className={`button ${businessFacing ? "button-primary" : "button-danger"} command-confirm-button`} type="button" onClick={() => void confirm()} disabled={!canConfirm} data-testid="confirm-command">
+            {busy ? <LoaderCircle className="spin" aria-hidden="true" size={17} /> : <Check aria-hidden="true" size={17} />}{memberProfile ? "确认创建会员档案" : membershipBusiness ? `确认${membershipCommandLabel(request.commandType)}` : memberLodging ? "确认创建会员住宿订单" : `确认提交：${request.title}`}
           </button> : null}
         </>
       }
     >
       <p className="command-description">{request.description}</p>
-      <div aria-live="polite" className="sr-status">{busy ? "正在处理命令" : receipt ? `命令状态 ${receipt.executionStatus}` : ""}</div>
-      <InlineError error={error} title={failedNotExecuted ? "命令明确未执行" : "命令处理失败"} />
+      <div aria-live="polite" className="sr-status">{busy ? "正在处理" : receipt ? (receipt.businessCommitted ? "操作已完成" : "操作未完成") : ""}</div>
+      <InlineError
+        error={error}
+        title={failedNotExecuted ? "操作未执行" : "操作处理失败"}
+        hideTechnicalDetails={businessFacing}
+      />
       <InlineError error={writeBlocked && !receipt ? new Error(writeBlockedReason) : undefined} title="写入已暂停" />
-      <InlineError error={previewExpired && !receipt ? new Error("Preview 已过期。库存或授权可能已经变化，请关闭后刷新并重新生成 Preview。") : undefined} title="Preview 已过期" />
+      <InlineError
+        error={previewExpired && !receipt ? new Error(businessFacing ? "本次核对已失效，请重新载入核对信息。" : "Preview 已过期。库存或授权可能已经变化，请关闭后刷新并重新生成 Preview。") : undefined}
+        title={businessFacing ? "核对已失效" : "Preview 已过期"}
+      />
       {!preview && !receipt ? (
         <div className="command-pending">
-          <p>命令类型</p>
-          <code>{request.commandType}</code>
-          <details className="raw-details">
-            <summary>请求输入</summary>
-            <pre>{JSON.stringify(displayCommandInput(request.input), null, 2)}</pre>
-          </details>
+          {businessFacing ? <p>{busy ? (memberProfile ? "正在检查身份证号并载入会员资料。" : memberLodging ? "正在载入会员住宿核对信息。" : "正在载入本次会员操作的核对信息。") : (memberProfile ? "系统会先检查身份证号是否已登记，再显示本次要创建的会员资料。" : memberLodging ? "系统将重新载入会员住宿核对信息。" : "系统将重新载入本次会员操作的核对信息。")}</p> : <>
+            <p>命令类型</p>
+            <code>{request.commandType}</code>
+            <details className="raw-details">
+              <summary>请求输入</summary>
+              <pre>{JSON.stringify(displayCommandInput(request.input), null, 2)}</pre>
+            </details>
+          </>}
         </div>
       ) : null}
       {preview && !receipt ? (
         <>
           <EffectSummary preview={preview} />
-          <section className="reason-section" aria-labelledby="reason-heading">
+          {!businessFacing ? <section className="reason-section" aria-labelledby="reason-heading">
             <h3 id="reason-heading">确认原因</h3>
             <div className="form-grid form-grid-two">
               <label>原因代码<input value={reasonCode} onChange={(event) => setReasonCode(event.target.value)} required maxLength={80} data-testid="reason-code" /></label>
               <label className="span-two">原因说明<textarea value={reasonNote} onChange={(event) => setReasonNote(event.target.value)} required maxLength={1000} rows={3} placeholder="记录本次人工确认依据" data-testid="reason-note" /></label>
             </div>
-          </section>
+          </section> : null}
         </>
       ) : null}
       {receipt && returnedOriginalReceipt ? (
@@ -917,16 +1136,16 @@ export function CommandDialog({
           data-testid="command-recovered-original"
           data-command-state="duplicate-returned-original-receipt"
         >
-          <strong>已返回原 Receipt</strong>
-          <p>服务端按原幂等键解析既有结果，没有重复执行业务命令。</p>
+          <strong>{businessFacing ? "已找到原操作结果" : "已返回原 Receipt"}</strong>
+          <p>{memberProfile ? "系统返回了原来的建档结果，没有重复创建会员。" : membershipBusiness ? "系统返回了原来的操作结果，没有重复写入会员订单或收款。" : memberLodging ? "系统返回了原来的住宿结果，没有重复创建订单或冻结会员权益。" : "服务端按原幂等键解析既有结果，没有重复执行业务命令。"}</p>
         </div>
       ) : null}
-      {receipt ? <ReceiptPanel receipt={receipt} onNavigateToResource={onClose} /> : null}
+      {receipt ? <ReceiptPanel receipt={receipt} onNavigateToResource={onClose} {...(businessFacing ? { businessCommand: request.commandType } : {})} /> : null}
       {networkUncertain && confirmationKey ? (
         <div className="recovery-bar">
-          <div><strong>执行状态需要恢复查询</strong><p>使用原幂等键查询，不会发起新的业务命令。</p></div>
+          <div><strong>{memberProfile ? "建档结果需要恢复查询" : membershipBusiness ? "会员操作结果需要恢复查询" : memberLodging ? "会员住宿结果需要恢复查询" : "执行状态需要恢复查询"}</strong><p>{memberProfile ? "系统会查询原建档结果，不会重复创建会员。" : membershipBusiness ? "系统会查询原操作结果，不会重复写入会员订单或收款。" : memberLodging ? "系统会查询原住宿结果，不会重复创建订单或冻结会员权益。" : "使用原幂等键查询，不会发起新的业务命令。"}</p></div>
           <button className="button button-secondary" type="button" onClick={() => void recover()} disabled={busy}>
-            <RefreshCw aria-hidden="true" size={17} />查询命令结果
+            <RefreshCw aria-hidden="true" size={17} />{memberProfile ? "查询建档结果" : membershipBusiness ? "查询会员操作结果" : memberLodging ? "查询住宿结果" : "查询命令结果"}
           </button>
         </div>
       ) : null}

@@ -3,6 +3,13 @@ title: 'QinTopia PMS Core Operations MVP'
 type: 'feature'
 created: '2026-07-19'
 status: 'done'
+pending_increment_status: 'room-status-all-occupant-nicknames-pending'
+pending_continuous_stay_context_status: 'pending'
+pending_room_status_lifecycle_status: 'pending'
+pending_increment:
+  - '../../待开发项/房态与订单运营流程分步开发计划.md#阶段-5多人间首页显示全部住客昵称'
+  - '../../待开发项/房态与订单运营流程分步开发计划.md#阶段-7连续订单区块选择与订单上下文'
+  - '../../待开发项/房态与订单运营流程分步开发计划.md#阶段-8入住与退房'
 review_loop_iteration: 0
 baseline_commit: 'NO_VCS'
 context:
@@ -45,15 +52,23 @@ context:
 
 **2026 有限计价政策：** 对外价取飞书工作簿 revision 561 的 `2026价格表!A28:F44`，排除底线测算版和取整日均价。`effectiveFrom=2026-02-25`，结束日开放。`N<7` 使用 `N×P1`；`7<=N<14` 使用 `N×P7/7`；`14<=N<30` 使用 `N×P14/14`；`N>=30` 使用 `N×P30/30`。完整住宿精确求和后只对最终总价按人民币元 positive half-up 舍入一次。跨月不拆，允许 6→7、13→14、29→30 夜倒挂。两人/四人整间先把锚点乘 2/4，再应用同一规则。
 
-**连续 Stay：** 计价累计周期是一个 Order 的同一 Stay 内 `[originalArrival, finalDeparture)`。续住、缩短、跨月和无缝 MOVE segment 都按完整累计晚数重选一次档位，并继续使用成交时锁定的 policy version。跨产品换房对每段使用该统一档位下对应产品的精确日分数，所有段求和后最终舍入一次。两个已完成订单不自动合并，也不创建 `continuationOfOrderId`；至少空出一个服务日后的新订单从新入住日重新计价。
+**连续 Stay：** 计价累计周期是一个 Order 的同一 Stay 内 `[originalArrival, finalDeparture)`。续住、缩短、跨月和无缝 MOVE segment 都按完整累计晚数重选一次档位，并继续使用成交时锁定的 policy version。跨产品换房对每段使用该统一档位下对应产品的精确日分数，所有段求和后最终舍入一次。两个已完成订单不自动合并，也不创建 `continuationOfOrderId`；至少空出一个服务日后的新订单从新入住日重新计价。每笔新 COLLECTION/REFUND 由服务端自动保存本次操作所依据的不可变 pricing revision，REFUND 同时引用原 COLLECTION；一个 revision 可对应多笔分次资金事实，该关系只用于追溯原始预订或后续变更，不构成会计分摊、到账、结清或核销。
 
 **会员、免费与手工价：** 会员订单确认时冻结逐日 ROOM_NIGHT/BED_NIGHT coverage，成功 `CHECK_IN` 时核销 HELD；入住前取消/未到释放，普通变更不恢复 CONSUMED。权益不足允许部分覆盖，已选择会员但 0 余额时也对每个未覆盖日期使用 P1，不按未覆盖晚数切档；续充追加新 Lot，可覆盖尚未覆盖日期。免费住宿必须保存原因、金额为 0、永不触碰会员权益；免费变更追加 amendment/revision/审计并要求本次原因。手工调价输入非负整数元最终总价，保存政策基础价与 `target-policyBase`，后续 revision 不继承。会员合同购买款不可退款。
+
+**正常与免费住宿渠道：** 新建正常住宿订单必须保存 `YOUMUDAO|CTRIP|MEITUAN|WECOM` 之一；`WECOM` 的渠道订单号必须为 `null`。免费入住不是渠道订单，`bookingChannelCode` 与 `channelOrderReference` 都必须为 `null`，并改为保存 `freeStayCategoryCode=VOLUNTEER|RECEPTION` 和具体免费原因。数据库可为历史免费订单保留真实 `null` 分类，Query/DTO 原样返回且 Web 仅派生显示“历史未记录”；不得虚构回填义工、接待或第五个渠道。本段是对早期“所有新 Order 渠道必填”表述的用户最新精确覆盖。
 
 **会员身份：** 会员档案手工保存姓名、唯一身份证号业务键、手机号和微信号；内部关系使用不可变 `memberId`。余额必须由该会员 Lot/Ledger 服务端计算，支持身份证号查找，不把余额当作可覆盖档案字段。
 
 **居住人昵称与身份边界：** 每个新建订单的不可变主要居住人快照必须保存去除首尾空白后仍非空的昵称；昵称属于该订单成交时的居住人事实，不从会员档案动态读取，也不随会员资料变化而改写历史订单。历史主要居住人快照可能缺少 `nickname` JSON 键，也可能显式保存 `null`；Query/API 必须忠实保留原始缺键或 `null` 形态，不伪造业务值，也不把两者强制归一化成新事实。Web 可对这两种情况派生显示“历史未记录”，但不得持久化该提示或其他虚构昵称。会员只表示权益/结算方式差异，不拥有或替代居住人身份；非会员与会员订单使用同一主要居住人快照规则。
 
-**多人间父房聚合：** 拆床销售房间的逐日父格使用 `已占床位数/实体床位总数`，例如四人间三个子床具有有效住宿事实时显示 `3/4`。分子只统计当天由有效正常 `Order` 或 `FREE_STAY` 住宿事实占用的不同子床；维修/锁房、`INTERNAL_USE`、清洁和其他非居住人来源不进入该住客占用比例。空间允许时父格优先显示居住人快照昵称；紧凑格至少保留比例，并在鼠标悬停及键盘聚焦时提供全部有权查看的昵称列表。该聚合是服务端事实投影，不改变整房与子床的双向互斥规则。
+**多人间父房聚合：** 拆床销售房间的逐日父格使用 `已占床位数/实体床位总数`，例如四人间三个子床具有有效住宿事实时显示 `3/4`。分子只统计当天由有效正常 `Order` 或 `FREE_STAY` 住宿事实占用的不同子床；维修/锁房、`INTERNAL_USE`、清洁和其他非居住人来源不进入该住客占用比例。父房格必须按床位稳定顺序直接显示当天每一个有权查看的居住人快照昵称，不得折叠成“首个昵称 +N”、只保留比例或要求悬停后才能看到其余昵称；同名住客也按不同床位分别保留。格子和整行应换行或增高以容纳最多四个昵称，不能覆盖比例、日期或相邻内容。Tooltip/键盘详情继续补充床号、来源和完整语义，但不是昵称的唯一载体。该聚合是服务端事实投影，不改变整房与子床的双向互斥规则。
+
+**连续住宿选择与订单上下文：** 房态中的正常或免费住宿必须以服务端稳定 Order/Stay 引用作为选择身份。点击已占连续区块、其中任一天或对应住客昵称，选择同一 Stay 从原始入住日至当前退房日的完整连续住宿；续住不拆分成另一张订单，无缝换房则同时选择跨房源行的全部住宿分段，但选中容器内部必须保留原始预订、续住、缩短和换房 segment/amendment 的可见审计边界。不同订单、存在日期间隔的新住宿和相同昵称的其他住客不得合并。已占订单被选择后，工作人员右侧先显示当前住宿安排，再显示可定位到具体日期段的变更记录、对应计价修订及相关收退款事实；只查看某次变更不得改变整张订单的选择身份。右侧同时使用服务端当前允许动作，不显示报价、会员搜索、草稿日期或创建订单控件；空白选区仍进入创建住宿或 Block 的流程。浏览器不得根据昵称或相邻逐日格重建 Stay。
+
+**房态工作人员状态语言：** 新订单至入住前显示“已预订”，`CHECK_IN` 成功后活动 Stay 显示“在住”，`CHECK_OUT` 后订单显示“已退房”且退房日按运营事实显示“待清洁”，清洁完成后恢复“可售”。服务端 `blocking`、`conflicts`、Claim 和稳定引用继续作为可售、互斥、重验与审计事实，但正常已预订/在住格、Tooltip、屏读名称和常规订单上下文不得显示“阻断、N 个阻断、阻断库存、库存 Claim”等机器语言；只有实际业务操作被已有事实拒绝或房态异常时，才以具体房源、日期和原因的中文业务句子说明。
+
+**待实施状态：** 上述“父房格直接显示全部昵称”“连续住宿选择与订单上下文”“房态工作人员状态语言”和“资金事实关联所依据计价修订”均为原 MVP 完成后的最新增量，分别由 `待开发项/房态与订单运营流程分步开发计划.md` 阶段 5、阶段 7、阶段 8 与阶段 13 跟踪，尚未实现或完成人工验收。本文件 frontmatter 的 `status: done`、既有 Execution 勾选和历史测试数量只代表 commit `4fbf90d` 之前的核心基线，不能作为这些增量已完成的证据。
 
 **飞书申请引用：** 飞书 Base 原生 `record_id` 只标识一次入住申请，不是会员 ID；同一自然人可有多个申请。PMS 以 `provider + source container + table + external_record_id` 唯一保存 append-only 外部引用并关联 `memberId`。身份证号已存在时复用既有会员并追加申请引用，不覆盖档案；Base 回写 `memberId` 只是可选投影，失败不影响 PMS。Base 不得发放、冻结或核销权益，现有 webhook 认证值不得进入代码、日志或文档，必须作为独立受控密钥轮换。
 
@@ -78,16 +93,21 @@ context:
 - [x] `tests/` -- 覆盖计价金标、并发/回滚/陈旧/重放、安全、契约、无障碍和 E2E。
 
 **Confirmed field increment acceptance:**
-- Given 新订单，when Preview/Confirm，then 必须持久化 `YOUMUDAO|CTRIP|MEITUAN|WECOM` 稳定 code 与 nullable 渠道订单号；`WECOM` 只能保存 `null`。
-- Given 新 COLLECTION 或 REFUND，when Preview/Confirm，then 必须保存该事实自身的非空 `transactionReference`；退款仍引用原 COLLECTION，REVERSAL 保持无交易号语义。
+- Given 新建正常住宿订单，when Preview/Confirm，then 必须持久化 `YOUMUDAO|CTRIP|MEITUAN|WECOM` 稳定 code 与 nullable 渠道订单号；`WECOM` 只能保存 `null`。
+- Given 新建免费入住，when Preview/Confirm，then 渠道与渠道订单号必须为 `null`，并保存 `VOLUNTEER|RECEPTION` 稳定免费类型和具体原因；历史分类空值不得虚构回填。
+- Given 新 COLLECTION 或 REFUND，when Preview/Confirm，then 必须保存该事实自身的非空 `transactionReference`，并由服务端绑定 Preview 所依据的不可变 pricing revision；退款仍引用原 COLLECTION，REVERSAL 保持无交易号语义。若确认前 current revision 改变则陈旧拒绝且零写入；历史资金事实缺少 revision 关联时保持真实 `null`，不得虚构回填。
 - Given 缺失/非法字段或幂等重放，when 命令执行，then 缺失值零业务写入，同键同载荷返回原 Receipt 且不重复产生 Order/Fact。
 - Given Web/API 查询，when 查看 Preview、Receipt 与订单详情，then 渠道和每笔交易号均可追溯，且不被解释为外部已到账、已结清或已核销。
 
 **Confirmed guest nickname and room-status acceptance:**
 - Given 新建正常或免费住宿订单，when Preview/Confirm，then 主要居住人快照必须包含非空昵称，Receipt/Query 返回最终持久昵称；会员选择与否不改变该校验。
 - Given 历史订单的主要居住人快照缺少 `nickname` 键或显式保存 `null`，when Query/API/Web 展示，then API 忠实保留对应的缺键或 `null` 形态，Web 只派生显示“历史未记录”，且不会产生回填写入。
-- Given 多人间的不同子床在同一天由正常订单或免费住宿占用，when 查询/展示父房格，then 显示 `已占/总床数` 并优先显示昵称；空间不足时至少显示比例，悬停和键盘聚焦可查看全部有权昵称。
+- Given 多人间的不同子床在同一天由正常订单或免费住宿占用，when 查询/展示父房格，then 同时显示 `已占/总床数` 与按床位稳定顺序排列的全部有权昵称，不得使用“昵称 +N”、去重、截掉后续昵称或仅在悬停时补全；悬停和键盘聚焦继续提供床号与来源详情。
 - Given 同一多人间存在维修、内部占用或清洁来源，when 计算住客占用比例，then 这些来源不增加分子，但仍按各自 typed source 和既有冲突规则呈现。
+- Given 点击已占订单的任一天、连续区块或住客昵称，when 房态选择该来源，then 必须通过稳定 Order/Stay 引用选择完整连续住宿；续住后的日期和无缝换房的跨房分段共同高亮，但原始预订和各次 amendment/segment 边界仍可见、可定位、可查询，相邻独立订单、有日期间隔的新住宿及相同昵称订单不合并。
+- Given 已占订单被选择，when 打开右侧上下文，then 显示权威订单基础信息、完整日期与分段，以及服务端按状态和权限返回的合法操作；不得显示 Quote、会员搜索、草稿日期、“应用选区”或创建订单控件，也不得由浏览器拼接逐日格推断 Stay。
+- Given 正常或免费住宿已占用库存，when 工作人员查看格子、Tooltip、屏读名称或订单上下文，then 只看到“已预订/在住”、昵称、日期和适用业务信息，不看到“阻断、Claim、冲突数量”等机器词；底层冲突事实仍完整参与可售与事务校验。
+- Given 工作人员依次办理入住、退房和完成清洁，when 房态刷新，then 工作人员文字依次为“已预订 → 在住 → 已退房/待清洁 → 可售”，内部枚举不得成为主界面文案。
 
 **Acceptance Criteria:**
 - Given 空目录与 README，when 安装并启动，then PostgreSQL 迁移/种子、演示账号、health/readiness、Web 和 OpenAPI 可用。
@@ -100,7 +120,7 @@ context:
 
 PostgreSQL 按需创建 `room_day`，按稳定顺序 `SELECT ... FOR UPDATE`。成功业务事实与 Receipt 同事务提交；opaque Token 由客户端生成和保管、服务端仅存哈希，Preview/Receipt 均不返回 secret；有效权限取主体当前授权与 Token 上限/物业范围的交集。Preview 绑定主体、物业、命令类型、规范化输入哈希、effect hash、订单/库存/权益/政策版本和有效期；Confirm 正文必须重复精确的 `propertyId` 和 `commandType`。
 
-订单渠道与外部交易号兼容边界：历史 `orders.booking_channel_code` 和历史 `collection_facts.transaction_reference` 允许保持真实 `null`，Query/DTO 原样返回，Web 仅派生显示“历史未记录”。不得以 `WECOM`、`UNKNOWN`、`LEGACY`、Fact/Receipt/Command/correlation/idempotency 标识伪造业务事实。数据库 nullable 列兼容历史行，但新插入触发器与应用命令共同保证：新 Order 必须使用四个已确认渠道之一；`WECOM` 的渠道订单号必须为 `null`；新 COLLECTION/REFUND 必须录入自身非空外部交易号；REVERSAL 的交易号保持 `null`。历史空值属于待运营补录的迁移债务，不降低新写入校验。
+订单渠道、外部交易号与计价修订兼容边界：历史 `orders.booking_channel_code`、历史 `collection_facts.transaction_reference` 及历史资金事实的 pricing revision 关联允许保持真实 `null`，Query/DTO 原样返回，Web 仅派生显示“历史未记录”或“历史未关联”。不得以 `WECOM`、`UNKNOWN`、`LEGACY`、Fact/Receipt/Command/correlation/idempotency 标识伪造业务事实。数据库 nullable 列兼容历史行，但新插入触发器与应用命令共同保证：新建正常住宿 Order 必须使用四个已确认渠道之一，`WECOM` 的渠道订单号必须为 `null`；新建免费住宿 Order 的渠道和渠道订单号必须为 `null`，并严格校验免费类型和原因；新 COLLECTION/REFUND 必须录入自身非空外部交易号，并自动绑定 Preview 时本次操作所依据的 pricing revision；REVERSAL 的交易号保持 `null`，通过被冲销 Fact 间接追溯。一个 revision 可关联多笔分次资金事实，REFUND 还要引用同订单原 COLLECTION。历史空值属于待运营补录的兼容状态，不降低新写入校验，也不得把该关联解释成外部到账或会计结算。
 
 连续日期边界不扩展成跨订单资金关系：只有同一 Stay 内前段 departure 等于后段 arrival 的 segment 才能无缝累计。已结账订单与后来订单保持各自稳定 orderId、pricing revisions 和资金 Facts，避免自动合并破坏“不跨订单分摊”。
 

@@ -13,6 +13,7 @@ const agentJourneyDatabaseUrl = process.env.AGENT_JOURNEY_CONTRACT_DATABASE_URL
 const foreignSubjectId = "subject_agent_journey_foreign";
 const foreignTokenId = "token_agent_journey_foreign";
 const foreignToken = "qtp_agent_journey_foreign_2026";
+const memberRoomId = "unit_room_d_gen_01";
 
 type PreviewDto = {
   previewId: string;
@@ -293,12 +294,12 @@ describe("scoped agent HTTP core journey", () => {
       },
       payload: {
         propertyId: demo.propertyId,
-        inventoryUnitId: demo.roomId,
+        inventoryUnitId: memberRoomId,
         stayType: "TRANSIENT",
         arrivalDate: "2028-04-10",
         departureDate: "2028-04-13",
         pricingPolicyVersionId: demo.transientPolicyId,
-        memberContractId: demo.memberContractId
+        memberId: demo.memberId
       }
     } as const;
     const quoteResponse = await app.inject(quoteRequest);
@@ -315,12 +316,13 @@ describe("scoped agent HTTP core journey", () => {
     });
     expect(quote).toMatchObject({
       propertyId: demo.propertyId,
-      inventoryUnitId: demo.roomId,
+      inventoryUnitId: memberRoomId,
+      memberId: demo.memberId,
       memberContractId: demo.memberContractId,
       pricingPolicyVersionId: demo.transientPolicyId,
       coverageSet: [
-        { serviceDate: "2028-04-10", inventoryUnitId: demo.roomId, unitKind: "ROOM_NIGHT", entitlementLotId: demo.roomLotId },
-        { serviceDate: "2028-04-11", inventoryUnitId: demo.roomId, unitKind: "ROOM_NIGHT", entitlementLotId: demo.roomLotId }
+        { serviceDate: "2028-04-10", inventoryUnitId: memberRoomId, unitKind: "ROOM_NIGHT", entitlementLotId: demo.roomLotId },
+        { serviceDate: "2028-04-11", inventoryUnitId: memberRoomId, unitKind: "ROOM_NIGHT", entitlementLotId: demo.roomLotId }
       ],
       cashRemainder: { currency: "CNY", minorUnits: 12_000 },
       currentContractAmount: { currency: "CNY", minorUnits: 12_000 }
@@ -347,19 +349,17 @@ describe("scoped agent HTTP core journey", () => {
         nickname: "Scoped Guest",
         phone: "13800000000",
         documentNumber: "AGENT-HTTP-2028"
-      },
-      bookingChannelCode: "MEITUAN",
-      channelOrderReference: "TEST-AGENT-ORDER-2028"
+      }
     }, "create-order");
     expect(created.preview.effect).toMatchObject({
       primaryGuest: { fullName: "Scoped Agent Journey Guest", nickname: "Scoped Guest" },
-      bookingChannelCode: "MEITUAN",
-      channelOrderReference: "TEST-AGENT-ORDER-2028"
+      bookingChannelCode: null,
+      channelOrderReference: null
     });
     expect(created.receipt.result).toMatchObject({
       primaryGuest: { fullName: "Scoped Agent Journey Guest", nickname: "Scoped Guest" },
-      bookingChannelCode: "MEITUAN",
-      channelOrderReference: "TEST-AGENT-ORDER-2028"
+      bookingChannelCode: null,
+      channelOrderReference: null
     });
     const orderId = created.receipt.result?.orderId as string;
     expect(orderId).toMatch(/^order_/);

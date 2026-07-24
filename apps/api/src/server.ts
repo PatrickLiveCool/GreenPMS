@@ -255,10 +255,10 @@ export async function buildServer(db: Kysely<Database>) {
       propertyIds.length ? db.selectFrom("inventory_units").selectAll().where("property_id", "in", propertyIds).where("active", "=", true).orderBy("code").execute() : [],
       propertyIds.length ? db.selectFrom("pricing_policy_versions").selectAll().where("property_id", "in", propertyIds).orderBy("code").execute() : [],
       propertyIds.length ? db.selectFrom("members")
-        .innerJoin("member_contracts", "member_contracts.member_id", "members.id")
+        .innerJoin("member_property_links", "member_property_links.member_id", "members.id")
         .selectAll("members")
         .distinct()
-        .where("member_contracts.property_id", "in", propertyIds)
+        .where("member_property_links.property_id", "in", propertyIds)
         .orderBy("members.full_name")
         .execute() : [],
       propertyIds.length ? db.selectFrom("member_contracts").selectAll().where("property_id", "in", propertyIds).orderBy("member_name").execute() : []
@@ -380,10 +380,10 @@ export async function buildServer(db: Kysely<Database>) {
   });
 
   app.get("/api/v1/members", { schema: { tags: ["queries"], querystring: MembersQuerySchema, response: { 200: MembersListResponseSchema, 400: ErrorResponse, 401: ErrorResponse, 403: ErrorResponse, 429: ErrorResponse, ...InternalErrorResponses } } }, async (request) => {
-    const query = request.query as { propertyId: string; identityCardNumber?: string };
+    const query = request.query as { propertyId: string; query?: string };
     const principal = await requirePrincipal(db, request);
     requirePropertyAccess(principal, query.propertyId, "READ");
-    return { members: await listMemberSummaries(db, query.propertyId, query.identityCardNumber) };
+    return { members: await listMemberSummaries(db, query.propertyId, query.query) };
   });
 
   app.get("/api/v1/members/:id", { schema: { tags: ["queries"], params: IdParams, querystring: Type.Object({ propertyId: Id }, { additionalProperties: false }), response: { 200: MemberResponseSchema, 400: ErrorResponse, 401: ErrorResponse, 403: ErrorResponse, 404: ErrorResponse, 429: ErrorResponse, ...InternalErrorResponses } } }, async (request) => {

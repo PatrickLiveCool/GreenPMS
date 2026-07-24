@@ -4,7 +4,7 @@ import { promisify } from "node:util";
 import pg from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createDatabase } from "@qintopia/db";
-import { seedDemo } from "../../packages/db/src/seed.ts";
+import { demo, seedDemo } from "../../packages/db/src/seed.ts";
 
 const execFileAsync = promisify(execFile);
 const adminUrl = process.env.MIGRATION_CONCURRENCY_ADMIN_DATABASE_URL
@@ -62,8 +62,12 @@ describe("database migration concurrency", () => {
         .sort();
       const rows = await client.query<{ name: string }>("SELECT name FROM schema_migrations ORDER BY name");
       expect(rows.rows.map((row) => row.name)).toEqual(expectedMigrations);
-      expect(expectedMigrations).toHaveLength(14);
-      expect(expectedMigrations).toContain("014_new_order_primary_guest_nickname.sql");
+      expect(expectedMigrations).toHaveLength(19);
+      expect(expectedMigrations).toContain("015_generated_room_operational_codes.sql");
+      expect(expectedMigrations).toContain("016_member_property_links.sql");
+      expect(expectedMigrations).toContain("017_membership_orders.sql");
+      expect(expectedMigrations).toContain("018_member_stay_identity_and_coverage_guards.sql");
+      expect(expectedMigrations).toContain("019_member_stay_booking_channel_rules.sql");
     } finally {
       await client.end();
     }
@@ -92,6 +96,7 @@ describe("database migration concurrency", () => {
       await seeded.destroy();
     }
 
+    let historicalFactsBefore: { contracts: number; lots: number; ledger: number } | undefined;
     const legacy = new pg.Client({ connectionString: databaseUrl.toString() });
     await legacy.connect();
     try {
@@ -122,6 +127,24 @@ describe("database migration concurrency", () => {
           '2030-01-01', '2030-07-01', 'Historical long maintenance interval', 'ACTIVE', 1, NULL
         )
       `);
+      await legacy.query(`
+        INSERT INTO members (id, identity_card_number, full_name, phone, wechat)
+        VALUES ('member_external_only_legacy', 'EXTERNAL-ONLY-LEGACY', 'External only legacy', '13900009991', 'external-only-legacy')
+      `);
+      await legacy.query(`
+        INSERT INTO member_external_references (
+          id, member_id, property_id, provider, source_container_id, source_table_id, external_record_id
+        ) VALUES (
+          'memberref_external_only_legacy', 'member_external_only_legacy', 'prop_qintopia_demo',
+          'FEISHU_BASE', 'legacy-container', 'legacy-table', 'legacy-external-only-record'
+        )
+      `);
+      historicalFactsBefore = (await legacy.query<{ contracts: number; lots: number; ledger: number }>(`
+        SELECT
+          (SELECT count(*)::int FROM member_contracts) AS contracts,
+          (SELECT count(*)::int FROM entitlement_lots) AS lots,
+          (SELECT count(*)::int FROM entitlement_ledger) AS ledger
+      `)).rows[0];
     } finally {
       await legacy.end();
     }
@@ -139,6 +162,53 @@ describe("database migration concurrency", () => {
       );
       expect(catalog.rows[0]?.catalog_version).not.toBeNull();
       expect((await upgraded.query("SELECT 1 FROM room_status_revisions LIMIT 1")).rowCount).toBe(1);
+      const memberLinks = await upgraded.query<{ member_id: string; property_id: string }>(
+        "SELECT member_id, property_id FROM member_property_links WHERE member_id = $1 AND property_id = $2",
+        [demo.memberId, demo.propertyId]
+      );
+      expect(memberLinks.rows).toEqual([{ member_id: demo.memberId, property_id: demo.propertyId }]);
+      const externalOnlyLinks = await upgraded.query<{ member_id: string; property_id: string }>(
+        "SELECT member_id, property_id FROM member_property_links WHERE member_id = 'member_external_only_legacy'"
+      );
+      expect(externalOnlyLinks.rows).toEqual([{ member_id: "member_external_only_legacy", property_id: demo.propertyId }]);
+      const historicalFactsAfter = (await upgraded.query<{ contracts: number; lots: number; ledger: number }>(`
+        SELECT
+          (SELECT count(*)::int FROM member_contracts) AS contracts,
+          (SELECT count(*)::int FROM entitlement_lots) AS lots,
+          (SELECT count(*)::int FROM entitlement_ledger) AS ledger
+      `)).rows[0];
+      expect(historicalFactsAfter).toEqual(historicalFactsBefore);
+
+      await upgraded.query(`
+        INSERT INTO members (id, identity_card_number, full_name, phone, wechat) VALUES
+          ('member_contract_during_cutover', 'CONTRACT-DURING-CUTOVER', 'Contract cutover', '13900009992', 'contract-cutover'),
+          ('member_reference_during_cutover', 'REFERENCE-DURING-CUTOVER', 'Reference cutover', '13900009993', 'reference-cutover')
+      `);
+      await upgraded.query(`
+        INSERT INTO member_contracts (
+          id, property_id, member_id, member_name, status, valid_from, valid_until, version
+        ) VALUES (
+          'contract_during_cutover', 'prop_qintopia_demo', 'member_contract_during_cutover',
+          'Contract cutover', 'ACTIVE', '2026-01-01', '2026-12-31', 1
+        )
+      `);
+      await upgraded.query(`
+        INSERT INTO member_external_references (
+          id, member_id, property_id, provider, source_container_id, source_table_id, external_record_id
+        ) VALUES (
+          'memberref_during_cutover', 'member_reference_during_cutover', 'prop_qintopia_demo',
+          'FEISHU_BASE', 'cutover-container', 'cutover-table', 'cutover-record'
+        )
+      `);
+      const cutoverLinks = await upgraded.query<{ member_id: string }>(`
+        SELECT member_id FROM member_property_links
+        WHERE member_id IN ('member_contract_during_cutover', 'member_reference_during_cutover')
+        ORDER BY member_id
+      `);
+      expect(cutoverLinks.rows).toEqual([
+        { member_id: "member_contract_during_cutover" },
+        { member_id: "member_reference_during_cutover" }
+      ]);
       const longMaintenance = await upgraded.query<{ nights: number }>(
         "SELECT departure_date - arrival_date AS nights FROM maintenance_locks WHERE id = 'maint_legacy_long_interval'"
       );

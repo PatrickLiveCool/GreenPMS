@@ -8,7 +8,7 @@ import {
   listMemberSummaries,
   type Database
 } from "@qintopia/db";
-import type { Kysely } from "kysely";
+import { sql, type Kysely } from "kysely";
 import { demo } from "../../packages/db/src/seed.ts";
 import { createQuoteForTesting as createQuote } from "../../packages/db/src/pricing-service.ts";
 import { resetDatabase } from "../helpers/database.ts";
@@ -62,9 +62,7 @@ async function createMemberOrder(prefix: string, arrivalDate: string, departureD
     input: {
       propertyId: demo.propertyId,
       quoteId: quote.quoteId,
-      primaryGuest: { fullName: `Member lifecycle ${prefix}`, nickname: `Member ${prefix}` },
-      bookingChannelCode: "WECOM",
-      channelOrderReference: null
+      primaryGuest: { fullName: `Member lifecycle ${prefix}`, nickname: `Member ${prefix}` }
     }
   }, `${prefix}-create-order`);
   return receipt.result!.orderId as string;
@@ -78,188 +76,170 @@ afterEach(async () => {
   await db.destroy();
 });
 
-describe("member profile registration and derived balances", () => {
-  it("creates one immutable member identity, one initial empty contract, and an append-only Feishu application reference", async () => {
-    const envelope: CommandEnvelope = {
-      commandType: "CREATE_MEMBER",
-      input: {
-        propertyId: demo.propertyId,
-        fullName: "张三",
-        identityCardNumber: "31000019900101001x",
-        phone: "13800000088",
-        wechat: "zhangsan-wechat",
-        validFrom: "2026-08-01",
-        validUntil: "2027-07-31",
-        sourceApplicationRecordId: "rec_member_application_001"
-      }
+describe("member profile registration and directory", () => {
+  const memberEnvelope = (identityCardNumber: string, fullName = "张三"): CommandEnvelope => ({
+    commandType: "CREATE_MEMBER",
+    input: {
+      propertyId: demo.propertyId,
+      fullName,
+      identityCardNumber,
+      phone: "13800000088",
+      wechat: "zhangsan-wechat"
+    }
+  });
+
+  it("atomically creates only a member profile and current-property link", async () => {
+    const envelope = memberEnvelope("31000019900101001x");
+    const before = {
+      members: await db.selectFrom("members").select("id").execute(),
+      links: await db.selectFrom("member_property_links").selectAll().execute(),
+      contracts: await db.selectFrom("member_contracts").select("id").execute(),
+      lots: await db.selectFrom("entitlement_lots").select("id").execute(),
+      ledger: await db.selectFrom("entitlement_ledger").select("fact_id").execute(),
+      references: await db.selectFrom("member_external_references").select("id").execute()
     };
     const createdPreview = await preview(envelope, "create-member");
-    expect(createdPreview.preview.effect).toMatchObject({
-      operation: "CREATE_MEMBER_WITH_INITIAL_CONTRACT",
+    expect(createdPreview.preview.effect).toEqual({
+      operation: "CREATE_MEMBER_PROFILE",
       memberId: null,
-      memberContractId: null,
-      profileMatch: true,
-      member: { identityCardNumber: "31000019900101001X" },
-      contract: { operation: "CREATE_INITIAL_EMPTY_CONTRACT", validFrom: "2026-08-01", validUntil: "2027-07-31" },
-      externalReference: {
-        operation: "CREATE_LINK",
-        provider: "FEISHU_BASE",
-        sourceContainerId: "wiki:FtxUwOE6diwS8wkmaawcDhEPnMc",
-        sourceTableId: "tbl4OryeWd0Td8jN",
-        externalRecordId: "rec_member_application_001"
-      }
+      member: {
+        fullName: "张三",
+        identityCardNumber: "31000019900101001X",
+        phone: "13800000088",
+        wechat: "zhangsan-wechat"
+      },
+      propertyLink: { operation: "CREATE" }
     });
     const receipt = await confirmCommandPreview(db, principal, createdPreview.preview.previewId, {
       propertyId: demo.propertyId,
       commandType: "CREATE_MEMBER",
       confirmation: true,
       expectedEffectHash: createdPreview.preview.effectHash,
-      reason: { code: "MEMBER_CREATED", note: "Create member from a verified application" }
+      reason: { code: "CREATE_MEMBER_PROFILE", note: "创建会员档案" }
     }, metadata("create-member-confirm"));
-    expect(receipt.result).toMatchObject({
-      memberCreated: true,
-      memberContractCreated: true,
-      externalReferenceCreated: true
-    });
+    expect(receipt.result).toMatchObject({ memberCreated: true });
     const memberId = receipt.result!.memberId as string;
-    const contractId = receipt.result!.memberContractId as string;
-    const externalReferenceId = receipt.result!.memberExternalReferenceId as string;
-    expect(receipt.resourceRefs).toEqual([memberId, contractId, externalReferenceId]);
+    expect(receipt.resourceRefs).toEqual([memberId]);
+    expect(await db.selectFrom("members").select("id").execute()).toHaveLength(before.members.length + 1);
+    expect(await db.selectFrom("member_property_links").selectAll().execute()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ member_id: memberId, property_id: demo.propertyId })
+    ]));
+    expect(await db.selectFrom("member_property_links").selectAll().execute()).toHaveLength(before.links.length + 1);
+    expect(await db.selectFrom("member_contracts").select("id").execute()).toHaveLength(before.contracts.length);
+    expect(await db.selectFrom("entitlement_lots").select("id").execute()).toHaveLength(before.lots.length);
+    expect(await db.selectFrom("entitlement_ledger").select("fact_id").execute()).toHaveLength(before.ledger.length);
+    expect(await db.selectFrom("member_external_references").select("id").execute()).toHaveLength(before.references.length);
 
     const view = await getMemberView(db, demo.propertyId, memberId);
-    expect(view.member).toMatchObject({ id: memberId, identity_card_number: "31000019900101001X", full_name: "张三" });
-    expect(view.contracts).toEqual([expect.objectContaining({ id: contractId, member_id: memberId, status: "ACTIVE" })]);
-    expect(view.availableBalance).toEqual({ ROOM_NIGHT: 0, BED_NIGHT: 0 });
-    expect(view.externalReferences).toEqual([expect.objectContaining({ id: externalReferenceId, external_record_id: "rec_member_application_001" })]);
-    await expect(db.insertInto("members").values({
-      id: "member_duplicate_identity_case",
-      identity_card_number: "31000019900101001x",
-      full_name: "Duplicate Identity",
-      phone: "13800000089",
-      wechat: "duplicate-identity"
-    }).execute()).rejects.toMatchObject({ constraint: "members_identity_card_number_key" });
+    expect(view.member).toMatchObject({ identity_card_number: "31000019900101001X", full_name: "张三" });
+    expect(view).toMatchObject({ contracts: [], lots: [], ledger: [], externalReferences: [], availableBalance: { ROOM_NIGHT: 0, BED_NIGHT: 0 } });
+    await expect(db.updateTable("member_property_links").set({ property_id: "changed" }).where("member_id", "=", memberId).execute())
+      .rejects.toThrow(/member_property_links is append-only/);
+  });
 
+  it("rolls back the member row when the property link cannot be inserted", async () => {
+    const identityCardNumber = "TEST-MEMBER-LINK-ROLLBACK";
+    const linksBefore = await db.selectFrom("member_property_links").select("member_id").execute();
+    const created = await preview(memberEnvelope(identityCardNumber, "回滚会员"), "member-link-rollback");
+    await sql`
+      CREATE FUNCTION qintopia_reject_test_member_link() RETURNS trigger
+      LANGUAGE plpgsql AS $$
+      BEGIN
+        IF EXISTS (
+          SELECT 1 FROM members
+          WHERE id = NEW.member_id AND identity_card_number = 'TEST-MEMBER-LINK-ROLLBACK'
+        ) THEN
+          RAISE EXCEPTION 'test member link failure';
+        END IF;
+        RETURN NEW;
+      END;
+      $$
+    `.execute(db);
+    await sql`
+      CREATE TRIGGER reject_test_member_link
+      BEFORE INSERT ON member_property_links
+      FOR EACH ROW EXECUTE FUNCTION qintopia_reject_test_member_link()
+    `.execute(db);
+    try {
+      const rejected = await confirmCommandPreview(db, principal, created.preview.previewId, {
+        propertyId: demo.propertyId,
+        commandType: "CREATE_MEMBER",
+        confirmation: true,
+        expectedEffectHash: created.preview.effectHash,
+        reason: { code: "CREATE_MEMBER_PROFILE", note: "验证原子回滚" }
+      }, metadata("member-link-rollback-confirm"));
+      expect(rejected).toMatchObject({ executionStatus: "NOT_EXECUTED", businessCommitted: false });
+      expect(await db.selectFrom("members").select("id").where("identity_card_number", "=", identityCardNumber).execute()).toEqual([]);
+      expect(await db.selectFrom("member_property_links").select("member_id").execute()).toEqual(linksBefore);
+    } finally {
+      await sql`DROP TRIGGER reject_test_member_link ON member_property_links`.execute(db);
+      await sql`DROP FUNCTION qintopia_reject_test_member_link()`.execute(db);
+    }
+  });
+
+  it("rejects a normalized duplicate identity while allowing repeated phone and WeChat values", async () => {
+    const first = await confirm(memberEnvelope("TEST-UNIQUE-MEMBER-ID", "第一位会员"), "unique-member-first");
+    await expect(preview(memberEnvelope(" test-unique-member-id ", "重复会员"), "unique-member-duplicate"))
+      .rejects.toThrow("该身份证号已登记，不能重复创建会员档案");
+    const second = await confirm(memberEnvelope("TEST-SECOND-MEMBER-ID", "第二位会员"), "unique-member-second");
+    expect(first.result!.memberId).not.toBe(second.result!.memberId);
+    expect(await db.selectFrom("members").select("id").where("phone", "=", "13800000088").execute()).toHaveLength(2);
+    expect(await db.selectFrom("members").select("id").where("wechat", "=", "zhangsan-wechat").execute()).toHaveLength(2);
+  });
+
+  it("searches all four profile fields by safe partial text and enforces property isolation", async () => {
+    const created = await confirm({
+      commandType: "CREATE_MEMBER",
+      input: {
+        propertyId: demo.propertyId,
+        fullName: "李晓云",
+        identityCardNumber: "SEARCH-ID-998877X",
+        phone: "13912345678",
+        wechat: "cloud-search-wechat"
+      }
+    }, "search-member");
+    const memberId = created.result!.memberId as string;
+    for (const query of ["晓云", "998877x", "123456", "search-wechat"]) {
+      expect(await listMemberSummaries(db, demo.propertyId, query)).toEqual([
+        expect.objectContaining({ member: expect.objectContaining({ id: memberId }) })
+      ]);
+    }
+    expect(await listMemberSummaries(db, demo.propertyId, "%")).toEqual([]);
+
+    const otherPropertyId = "prop_member_isolation";
     await db.insertInto("properties").values({
-      id: "prop_member_isolation",
+      id: otherPropertyId,
       code: "MEMBER-ISOLATION",
       name: "Member isolation property",
       timezone: "Asia/Shanghai",
       currency: "CNY"
     }).execute();
-    await db.insertInto("member_contracts").values({
-      id: "contract_member_isolation",
-      property_id: "prop_member_isolation",
-      member_id: memberId,
-      member_name: "张三",
-      status: "ACTIVE",
-      valid_from: "2026-08-01",
-      valid_until: "2027-07-31",
-      version: 1
-    }).execute();
-    expect((await getMemberView(db, "prop_member_isolation", memberId)).externalReferences).toEqual([]);
-
-    await expect(db.updateTable("members").set({ identity_card_number: "CHANGED" }).where("id", "=", memberId).execute())
-      .rejects.toThrow(/member identity is immutable/);
-    await expect(db.deleteFrom("members").where("id", "=", memberId).execute())
-      .rejects.toThrow(/member identity is immutable/);
-    await expect(db.updateTable("member_external_references").set({ external_record_id: "changed" }).where("id", "=", externalReferenceId).execute())
-      .rejects.toThrow(/member_external_references is append-only/);
-    await expect(db.insertInto("member_contracts").values({
-      id: "contract_without_member_profile",
-      property_id: demo.propertyId,
-      member_name: "Forbidden historical-shaped insert",
-      status: "ACTIVE",
-      valid_from: "2026-01-01",
-      valid_until: "2026-12-31",
-      version: 1
-    }).execute()).rejects.toMatchObject({ constraint: "member_contracts_new_member_required" });
+    expect(await listMemberSummaries(db, otherPropertyId, "李晓云")).toEqual([]);
+    await expect(getMemberView(db, otherPropertyId, memberId)).rejects.toMatchObject({ code: "NOT_FOUND", statusCode: 404 });
+    await db.insertInto("member_property_links").values({ member_id: memberId, property_id: otherPropertyId }).execute();
+    expect(await listMemberSummaries(db, otherPropertyId, "李晓云")).toHaveLength(1);
+    expect((await getMemberView(db, otherPropertyId, memberId)).member.id).toBe(memberId);
   });
 
-  it("matches an existing identity without overwriting profile fields or requiring a contract, and links each application once", async () => {
-    const first = await confirm({
-      commandType: "CREATE_MEMBER",
-      input: {
-        propertyId: demo.propertyId,
-        fullName: "Existing Member",
-        identityCardNumber: "TEST-EXISTING-MEMBER-ID",
-        phone: "13800000111",
-        wechat: "existing-member",
-        validFrom: "2026-01-01",
-        validUntil: "2027-01-01"
-      }
-    }, "existing-member-first");
-    const memberId = first.result!.memberId as string;
-    const contractId = first.result!.memberContractId as string;
-    await db.updateTable("member_contracts").set({ status: "EXPIRED" }).where("id", "=", contractId).execute();
-
-    const matchEnvelope: CommandEnvelope = {
-      commandType: "CREATE_MEMBER",
-      input: {
-        propertyId: demo.propertyId,
-        fullName: "Different submitted name",
-        identityCardNumber: "test-existing-member-id",
-        phone: "13999999999",
-        wechat: "different-submitted-wechat",
-        sourceApplicationRecordId: "rec_member_application_existing"
-      }
-    };
-    const matchPreview = await preview(matchEnvelope, "existing-member-match");
-    expect(matchPreview.preview.effect).toMatchObject({
-      operation: "MATCH_EXISTING_MEMBER",
-      memberId,
-      memberContractId: null,
-      profileMatch: false,
-      member: { fullName: "Existing Member", phone: "13800000111", wechat: "existing-member" },
-      submittedProfile: { fullName: "Different submitted name", phone: "13999999999" },
-      contract: { operation: "NO_CONTRACT_SELECTED", validFrom: null, validUntil: null }
-    });
-    const matched = await confirmCommandPreview(db, principal, matchPreview.preview.previewId, {
+  it("replays the original confirmation without duplicating the member", async () => {
+    const envelope = memberEnvelope("TEST-IDEMPOTENT-MEMBER-ID", "幂等会员");
+    const created = await preview(envelope, "idempotent-member");
+    const confirmationInput = {
       propertyId: demo.propertyId,
-      commandType: "CREATE_MEMBER",
-      confirmation: true,
-      expectedEffectHash: matchPreview.preview.effectHash,
-      reason: { code: "APPLICATION_LINKED", note: "Link application to the existing identity" }
-    }, metadata("existing-member-match-confirm"));
-    expect(matched.result).toMatchObject({ memberId, memberContractId: null, memberCreated: false, memberContractCreated: false, externalReferenceCreated: true });
-    expect(await db.selectFrom("members").selectAll().where("identity_card_number", "=", "TEST-EXISTING-MEMBER-ID").execute())
-      .toEqual([expect.objectContaining({ full_name: "Existing Member", phone: "13800000111", wechat: "existing-member" })]);
-
-    const replayedLink = await confirm(matchEnvelope, "existing-member-link-replay-new-key");
-    expect(replayedLink.result).toMatchObject({
-      memberId,
-      memberContractId: null,
-      memberCreated: false,
-      memberExternalReferenceId: matched.result!.memberExternalReferenceId,
-      externalReferenceCreated: false
+      commandType: "CREATE_MEMBER" as const,
+      confirmation: true as const,
+      expectedEffectHash: created.preview.effectHash,
+      reason: { code: "CREATE_MEMBER_PROFILE", note: "创建会员档案" }
+    };
+    const confirmationMetadata = { idempotencyKey: "member-idempotent-confirm", correlationId: "member-idempotent-first" };
+    const first = await confirmCommandPreview(db, principal, created.preview.previewId, confirmationInput, confirmationMetadata);
+    const replay = await confirmCommandPreview(db, principal, created.preview.previewId, confirmationInput, {
+      ...confirmationMetadata,
+      correlationId: "member-idempotent-replay"
     });
-    expect(await db.selectFrom("member_external_references").select("id").where("member_id", "=", memberId).execute()).toHaveLength(1);
-  });
-
-  it("searches by normalized identity and returns balances derived from Lot and Ledger facts", async () => {
-    await confirm({
-      commandType: "ADJUST_MEMBER_ENTITLEMENT",
-      input: { propertyId: demo.propertyId, entitlementLotId: demo.roomLotId, quantityDelta: 3, adjustmentReason: "Derived balance test" }
-    }, "derived-balance-adjust");
-    const summaries = await listMemberSummaries(db, demo.propertyId, "demo-id-310000199001010001");
-    expect(summaries).toEqual([expect.objectContaining({
-      member: expect.objectContaining({ id: demo.memberId, identity_card_number: "DEMO-ID-310000199001010001" }),
-      availableBalance: { ROOM_NIGHT: 5, BED_NIGHT: 2 }
-    })]);
-    const current = await getMemberView(db, demo.propertyId, demo.memberId);
-    const expiry = new Date(`${current.balanceAsOfDate}T00:00:00.000Z`);
-    expiry.setUTCDate(expiry.getUTCDate() - 1);
-    await db.insertInto("entitlement_lots").values({
-      id: "lot_ledger_available_but_date_expired",
-      contract_id: demo.memberContractId,
-      unit_kind: "ROOM_NIGHT",
-      total_units: 10,
-      expires_on: expiry.toISOString().slice(0, 10),
-      version: 1
-    }).execute();
-    const afterExpiredLot = await getMemberView(db, demo.propertyId, demo.memberId);
-    expect(afterExpiredLot.lotBalances.find((lot) => lot.lotId === "lot_ledger_available_but_date_expired")?.availableUnits).toBe(0);
-    expect(afterExpiredLot.availableBalance).toEqual({ ROOM_NIGHT: 5, BED_NIGHT: 2 });
-    expect(await listMemberSummaries(db, demo.propertyId, "identity-not-present")).toEqual([]);
+    expect(replay.receiptId).toBe(first.receiptId);
+    expect(replay.result).toEqual(first.result);
+    expect(await db.selectFrom("members").select("id").where("identity_card_number", "=", "TEST-IDEMPOTENT-MEMBER-ID").execute()).toHaveLength(1);
   });
 
   it("rejects a stale concurrent registration Preview without a second member write", async () => {
@@ -270,34 +250,36 @@ describe("member profile registration and derived balances", () => {
         fullName: "Concurrent Member",
         identityCardNumber: "TEST-CONCURRENT-MEMBER-ID",
         phone: "13800000222",
-        wechat: "concurrent-member",
-        validFrom: "2026-01-01",
-        validUntil: "2027-01-01"
+        wechat: "concurrent-member"
       }
     };
     const first = await preview(envelope, "member-concurrent-first");
     const second = await preview(envelope, "member-concurrent-second");
-    await confirmCommandPreview(db, principal, first.preview.previewId, {
-      propertyId: demo.propertyId,
-      commandType: "CREATE_MEMBER",
-      confirmation: true,
-      expectedEffectHash: first.preview.effectHash,
-      reason: { code: "FIRST_WINS", note: "First concurrent member registration" }
-    }, metadata("member-concurrent-first-confirm"));
-    const stale = await confirmCommandPreview(db, principal, second.preview.previewId, {
-      propertyId: demo.propertyId,
-      commandType: "CREATE_MEMBER",
-      confirmation: true,
-      expectedEffectHash: second.preview.effectHash,
-      reason: { code: "SECOND_STALE", note: "Second concurrent member registration" }
-    }, metadata("member-concurrent-second-confirm"));
-    expect(stale).toMatchObject({
-      executionStatus: "NOT_EXECUTED",
-      businessCommitted: false,
-      error: { code: "PREVIEW_STALE" },
-      resourceRefs: [],
-      factRefs: []
-    });
+    const [firstResult, secondResult] = await Promise.all([
+      confirmCommandPreview(db, principal, first.preview.previewId, {
+        propertyId: demo.propertyId,
+        commandType: "CREATE_MEMBER",
+        confirmation: true,
+        expectedEffectHash: first.preview.effectHash,
+        reason: { code: "CONCURRENT_ATTEMPT", note: "Concurrent member registration" }
+      }, metadata("member-concurrent-first-confirm")),
+      confirmCommandPreview(db, principal, second.preview.previewId, {
+        propertyId: demo.propertyId,
+        commandType: "CREATE_MEMBER",
+        confirmation: true,
+        expectedEffectHash: second.preview.effectHash,
+        reason: { code: "CONCURRENT_ATTEMPT", note: "Concurrent member registration" }
+      }, metadata("member-concurrent-second-confirm"))
+    ]);
+    expect([firstResult, secondResult].filter((receipt) => receipt.businessCommitted)).toHaveLength(1);
+    expect([firstResult, secondResult].filter((receipt) => !receipt.businessCommitted)).toEqual([
+      expect.objectContaining({
+        executionStatus: "NOT_EXECUTED",
+        error: expect.objectContaining({ code: "PREVIEW_STALE", message: expect.any(String) }),
+        resourceRefs: [],
+        factRefs: []
+      })
+    ]);
     expect(await db.selectFrom("members").select("id").where("identity_card_number", "=", "TEST-CONCURRENT-MEMBER-ID").execute()).toHaveLength(1);
   });
 });

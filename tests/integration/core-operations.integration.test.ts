@@ -54,8 +54,10 @@ async function createOrder(unitId: string, prefix: string, options: { member?: b
       propertyId: demo.propertyId,
       quoteId: priced.quoteId,
       primaryGuest: { fullName: `Guest ${prefix}`, nickname: `Guest ${prefix}` },
-      bookingChannelCode: "YOUMUDAO",
-      channelOrderReference: `TEST-ORDER-${prefix}`,
+      ...(!options.member ? {
+        bookingChannelCode: "YOUMUDAO",
+        channelOrderReference: `TEST-ORDER-${prefix}`
+      } : {}),
       ...(options.stayType === "FREE" ? { freeStayReason: `Automated FREE stay fixture: ${prefix}` } : {})
     }
   }, prefix);
@@ -203,7 +205,7 @@ describe("PostgreSQL core operations", () => {
     expect(priced.cashRemainder.minorUnits).toBe(12_000);
     const receipt = await previewAndConfirm({
       commandType: "CREATE_ORDER",
-      input: { propertyId: demo.propertyId, quoteId: priced.quoteId, primaryGuest: { fullName: "Member Guest", nickname: "Member Guest" }, bookingChannelCode: "CTRIP", channelOrderReference: "TEST-ORDER-MEMBER" }
+      input: { propertyId: demo.propertyId, quoteId: priced.quoteId, primaryGuest: { fullName: "Member Guest", nickname: "Member Guest" } }
     }, "member-order");
     expect(receipt.businessCommitted).toBe(true);
     const view = await getOrderView(db, receipt.result!.orderId as string);
@@ -315,7 +317,7 @@ describe("PostgreSQL core operations", () => {
     await db.updateTable("quotes").set({ member_contract_id: demo.memberContractId }).where("id", "=", forged.quoteId).execute();
     await expect(createCommandPreview(db, principal, {
       commandType: "CREATE_ORDER",
-      input: { propertyId: demo.propertyId, quoteId: forged.quoteId, primaryGuest: { fullName: "No entitlement debit", nickname: "No Debit" }, bookingChannelCode: "MEITUAN", channelOrderReference: "TEST-ORDER-FORGED-FREE", freeStayReason: "Defensive FREE membership rejection fixture" }
+      input: { propertyId: demo.propertyId, quoteId: forged.quoteId, primaryGuest: { fullName: "No entitlement debit", nickname: "No Debit" }, freeStayReason: "Defensive FREE membership rejection fixture" }
     }, metadata("free-member-command-denied"))).rejects.toMatchObject({ code: "PRICING_POLICY_UNCONFIGURED" });
     expect(await db.selectFrom("orders").select("id").execute()).toHaveLength(0);
     expect(await db.selectFrom("entitlement_ledger").select("fact_id").execute()).toHaveLength(0);
@@ -381,7 +383,7 @@ describe("PostgreSQL core operations", () => {
     const priced = await quote(demo.secondRoomId, { member: true, arrival: "2026-08-01", departure: "2026-08-02" });
     const createPreview = await createCommandPreview(db, principal, {
       commandType: "CREATE_ORDER",
-      input: { propertyId: demo.propertyId, quoteId: priced.quoteId, primaryGuest: { fullName: "Lock Order Guest", nickname: "Lock Guest" }, bookingChannelCode: "CTRIP", channelOrderReference: "TEST-ORDER-LOCK" }
+      input: { propertyId: demo.propertyId, quoteId: priced.quoteId, primaryGuest: { fullName: "Lock Order Guest", nickname: "Lock Guest" } }
     }, metadata("lock-order-create-preview"));
     const adjustPreview = await createCommandPreview(db, principal, {
       commandType: "ADJUST_MEMBER_ENTITLEMENT",

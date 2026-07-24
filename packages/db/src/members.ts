@@ -1,3 +1,4 @@
+import { sql } from "kysely";
 import { DomainError } from "@qintopia/contracts";
 import { entitlementAvailableBalance } from "./entitlement-balance.ts";
 import type { DbExecutor } from "./inventory.ts";
@@ -21,21 +22,27 @@ export async function propertyLocalToday(db: DbExecutor, propertyId: string): Pr
 
 export async function getMemberView(db: DbExecutor, propertyId: string, memberId: string) {
   const balanceAsOfDate = await propertyLocalToday(db, propertyId);
-  const member = await db.selectFrom("members").selectAll().where("id", "=", memberId).executeTakeFirst();
-  if (!member) throw new DomainError("NOT_FOUND", "Member not found", 404);
+  const member = await db.selectFrom("members")
+    .innerJoin("member_property_links", "member_property_links.member_id", "members.id")
+    .selectAll("members")
+    .where("members.id", "=", memberId)
+    .where("member_property_links.property_id", "=", propertyId)
+    .executeTakeFirst();
+  if (!member) throw new DomainError("NOT_FOUND", "Member not found for this property", 404);
   const contracts = await db.selectFrom("member_contracts").selectAll()
     .where("member_id", "=", memberId)
     .where("property_id", "=", propertyId)
     .orderBy("valid_from", "desc")
     .orderBy("id")
     .execute();
-  if (contracts.length === 0) throw new DomainError("NOT_FOUND", "Member not found for this property", 404);
   const contractIds = contracts.map((contract) => contract.id);
-  const lots = await db.selectFrom("entitlement_lots").selectAll()
-    .where("contract_id", "in", contractIds)
-    .orderBy("expires_on")
-    .orderBy("id")
-    .execute();
+  const lots = contractIds.length > 0
+    ? await db.selectFrom("entitlement_lots").selectAll()
+      .where("contract_id", "in", contractIds)
+      .orderBy("expires_on")
+      .orderBy("id")
+      .execute()
+    : [];
   const lotIds = lots.map((lot) => lot.id);
   const ledger = lotIds.length > 0
     ? await db.selectFrom("entitlement_ledger").selectAll()
@@ -69,19 +76,64 @@ export async function getMemberView(db: DbExecutor, propertyId: string, memberId
     .orderBy("created_at")
     .orderBy("id")
     .execute();
-  return { member, contracts, lots, ledger, externalReferences, lotBalances, availableBalance, balanceAsOfDate };
+  const membershipProducts = await db.selectFrom("membership_products").selectAll()
+    .where("status", "=", "PUBLISHED")
+    .orderBy("list_price_minor")
+    .orderBy("code")
+    .execute();
+  const membershipOrderRows = await db.selectFrom("membership_orders").selectAll()
+    .where("member_id", "=", memberId)
+    .where("property_id", "=", propertyId)
+    .orderBy("created_at", "desc")
+    .orderBy("id")
+    .execute();
+  const membershipOrderIds = membershipOrderRows.map((order) => order.id);
+  const membershipPaymentFacts = membershipOrderIds.length > 0
+    ? await db.selectFrom("membership_payment_facts").selectAll()
+      .where("membership_order_id", "in", membershipOrderIds)
+      .orderBy("created_at")
+      .orderBy("fact_id")
+      .execute()
+    : [];
+  const factsByOrder = new Map<string, typeof membershipPaymentFacts>();
+  for (const fact of membershipPaymentFacts) {
+    const facts = factsByOrder.get(fact.membership_order_id) ?? [];
+    facts.push(fact);
+    factsByOrder.set(fact.membership_order_id, facts);
+  }
+  const membershipOrders = membershipOrderRows.map((order) => {
+    const paymentFacts = factsByOrder.get(order.id) ?? [];
+    const paymentTotalMinor = paymentFacts.reduce((sum, fact) => sum + fact.net_effect_minor, 0);
+    if (!Number.isSafeInteger(paymentTotalMinor)) throw new DomainError("INTERNAL_ERROR", "会员订单收款合计超出支持范围", 500);
+    return {
+      order,
+      paymentFacts,
+      paymentTotalMinor,
+      paymentDifferenceMinor: paymentTotalMinor - order.agreed_price_minor
+    };
+  });
+  return { member, contracts, lots, ledger, externalReferences, lotBalances, availableBalance, balanceAsOfDate, membershipProducts, membershipOrders };
 }
 
-export async function listMemberSummaries(db: DbExecutor, propertyId: string, identityCardNumber?: string) {
+function escapeLikePattern(value: string): string {
+  return value.replace(/[\\%_]/g, "\\$&");
+}
+
+export async function listMemberSummaries(db: DbExecutor, propertyId: string, query?: string) {
   let selection = db.selectFrom("members")
-    .innerJoin("member_contracts", "member_contracts.member_id", "members.id")
+    .innerJoin("member_property_links", "member_property_links.member_id", "members.id")
     .selectAll("members")
-    .distinct()
-    .where("member_contracts.property_id", "=", propertyId);
-  if (identityCardNumber) selection = selection.where("members.identity_card_number", "=", identityCardNumber.trim().toUpperCase());
+    .where("member_property_links.property_id", "=", propertyId);
+  const normalizedQuery = query?.trim();
+  if (normalizedQuery) {
+    const pattern = `%${escapeLikePattern(normalizedQuery)}%`;
+    selection = selection.where(sql<boolean>`(
+      members.full_name ILIKE ${pattern} ESCAPE '\\'
+      OR members.identity_card_number ILIKE ${pattern} ESCAPE '\\'
+      OR members.phone ILIKE ${pattern} ESCAPE '\\'
+      OR members.wechat ILIKE ${pattern} ESCAPE '\\'
+    )`);
+  }
   const members = await selection.orderBy("members.full_name").orderBy("members.id").execute();
-  return Promise.all(members.map(async (member) => {
-    const view = await getMemberView(db, propertyId, member.id);
-    return { member, contracts: view.contracts, availableBalance: view.availableBalance, balanceAsOfDate: view.balanceAsOfDate };
-  }));
+  return members.map((member) => ({ member }));
 }

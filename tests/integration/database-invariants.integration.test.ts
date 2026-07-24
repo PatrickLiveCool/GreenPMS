@@ -47,12 +47,12 @@ async function previewAndConfirm(envelope: CommandEnvelope, prefix: string): Pro
 async function createOrder(prefix: string, options: { member?: boolean; arrival?: string; departure?: string } = {}): Promise<string> {
   const quote = await createQuote(db, {
     propertyId: demo.propertyId,
-    inventoryUnitId: demo.roomId,
+    inventoryUnitId: options.member ? "unit_room_d_gen_01" : demo.roomId,
     stayType: "TRANSIENT",
     arrivalDate: options.arrival ?? "2028-01-01",
     departureDate: options.departure ?? "2028-01-02",
     pricingPolicyVersionId: demo.transientPolicyId,
-    ...(options.member ? { memberContractId: demo.memberContractId } : {})
+    ...(options.member ? { memberId: demo.memberId } : {})
   });
   const receipt = await previewAndConfirm({
     commandType: "CREATE_ORDER",
@@ -60,8 +60,10 @@ async function createOrder(prefix: string, options: { member?: boolean; arrival?
       propertyId: demo.propertyId,
       quoteId: quote.quoteId,
       primaryGuest: { fullName: `Invariant Guest ${prefix}`, nickname: `Invariant ${prefix}` },
-      bookingChannelCode: "YOUMUDAO",
-      channelOrderReference: `TEST-INVARIANT-ORDER-${prefix}`
+      ...(!options.member ? {
+        bookingChannelCode: "YOUMUDAO",
+        channelOrderReference: `TEST-INVARIANT-ORDER-${prefix}`
+      } : {})
     }
   }, prefix);
   return receipt.result!.orderId as string;
@@ -188,23 +190,44 @@ describe.sequential("database-owned invariants on PostgreSQL", () => {
 
     await expect(db.updateTable("coverage_items").set({ inventory_unit_id: demo.secondRoomId })
       .where("id", "=", coverage[0]!.id).execute()).rejects.toThrow(/coverage identity is immutable/);
-    await db.updateTable("coverage_items").set({ status: "CONSUMED", updated_at: new Date() })
-      .where("id", "=", coverage[0]!.id).execute();
+    await expect(db.updateTable("coverage_items").set({ status: "CONSUMED", updated_at: new Date() })
+      .where("id", "=", coverage[0]!.id).execute())
+      .rejects.toMatchObject({ constraint: "coverage_items_lifecycle_conserved" });
+    await db.transaction().execute(async (trx) => {
+      await trx.updateTable("coverage_items").set({ status: "CONSUMED", updated_at: new Date() })
+        .where("id", "=", coverage[0]!.id).execute();
+      await trx.insertInto("entitlement_ledger").values({
+        fact_id: newId("fact"),
+        lot_id: coverage[0]!.lot_id,
+        entry_type: "CONSUME",
+        quantity_delta: 0,
+        service_date: coverage[0]!.service_date,
+        order_id: orderId,
+        coverage_id: coverage[0]!.id,
+        reason: "TEST_DIRECT_CONSUME_BALANCE",
+        command_id: null
+      }).execute();
+    });
     await expect(db.updateTable("coverage_items").set({ status: "RELEASED", updated_at: new Date() })
       .where("id", "=", coverage[0]!.id).execute()).rejects.toThrow(/status may only advance/);
-    await db.updateTable("coverage_items").set({ status: "RELEASED", updated_at: new Date() })
-      .where("id", "=", coverage[1]!.id).execute();
-    await db.insertInto("entitlement_ledger").values({
-      fact_id: newId("fact"),
-      lot_id: coverage[1]!.lot_id,
-      entry_type: "RELEASE",
-      quantity_delta: 1,
-      service_date: coverage[1]!.service_date,
-      order_id: orderId,
-      coverage_id: coverage[1]!.id,
-      reason: "TEST_DIRECT_RELEASE_BALANCE",
-      command_id: null
-    }).execute();
+    await expect(db.updateTable("coverage_items").set({ status: "RELEASED", updated_at: new Date() })
+      .where("id", "=", coverage[1]!.id).execute())
+      .rejects.toMatchObject({ constraint: "coverage_items_lifecycle_conserved" });
+    await db.transaction().execute(async (trx) => {
+      await trx.updateTable("coverage_items").set({ status: "RELEASED", updated_at: new Date() })
+        .where("id", "=", coverage[1]!.id).execute();
+      await trx.insertInto("entitlement_ledger").values({
+        fact_id: newId("fact"),
+        lot_id: coverage[1]!.lot_id,
+        entry_type: "RELEASE",
+        quantity_delta: 1,
+        service_date: coverage[1]!.service_date,
+        order_id: orderId,
+        coverage_id: coverage[1]!.id,
+        reason: "TEST_DIRECT_RELEASE_BALANCE",
+        command_id: null
+      }).execute();
+    });
     await expect(db.updateTable("coverage_items").set({ status: "HELD", updated_at: new Date() })
       .where("id", "=", coverage[1]!.id).execute()).rejects.toThrow(/status may only advance/);
 
@@ -219,6 +242,89 @@ describe.sequential("database-owned invariants on PostgreSQL", () => {
       status: "RELEASED",
       held_by_revision_id: coverage[0]!.held_by_revision_id
     }).execute()).rejects.toThrow(/created in HELD status/);
+
+    await expect(db.insertInto("entitlement_ledger").values({
+      fact_id: newId("fact"),
+      lot_id: coverage[0]!.lot_id,
+      entry_type: "HOLD",
+      quantity_delta: -1,
+      service_date: coverage[0]!.service_date,
+      order_id: orderId,
+      coverage_id: coverage[0]!.id,
+      reason: "TEST_DUPLICATE_HOLD",
+      command_id: null
+    }).execute()).rejects.toMatchObject({ constraint: "entitlement_ledger_lifecycle_status" });
+    await expect(db.insertInto("entitlement_ledger").values({
+      fact_id: newId("fact"),
+      lot_id: coverage[1]!.lot_id,
+      entry_type: "RELEASE",
+      quantity_delta: 1,
+      service_date: coverage[1]!.service_date,
+      order_id: orderId,
+      coverage_id: coverage[1]!.id,
+      reason: "TEST_DUPLICATE_RELEASE",
+      command_id: null
+    }).execute()).rejects.toMatchObject({ constraint: "entitlement_ledger_one_terminal_per_coverage_idx" });
+    await expect(db.insertInto("entitlement_ledger").values({
+      fact_id: newId("fact"),
+      lot_id: coverage[1]!.lot_id,
+      entry_type: "CONSUME",
+      quantity_delta: 0,
+      service_date: coverage[1]!.service_date,
+      order_id: orderId,
+      coverage_id: coverage[1]!.id,
+      reason: "TEST_RELEASE_THEN_CONSUME",
+      command_id: null
+    }).execute()).rejects.toMatchObject({ constraint: "entitlement_ledger_lifecycle_status" });
+
+    await expect(db.insertInto("coverage_items").values({
+      id: "coverage_invalid_membership_product",
+      order_id: orderId,
+      contract_id: demo.memberContractId,
+      lot_id: demo.roomLotId,
+      inventory_unit_id: demo.roomId,
+      service_date: coverage[1]!.service_date,
+      unit_kind: "ROOM_NIGHT",
+      status: "HELD",
+      held_by_revision_id: coverage[1]!.held_by_revision_id
+    }).execute()).rejects.toMatchObject({ constraint: "coverage_items_membership_product_match" });
+
+    const otherOrderId = await createOrder("coverage-revision-owner", { arrival: "2028-02-05", departure: "2028-02-06" });
+    const otherRevisionId = (await db.selectFrom("orders").select("current_revision_id")
+      .where("id", "=", otherOrderId).executeTakeFirstOrThrow()).current_revision_id!;
+    await expect(db.insertInto("coverage_items").values({
+      id: "coverage_invalid_holding_revision",
+      order_id: orderId,
+      contract_id: demo.memberContractId,
+      lot_id: demo.roomLotId,
+      inventory_unit_id: "unit_room_d_gen_01",
+      service_date: coverage[1]!.service_date,
+      unit_kind: "ROOM_NIGHT",
+      status: "HELD",
+      held_by_revision_id: otherRevisionId
+    }).execute()).rejects.toMatchObject({ constraint: "coverage_items_revision_match" });
+  });
+
+  it("requires member identity to belong to the quote property", async () => {
+    await expect(db.insertInto("quotes").values({
+      id: "quote_cross_property_member_identity",
+      property_id: "prop_invariant_other",
+      inventory_unit_id: "unit_invariant_other_room",
+      stay_type: "TRANSIENT",
+      arrival_date: "2028-03-01",
+      departure_date: "2028-03-02",
+      policy_version_id: demo.transientPolicyId,
+      member_id: demo.memberId,
+      member_contract_id: null,
+      requester_subject_id: null,
+      input_hash: "f".repeat(64),
+      coverage_set: [],
+      cash_lines: [],
+      cash_remainder_minor: 0,
+      current_contract_amount_minor: 0,
+      currency: "CNY",
+      expires_at: new Date("2028-03-01T00:15:00.000Z")
+    }).execute()).rejects.toMatchObject({ constraint: "quotes_member_property_fk" });
   });
 
   it("keeps each order current revision scoped to that order while allowing a valid new revision", async () => {
@@ -550,13 +656,13 @@ describe.sequential("database-owned invariants on PostgreSQL", () => {
       .toEqual({ fact_id: result.factIds[0], coverage_id: coverage.id, entry_type: "RELEASE" });
   });
 
-  it("requires the current nickname migration for readiness", async () => {
+  it("requires the current member-stay migrations for readiness", async () => {
     expect(await databaseReady(db)).toBe(true);
-    await db.deleteFrom("schema_migrations").where("name", "=", "014_new_order_primary_guest_nickname.sql").execute();
+    await db.deleteFrom("schema_migrations").where("name", "=", "019_member_stay_booking_channel_rules.sql").execute();
     try {
       expect(await databaseReady(db)).toBe(false);
     } finally {
-      await db.insertInto("schema_migrations").values({ name: "014_new_order_primary_guest_nickname.sql" }).execute();
+      await db.insertInto("schema_migrations").values({ name: "019_member_stay_booking_channel_rules.sql" }).execute();
     }
     expect(await databaseReady(db)).toBe(true);
   });

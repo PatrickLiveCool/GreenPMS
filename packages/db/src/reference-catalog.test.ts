@@ -4,12 +4,13 @@ import {
   referenceCatalogSummary,
   validateQintopia2026ReferenceCatalogSnapshot
 } from "./reference-catalog.ts";
+import { buildQintopia2026OperationalCatalogRows } from "./seed.ts";
 
 describe("QinTopia 2026 reference catalog snapshot", () => {
   it("preserves the verified inventory and published-price totals", async () => {
     const snapshot = await loadBundledQintopia2026Catalog();
     expect(referenceCatalogSummary(snapshot)).toMatchObject({
-      importId: "qintopia-2026-feishu-revision-561-user-confirmed-v3",
+      importId: "qintopia-2026-feishu-revision-561-user-confirmed-v4",
       sourceRevision: 561,
       physicalRoomCount: 44,
       physicalBedCount: 91,
@@ -47,10 +48,21 @@ describe("QinTopia 2026 reference catalog snapshot", () => {
     expect(unresolved).not.toContain("MEMBERSHIP_REFUND_CALCULATION_AMBIGUOUS");
     expect(unresolved).not.toContain("FREE_PRICING_CASES_MISSING");
     expect(snapshot.inventory.rooms.filter((room) => ["D", "E"].includes(room.buildingCode)).every((room) => room.codeProvenance === "PMS_GENERATED" && room.sourceCode === null)).toBe(true);
+    expect(snapshot.inventory.rooms.filter((room) => room.buildingCode === "D").map((room) => room.operationalCode)).toEqual(["D01", "D02", "D03", "D04", "D05"]);
+    expect(snapshot.inventory.rooms.filter((room) => room.buildingCode === "E").map((room) => room.operationalCode)).toEqual(["E01", "E02", "E03"]);
+    expect(JSON.stringify(snapshot.inventory.rooms)).not.toMatch(/D-GEN-|E-GEN-/);
     expect(snapshot.membershipRules.refundPolicy).toBe("NON_REFUNDABLE_MEMBERSHIP");
     expect(snapshot.membershipRules.refundCalculation).toBeNull();
     expect(snapshot.membershipProducts.every((product) => product.validity.period === "P1Y")).toBe(true);
     expect(snapshot.membershipProducts.reduce((sum, product) => sum + product.quota, 0)).toBe(30);
+  });
+
+  it("keeps generated-room internal IDs stable after the operational-code rename", async () => {
+    const catalog = await buildQintopia2026OperationalCatalogRows();
+    expect(catalog.rooms.find((room) => room.code === "D01")).toMatchObject({ id: "unit_room_d_gen_01", code_provenance: "PMS_GENERATED" });
+    expect(catalog.rooms.find((room) => room.code === "E03")).toMatchObject({ id: "unit_room_e_gen_03", code_provenance: "PMS_GENERATED" });
+    expect(catalog.rooms).toHaveLength(44);
+    expect(catalog.beds).toHaveLength(46);
   });
 
   it("rejects malformed operating facts instead of coercing them", async () => {
@@ -86,7 +98,7 @@ describe("QinTopia 2026 reference catalog snapshot", () => {
 
     const wrongImportId = structuredClone(source);
     wrongImportId.importId = "qintopia-2026-feishu-revision-561-rewritten";
-    expect(() => validateQintopia2026ReferenceCatalogSnapshot(wrongImportId)).toThrow(/importId must remain .*revision-561-user-confirmed-v3/);
+    expect(() => validateQintopia2026ReferenceCatalogSnapshot(wrongImportId)).toThrow(/importId must remain .*revision-561-user-confirmed-v4/);
 
     const wrongRevision = structuredClone(source);
     wrongRevision.source.revision = 562;

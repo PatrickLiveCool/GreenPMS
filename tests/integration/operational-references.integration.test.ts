@@ -421,6 +421,26 @@ describe.sequential("booking channels and external transaction references on Pos
 
     await expect(directOrder("order_direct_missing_channel", null, null)).rejects.toMatchObject({ constraint: "orders_new_booking_channel_required" });
     await expect(directOrder("order_direct_wecom_reference", "WECOM", "MUST-NOT-PERSIST")).rejects.toMatchObject({ constraint: "orders_wecom_has_no_channel_order_reference" });
+    const directMemberOrder = (id: string, bookingChannelCode: BookingChannelCode | null) => db.insertInto("orders").values({
+      id,
+      property_id: demo.propertyId,
+      status: "RESERVED",
+      stay_type: "TRANSIENT",
+      arrival_date: "2029-01-03",
+      departure_date: "2029-01-04",
+      primary_guest_snapshot: { fullName: "Direct member database guard probe", nickname: "Member Guard" },
+      booking_channel_code: bookingChannelCode,
+      channel_order_reference: null,
+      free_stay_reason: null,
+      pricing_policy_version_id: demo.transientPolicyId,
+      member_id: demo.memberId,
+      member_contract_id: demo.memberContractId,
+      current_revision_id: null,
+      version: 1
+    }).execute();
+    await directMemberOrder("order_direct_member_without_channel", null);
+    await expect(directMemberOrder("order_direct_member_with_channel", "WECOM")).rejects.toMatchObject({ constraint: "orders_member_booking_channel_null" });
+    await db.deleteFrom("orders").where("id", "=", "order_direct_member_without_channel").execute();
     await directOrder("order_direct_blank_reference", "CTRIP", " \t\n ");
     expect(await db.selectFrom("orders").select("channel_order_reference").where("id", "=", "order_direct_blank_reference").executeTakeFirstOrThrow()).toEqual({ channel_order_reference: null });
     await db.deleteFrom("orders").where("id", "=", "order_direct_blank_reference").execute();
@@ -701,7 +721,7 @@ describe.sequential("booking channels and external transaction references on Pos
     expect(await db.selectFrom("collection_facts").select("fact_id").where("command_id", "=", "command_direct_fact_guard").execute()).toHaveLength(0);
   });
 
-  it("applies migrations 009 through 014, preserves historical facts, and upgrades the legacy demo catalog", async () => {
+  it("applies migrations 009 through 018, preserves historical facts, and upgrades the legacy demo catalog", async () => {
     let historicalDb: Kysely<Database> | undefined;
     try {
       historicalDb = await recreateDatabaseThrough008(historicalDatabaseUrl);
@@ -813,6 +833,16 @@ describe.sequential("booking channels and external transaction references on Pos
         const migration010 = await readFile(resolve(process.cwd(), "packages/db/src/migrations/010_qintopia_2026_catalog_pricing_and_free_stays.sql"), "utf8");
         await client.query(migration010);
         await client.query("INSERT INTO schema_migrations(name) VALUES ('010_qintopia_2026_catalog_pricing_and_free_stays.sql')");
+        await client.query(`
+          INSERT INTO members(id, identity_card_number, full_name, phone, wechat)
+          VALUES ('member_historical_identity', 'HISTORICAL-MEMBER-ID', 'Historical Member', '13900008881', 'historical-member');
+          INSERT INTO member_contracts(id, property_id, member_id, member_name, status, valid_from, valid_until, version)
+          VALUES ('contract_historical_identity', '${demo.propertyId}', 'member_historical_identity', 'Historical Member', 'ACTIVE', '2028-01-01', '2030-12-31', 1);
+          INSERT INTO quotes(id, property_id, inventory_unit_id, stay_type, arrival_date, departure_date, policy_version_id, member_contract_id, input_hash, coverage_set, cash_lines, cash_remainder_minor, current_contract_amount_minor, currency, expires_at)
+          VALUES ('quote_historical_member_identity', '${demo.propertyId}', '${demo.roomId}', 'TRANSIENT', '2029-01-01', '2029-01-02', '${demo.transientPolicyId}', 'contract_historical_identity', repeat('9', 64), '[]'::jsonb, '[]'::jsonb, 12000, 12000, 'CNY', '2035-01-01T00:00:00Z');
+          INSERT INTO orders(id, property_id, status, stay_type, arrival_date, departure_date, primary_guest_snapshot, pricing_policy_version_id, member_contract_id, current_revision_id, version, booking_channel_code, channel_order_reference, free_stay_reason)
+          VALUES ('order_historical_member_identity', '${demo.propertyId}', 'RESERVED', 'TRANSIENT', '2029-01-01', '2029-01-02', '{"fullName":"Historical Member Guest","nickname":"Historical Member"}'::jsonb, '${demo.transientPolicyId}', 'contract_historical_identity', NULL, 1, 'CTRIP', 'HISTORICAL-MEMBER-ORDER', NULL);
+        `);
         const migration011 = await readFile(resolve(process.cwd(), "packages/db/src/migrations/011_core_fact_shape_guards.sql"), "utf8");
         await client.query(migration011);
         await client.query("INSERT INTO schema_migrations(name) VALUES ('011_core_fact_shape_guards.sql')");
@@ -825,6 +855,21 @@ describe.sequential("booking channels and external transaction references on Pos
         const migration014 = await readFile(resolve(process.cwd(), "packages/db/src/migrations/014_new_order_primary_guest_nickname.sql"), "utf8");
         await client.query(migration014);
         await client.query("INSERT INTO schema_migrations(name) VALUES ('014_new_order_primary_guest_nickname.sql')");
+        const migration015 = await readFile(resolve(process.cwd(), "packages/db/src/migrations/015_generated_room_operational_codes.sql"), "utf8");
+        await client.query(migration015);
+        await client.query("INSERT INTO schema_migrations(name) VALUES ('015_generated_room_operational_codes.sql')");
+        const migration016 = await readFile(resolve(process.cwd(), "packages/db/src/migrations/016_member_property_links.sql"), "utf8");
+        await client.query(migration016);
+        await client.query("INSERT INTO schema_migrations(name) VALUES ('016_member_property_links.sql')");
+        const migration017 = await readFile(resolve(process.cwd(), "packages/db/src/migrations/017_membership_orders.sql"), "utf8");
+        await client.query(migration017);
+        await client.query("INSERT INTO schema_migrations(name) VALUES ('017_membership_orders.sql')");
+        const migration018 = await readFile(resolve(process.cwd(), "packages/db/src/migrations/018_member_stay_identity_and_coverage_guards.sql"), "utf8");
+        await client.query(migration018);
+        await client.query("INSERT INTO schema_migrations(name) VALUES ('018_member_stay_identity_and_coverage_guards.sql')");
+        const migration019 = await readFile(resolve(process.cwd(), "packages/db/src/migrations/019_member_stay_booking_channel_rules.sql"), "utf8");
+        await client.query(migration019);
+        await client.query("INSERT INTO schema_migrations(name) VALUES ('019_member_stay_booking_channel_rules.sql')");
       } finally {
         await client.end();
       }
@@ -844,6 +889,19 @@ describe.sequential("booking channels and external transaction references on Pos
           primary_guest_snapshot: { fullName: "Historical Null Guest" }
         }
       ]);
+      const historicalMemberIdentities = await historicalDb.selectFrom("orders")
+        .select(["id", "member_id"])
+        .where("id", "in", ["order_historical_member_identity", "order_historical_nulls", "order_historical_explicit_null"])
+        .orderBy("id")
+        .execute();
+      expect(historicalMemberIdentities).toEqual([
+        { id: "order_historical_explicit_null", member_id: null },
+        { id: "order_historical_member_identity", member_id: "member_historical_identity" },
+        { id: "order_historical_nulls", member_id: null }
+      ]);
+      expect(await historicalDb.selectFrom("quotes").select(["id", "member_id"])
+        .where("id", "=", "quote_historical_member_identity").executeTakeFirstOrThrow())
+        .toEqual({ id: "quote_historical_member_identity", member_id: "member_historical_identity" });
       const historicalOrderCountBeforeRejectedInsert = await historicalDb.selectFrom("orders")
         .select(({ fn }) => fn.countAll<number>().as("count"))
         .executeTakeFirstOrThrow();
@@ -885,7 +943,7 @@ describe.sequential("booking channels and external transaction references on Pos
       expect(upgradedLegacyUnits).toEqual([
         {
           id: demo.roomId,
-          catalog_version: "qintopia-2026-feishu-revision-561-user-confirmed-v3",
+          catalog_version: "qintopia-2026-feishu-revision-561-user-confirmed-v4",
           building_code: "1",
           room_type_code: "shared_bath_quad",
           pricing_product_code: "shared_bath_quad_whole_room",
@@ -895,7 +953,7 @@ describe.sequential("booking channels and external transaction references on Pos
         },
         {
           id: demo.bedAId,
-          catalog_version: "qintopia-2026-feishu-revision-561-user-confirmed-v3",
+          catalog_version: "qintopia-2026-feishu-revision-561-user-confirmed-v4",
           building_code: "1",
           room_type_code: "shared_bath_quad",
           pricing_product_code: "shared_bath_quad_bed",
@@ -905,7 +963,7 @@ describe.sequential("booking channels and external transaction references on Pos
         },
         {
           id: demo.bedBId,
-          catalog_version: "qintopia-2026-feishu-revision-561-user-confirmed-v3",
+          catalog_version: "qintopia-2026-feishu-revision-561-user-confirmed-v4",
           building_code: "1",
           room_type_code: "shared_bath_quad",
           pricing_product_code: "shared_bath_quad_bed",
@@ -915,7 +973,7 @@ describe.sequential("booking channels and external transaction references on Pos
         },
         {
           id: demo.secondRoomId,
-          catalog_version: "qintopia-2026-feishu-revision-561-user-confirmed-v3",
+          catalog_version: "qintopia-2026-feishu-revision-561-user-confirmed-v4",
           building_code: "1",
           room_type_code: "shared_bath_quad",
           pricing_product_code: "shared_bath_quad_whole_room",

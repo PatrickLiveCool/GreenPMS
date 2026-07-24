@@ -1,0 +1,217 @@
+import { expect, test, type Page, type TestInfo } from "@playwright/test";
+import { createDatabase } from "../../packages/db/src/database.ts";
+
+const e2eDatabaseUrl = process.env.E2E_DATABASE_URL ?? "postgres://qintopia:qintopia@127.0.0.1:55432/qintopia_e2e";
+const e2ePropertyId = "prop_qintopia_demo";
+
+async function seedMember(testInfo: TestInfo) {
+  const suffix = testInfo.project.name;
+  const memberId = `member_step2c_e2e_${suffix}`;
+  const contractId = `contract_step2c_e2e_${suffix}`;
+  const lotId = `lot_step2c_e2e_${suffix}`;
+  const membershipOrderId = `membership_order_step2c_e2e_${suffix}`;
+  const identity = `E2E-2C-${suffix.toUpperCase()}-001`;
+  const db = createDatabase(e2eDatabaseUrl);
+  try {
+    await db.insertInto("members").values({ id: memberId, identity_card_number: identity, full_name: `2C住宿会员-${suffix}`, phone: suffix === "desktop" ? "13923000001" : "13923000002", wechat: `qintopia-2c-${suffix}` }).execute();
+    await db.insertInto("member_property_links").values({ member_id: memberId, property_id: e2ePropertyId }).execute();
+    await db.insertInto("member_contracts").values({ id: contractId, property_id: e2ePropertyId, member_id: memberId, member_name: `2C住宿会员-${suffix}`, status: "ACTIVE", valid_from: "2026-07-24", valid_until: "2027-07-24", version: 1 }).execute();
+    await db.insertInto("entitlement_lots").values({ id: lotId, contract_id: contractId, unit_kind: "ROOM_NIGHT", total_units: 3, expires_on: "2027-07-24", version: 1 }).execute();
+    await db.insertInto("membership_orders").values({
+      id: membershipOrderId,
+      property_id: e2ePropertyId,
+      member_id: memberId,
+      product_id: "membership_product_shared_bath_single_v1",
+      product_code: "SHARED_BATH_SINGLE_30",
+      product_version: 1,
+      product_name: "公卫单人间会员",
+      listed_price_minor: 162_000,
+      agreed_price_minor: 162_000,
+      price_adjustment_minor: 0,
+      price_adjustment_reason: null,
+      currency: "CNY",
+      entitlement_unit_kind: "ROOM_NIGHT",
+      entitlement_units: 3,
+      allowed_room_type_code: "shared_bath_single",
+      allowed_inventory_kind: "ROOM",
+      status: "ACTIVE",
+      activated_at: new Date("2026-07-24T03:00:00.000Z"),
+      valid_from: "2026-07-24",
+      valid_until: "2027-07-24",
+      contract_id: contractId,
+      entitlement_lot_id: lotId,
+      version: 1,
+      created_by_command_id: `seed-step2c-${suffix}`,
+      activated_by_command_id: `seed-step2c-${suffix}`
+    }).execute();
+    await db.updateTable("member_contracts").set({ membership_order_id: membershipOrderId }).where("id", "=", contractId).execute();
+  } finally {
+    await db.destroy();
+  }
+  return {
+    memberId,
+    identity,
+    lotId,
+    name: `2C住宿会员-${suffix}`,
+    phone: suffix === "desktop" ? "13923000001" : "13923000002"
+  };
+}
+
+async function login(page: Page) {
+  await page.goto("/");
+  await page.getByTestId("login-username").fill("operator");
+  await page.getByTestId("login-password").fill("demo-pass-2026");
+  await page.getByTestId("login-submit").click();
+  await expect(page.getByRole("heading", { name: "房态与可售" })).toBeVisible();
+}
+
+async function chooseD01(page: Page, arrival: string, departure: string) {
+  await page.getByTestId("arrival-date").fill(arrival);
+  await page.getByTestId("departure-date").fill(departure);
+  await expect(page.getByTestId("room-status-range-loading")).toBeHidden({ timeout: 15_000 });
+  if ((page.viewportSize()?.width ?? 0) < 576) {
+    await page.getByRole("button", { name: "新建住宿或库存 Block", exact: true }).click();
+  }
+  const unitSelect = page.getByTestId("room-status-unit-select");
+  const d01Id = "unit_room_d_gen_01";
+  await expect(unitSelect.locator(`option[value="${d01Id}"]`)).toContainText("D01");
+  await unitSelect.selectOption(d01Id);
+  await page.getByLabel("入住日期", { exact: true }).fill(arrival);
+  await page.getByLabel("退房日期", { exact: true }).fill(departure);
+  await page.getByRole("button", { name: "创建正常住宿订单", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "住宿金额", exact: true })).toBeVisible();
+}
+
+test("2C shows ledger balance, corrects by target, and creates a partially covered member stay", async ({ page }, testInfo) => {
+  const fixture = await seedMember(testInfo);
+  const quoteBodies: Record<string, unknown>[] = [];
+  const createOrderBodies: Record<string, unknown>[] = [];
+  page.on("request", (request) => {
+    if (request.method() !== "POST") return;
+    try {
+      const body = request.postDataJSON() as Record<string, unknown>;
+      const path = new URL(request.url()).pathname;
+      if (path === "/api/v1/quotes") quoteBodies.push(body);
+      if (path === "/api/v1/command-previews" && body.commandType === "CREATE_ORDER") createOrderBodies.push(body);
+    } catch {
+      // A malformed request is rejected elsewhere; this observer only proves the ordinary path omits memberId.
+    }
+  });
+  await login(page);
+  await page.getByRole("link", { name: "会员", exact: true }).click();
+  await page.getByTestId("member-search-query").fill(fixture.identity);
+  await page.getByRole("button", { name: "搜索", exact: true }).click();
+  await expect(page.getByRole("heading", { name: fixture.name, exact: true })).toBeVisible();
+  const balance = page.getByTestId("member-balance-summary");
+  await expect(balance).toContainText("3 间夜");
+  const lot = page.getByTestId("member-entitlement-lot");
+  await expect(lot).toContainText("公卫单人间会员");
+  await expect(lot).toContainText("2026-07-24 至 2027-07-24");
+  await expect(lot).toContainText("当前可用3 间夜");
+
+  await lot.getByTestId("correct-entitlement-balance").click();
+  await page.getByTestId("target-entitlement-balance").fill("1");
+  await page.getByTestId("entitlement-adjustment-reason").fill("2C 浏览器验收调整为 1 间夜");
+  await page.getByRole("button", { name: "核对余额更正", exact: true }).click();
+  const effect = page.getByTestId("command-effect");
+  await expect(effect).toContainText("当前可用余额3 间夜");
+  await expect(effect).toContainText("更正后可用余额1 间夜");
+  await expect(effect).toContainText("本次变动-2");
+  await expect(effect).not.toContainText("entitlementLotId");
+  await page.getByTestId("confirm-command").click();
+  const receipt = page.getByTestId("command-receipt");
+  await expect(receipt).toContainText("更正会员余额已完成");
+  await expect(receipt).not.toContainText("Receipt ID");
+  await page.getByRole("button", { name: "完成", exact: true }).click();
+  await expect(balance).toContainText("1 间夜");
+  const ledger = page.getByTestId("member-ledger-history");
+  await expect(ledger).toContainText("余额更正");
+  await expect(ledger).toContainText("公卫单人间会员");
+  await expect(ledger).toContainText("-2 间夜");
+  await expect(ledger).toContainText("2C 浏览器验收调整为 1 间夜");
+
+  await page.getByRole("link", { name: "房态", exact: true }).click();
+  const arrival = testInfo.project.name === "desktop" ? "2026-10-01" : "2026-10-05";
+  const departure = testInfo.project.name === "desktop" ? "2026-10-04" : "2026-10-08";
+  await chooseD01(page, arrival, departure);
+  await expect(page.getByTestId("quote-result")).toBeVisible({ timeout: 15_000 });
+  await expect.poll(() => quoteBodies.some((body) => body.arrivalDate === arrival
+    && body.departureDate === departure
+    && !Object.hasOwn(body, "memberId"))).toBe(true);
+  await expect(page.getByTestId("member-search")).toHaveCount(0);
+  await expect(page.getByText("覆盖晚数", { exact: true })).toHaveCount(0);
+  await page.getByTestId("use-member-entitlement").check();
+  await page.getByTestId("member-search").fill(fixture.identity);
+  await page.getByTestId("member-profile-select").selectOption(fixture.memberId);
+  await expect(page.getByTestId("booking-channel-code")).toHaveCount(0);
+  const quote = page.getByTestId("quote-result");
+  await expect(quote).toBeVisible({ timeout: 15_000 });
+  await expect(quote).toContainText("总住宿晚数3 晚");
+  await expect(quote).toContainText("覆盖晚数1 晚");
+  await expect(quote).toContainText("未覆盖晚数2 晚");
+  await expect(quote).toContainText("未覆盖金额¥260.00");
+  await expect(page.getByTestId("primary-guest-nickname")).toHaveValue(fixture.name);
+  await expect(page.getByTestId("primary-guest-name")).toHaveValue(fixture.name);
+  await expect(page.getByLabel("联系电话", { exact: true })).toHaveValue(fixture.phone);
+  await expect(page.getByLabel("证件号码", { exact: true })).toHaveValue(fixture.identity);
+  await page.getByTestId("primary-guest-nickname").fill("2C住客");
+  await page.getByTestId("primary-guest-name").fill("2C 会员住客");
+  await page.getByLabel("联系电话", { exact: true }).fill("13923000999");
+  await page.getByLabel("证件号码", { exact: true }).fill("2C-STAY-SNAPSHOT-EDITED");
+  await page.screenshot({ path: testInfo.outputPath("member-stay-form-step2c.png"), fullPage: true });
+  await page.getByRole("button", { name: "核对并创建订单", exact: true }).click();
+  const memberStayEffect = page.getByTestId("command-effect");
+  await expect(memberStayEffect).toContainText("请核对会员住宿");
+  await expect(memberStayEffect).not.toContainText("Preview");
+  await expect(memberStayEffect).not.toContainText("Command");
+  await expect.poll(() => createOrderBodies.length).toBe(1);
+  const memberStayInput = createOrderBodies[0]?.input as Record<string, unknown>;
+  expect(memberStayInput).not.toHaveProperty("bookingChannelCode");
+  expect(memberStayInput).not.toHaveProperty("channelOrderReference");
+  expect(memberStayInput.primaryGuest).toEqual({
+    fullName: "2C 会员住客",
+    nickname: "2C住客",
+    phone: "13923000999",
+    documentNumber: "2C-STAY-SNAPSHOT-EDITED"
+  });
+  await page.screenshot({ path: testInfo.outputPath("member-stay-confirm-step2c.png"), fullPage: true });
+  await page.getByTestId("confirm-command").click();
+  await expect(page.getByTestId("command-receipt")).toContainText("会员住宿订单已创建");
+  await expect(page.getByTestId("command-receipt")).not.toContainText("Receipt");
+  await expect(page.getByTestId("command-receipt")).not.toContainText("Command");
+  await expect(page.getByTestId("command-receipt")).not.toContainText("内部 ID");
+  await expect(page.getByTestId("command-receipt")).not.toContainText(/(?:order|quote|member|contract|receipt|command)_/i);
+  await page.getByRole("link", { name: "查看订单", exact: true }).click();
+  await expect(page.getByText("住宿来源", { exact: true })).toBeVisible();
+  await expect(page.getByText("会员权益", { exact: true })).toBeVisible();
+  await expect(page.getByText("订单来源渠道", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("渠道订单号", { exact: true })).toHaveCount(0);
+
+  await page.getByRole("link", { name: "移动履约", exact: true }).click();
+  await page.getByLabel("营业日期", { exact: true }).fill(arrival);
+  const arrivalRow = page.locator("article.queue-row").filter({ hasText: "2C住客" });
+  await arrivalRow.getByRole("button", { name: "入住", exact: true }).click();
+  await page.getByTestId("create-command-preview").click();
+  await page.getByTestId("reason-note").fill("2C 浏览器验收入住核销");
+  await page.getByTestId("confirm-command").click();
+  await expect(page.getByTestId("command-receipt")).toContainText("业务写入已提交");
+  await page.getByRole("button", { name: "完成", exact: true }).click();
+
+  await page.getByRole("link", { name: "会员", exact: true }).click();
+  await page.getByTestId("member-search-query").fill(fixture.identity);
+  await page.getByRole("button", { name: "搜索", exact: true }).click();
+  await expect(page.getByRole("heading", { name: fixture.name, exact: true })).toBeVisible();
+  await expect(page.getByTestId("member-balance-summary")).toContainText("0 间夜");
+  await expect(page.getByTestId("member-ledger-history")).toContainText("预订冻结");
+  await expect(page.getByTestId("member-ledger-history")).toContainText("公卫单人间会员");
+  const heldEntry = page.getByTestId("member-ledger-entry-hold");
+  await expect(heldEntry).toContainText("余额 -1 间夜");
+  const consumedEntry = page.getByTestId("member-ledger-entry-consume");
+  await expect(consumedEntry).toContainText("入住核销");
+  await expect(consumedEntry).toContainText("本次核销 1 间夜");
+  await expect(consumedEntry).not.toContainText("0 间夜");
+
+  const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+  expect(overflow).toBeLessThanOrEqual(1);
+  await page.screenshot({ path: testInfo.outputPath("member-stay-step2c.png"), fullPage: true });
+});

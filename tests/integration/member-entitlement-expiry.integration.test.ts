@@ -101,6 +101,10 @@ beforeEach(async () => {
       version: 1
     }
   ]).execute();
+  await db.insertInto("member_property_links").values({
+    member_id: memberId,
+    property_id: demo.propertyId
+  }).onConflict((oc) => oc.columns(["member_id", "property_id"]).doNothing()).execute();
 });
 
 afterEach(async () => {
@@ -282,7 +286,7 @@ describe("member entitlement natural expiry", () => {
       "fact_inactive_contract_history"
     ]));
     expect(await listMemberSummaries(db, demo.propertyId, "expiry-consistency-id")).toEqual([
-      expect.objectContaining({ availableBalance: { ROOM_NIGHT: 3, BED_NIGHT: 0 }, balanceAsOfDate: today })
+      { member: expect.objectContaining({ id: "member_expiry_consistency" }) }
     ]);
   });
 

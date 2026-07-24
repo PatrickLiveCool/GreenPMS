@@ -13,7 +13,7 @@ import {
   type ReceiptDto,
   type StoredQuoteDto
 } from "@qintopia/contracts";
-import { newId, sha256, stableHash } from "@qintopia/domain";
+import { enumerateServiceDates, newId, paidStayTypeForNights, sha256, stableHash } from "@qintopia/domain";
 import { createQuoteInTransaction } from "../pricing-service.ts";
 import { bumpRoomStatusRevision } from "../room-status.ts";
 import type { Database } from "../schema.ts";
@@ -225,11 +225,7 @@ function normalizeCommandEnvelope(envelope: CommandEnvelope): CommandEnvelope {
         fullName: trim("fullName"),
         identityCardNumber: trim("identityCardNumber", true),
         phone: trim("phone"),
-        wechat: trim("wechat"),
-        validFrom: trim("validFrom"),
-        validUntil: trim("validUntil"),
-        ...(envelope.input.memberContractId !== undefined ? { memberContractId: trim("memberContractId") } : {}),
-        ...(envelope.input.sourceApplicationRecordId !== undefined ? { sourceApplicationRecordId: trim("sourceApplicationRecordId") } : {})
+        wechat: trim("wechat")
       }
     };
   }
@@ -405,14 +401,25 @@ export async function executeQuoteCommand(
     throw new DomainError("RESOURCE_SCOPE_DENIED", "Property is outside the credential scope", 403);
   }
 
+  const nights = enumerateServiceDates(input.arrivalDate, input.departureDate).length;
+  const derivedPaidStayType = paidStayTypeForNights(nights);
+  if (input.stayType !== undefined && input.stayType !== "FREE" && input.stayType !== derivedPaidStayType) {
+    throw new DomainError("PRICING_POLICY_UNCONFIGURED", `住宿类型与 ${nights} 晚住宿不一致，请重新报价`, 422);
+  }
+  const stayType = input.stayType === "FREE" ? "FREE" : derivedPaidStayType;
+  if (input.memberId && input.memberContractId) {
+    throw new DomainError("VALIDATION_ERROR", "会员报价只能选择会员档案，不能同时指定会员合同");
+  }
+
   const commandType = "CREATE_QUOTE" as const;
   const normalizedInput: CreateQuoteCommandInputDto = {
     propertyId,
     inventoryUnitId: input.inventoryUnitId,
-    stayType: input.stayType,
+    stayType,
     arrivalDate: input.arrivalDate,
     departureDate: input.departureDate,
     pricingPolicyVersionId: input.pricingPolicyVersionId,
+    ...(input.memberId ? { memberId: input.memberId } : {}),
     ...(input.memberContractId ? { memberContractId: input.memberContractId } : {})
   };
   const requestHash = stableHash(normalizedInput);
@@ -740,7 +747,9 @@ export async function confirmCommandPreview(db: Kysely<Database>, principal: Aut
             "QUOTE_EXPIRED",
             "FACT_ALREADY_REVERSED",
             "REFUND_LIMIT_EXCEEDED"
-          ].includes(error.code) || (isTokenLifecycleCommand(commandType) && error.code === "VALIDATION_ERROR"))) {
+          ].includes(error.code)
+            || (isTokenLifecycleCommand(commandType) && error.code === "VALIDATION_ERROR")
+            || (commandType === "CREATE_MEMBER" && error.code === "VALIDATION_ERROR"))) {
             throw new DomainError("PREVIEW_STALE", "Preview basis changed; request a new preview", 409, false, { causeCode: error.code });
           }
           throw error;

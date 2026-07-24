@@ -178,6 +178,7 @@ export async function appendAmendment(trx: Transaction<Database>, options: {
 export async function holdCoverage(trx: Transaction<Database>, options: {
   orderId: string;
   contractId: string;
+  memberId?: string;
   inventoryUnitId: string;
   revisionId: string;
   coverageSet: CoverageItemDto[];
@@ -186,6 +187,15 @@ export async function holdCoverage(trx: Transaction<Database>, options: {
   const coverageIds: string[] = [];
   const factIds: string[] = [];
   for (const item of options.coverageSet) {
+    const lotOwner = await trx.selectFrom("entitlement_lots")
+      .innerJoin("member_contracts", "member_contracts.id", "entitlement_lots.contract_id")
+      .select(["entitlement_lots.contract_id", "member_contracts.member_id"])
+      .where("entitlement_lots.id", "=", item.entitlementLotId)
+      .executeTakeFirst();
+    if (!lotOwner || (options.memberId ? lotOwner.member_id !== options.memberId : lotOwner.contract_id !== options.contractId)) {
+      throw new DomainError("ENTITLEMENT_CONFLICT", "会员权益不属于本次住宿选择的会员", 409);
+    }
+    const coverageContractId = lotOwner.contract_id;
     const existing = await trx.selectFrom("coverage_items")
       .select(["id", "status", "contract_id", "lot_id", "unit_kind", "inventory_unit_id"])
       .where("order_id", "=", options.orderId)
@@ -193,7 +203,7 @@ export async function holdCoverage(trx: Transaction<Database>, options: {
       .where("status", "!=", "RELEASED")
       .executeTakeFirst();
     if (existing) {
-      if (existing.contract_id !== options.contractId
+      if (existing.contract_id !== coverageContractId
         || existing.lot_id !== item.entitlementLotId
         || existing.unit_kind !== item.unitKind
         || existing.inventory_unit_id !== item.inventoryUnitId) {
@@ -210,7 +220,7 @@ export async function holdCoverage(trx: Transaction<Database>, options: {
     await trx.insertInto("coverage_items").values({
       id: coverageId,
       order_id: options.orderId,
-      contract_id: options.contractId,
+      contract_id: coverageContractId,
       lot_id: item.entitlementLotId,
       inventory_unit_id: item.inventoryUnitId,
       service_date: item.serviceDate,
@@ -251,16 +261,25 @@ function coverageMatches(item: {
 export async function reconcileCoverage(trx: Transaction<Database>, options: {
   orderId: string;
   contractId: string;
+  memberId?: string;
   revisionId: string;
   coverageSet: CoverageItemDto[];
   commandId: string;
 }): Promise<{ coverageIds: string[]; factIds: string[] }> {
-  const desiredByDate = new Map<string, CoverageItemDto>();
+  const desiredByDate = new Map<string, { item: CoverageItemDto; contractId: string }>();
   for (const item of options.coverageSet) {
     if (desiredByDate.has(item.serviceDate)) {
       throw new DomainError("INTERNAL_ERROR", `Pricing produced duplicate coverage on ${item.serviceDate}`, 500);
     }
-    desiredByDate.set(item.serviceDate, item);
+    const lotOwner = await trx.selectFrom("entitlement_lots")
+      .innerJoin("member_contracts", "member_contracts.id", "entitlement_lots.contract_id")
+      .select(["entitlement_lots.contract_id", "member_contracts.member_id"])
+      .where("entitlement_lots.id", "=", item.entitlementLotId)
+      .executeTakeFirst();
+    if (!lotOwner || (options.memberId ? lotOwner.member_id !== options.memberId : lotOwner.contract_id !== options.contractId)) {
+      throw new DomainError("ENTITLEMENT_CONFLICT", "会员权益不属于本次住宿选择的会员", 409);
+    }
+    desiredByDate.set(item.serviceDate, { item, contractId: lotOwner.contract_id });
   }
 
   const active = await trx.selectFrom("coverage_items")
@@ -287,7 +306,7 @@ export async function reconcileCoverage(trx: Transaction<Database>, options: {
   for (const item of active) {
     const desired = desiredByDate.get(item.service_date);
     if (item.status === "CONSUMED") {
-      if (desired && !coverageMatches(item, desired, options.contractId)) {
+      if (desired && !coverageMatches(item, desired.item, desired.contractId)) {
         throw new DomainError("ENTITLEMENT_CONFLICT", "A pricing revision cannot rewrite consumed coverage", 409, false, {
           orderId: options.orderId,
           serviceDate: item.service_date,
@@ -298,7 +317,7 @@ export async function reconcileCoverage(trx: Transaction<Database>, options: {
       coverageIds.push(item.id);
       continue;
     }
-    if (desired && coverageMatches(item, desired, options.contractId)) {
+    if (desired && coverageMatches(item, desired.item, desired.contractId)) {
       desiredByDate.delete(item.service_date);
       coverageIds.push(item.id);
       continue;
@@ -316,7 +335,7 @@ export async function reconcileCoverage(trx: Transaction<Database>, options: {
       reason: "ORDER_COVERAGE_RELEASE", command_id: options.commandId
     }).execute();
     factIds.push(releaseFactId);
-    if (expiredLotIds.has(item.lot_id) && desired?.entitlementLotId !== item.lot_id) {
+    if (expiredLotIds.has(item.lot_id) && desired?.item.entitlementLotId !== item.lot_id) {
       const expirationFactId = newId("fact");
       await trx.insertInto("entitlement_ledger").values({
         fact_id: expirationFactId, lot_id: item.lot_id, entry_type: "EXPIRE", quantity_delta: -1,
@@ -328,12 +347,13 @@ export async function reconcileCoverage(trx: Transaction<Database>, options: {
     changedLotIds.add(item.lot_id);
   }
 
-  for (const item of desiredByDate.values()) {
+  for (const desired of desiredByDate.values()) {
+    const { item, contractId } = desired;
     const coverageId = newId("coverage");
     await trx.insertInto("coverage_items").values({
       id: coverageId,
       order_id: options.orderId,
-      contract_id: options.contractId,
+      contract_id: contractId,
       lot_id: item.entitlementLotId,
       inventory_unit_id: item.inventoryUnitId,
       service_date: item.serviceDate,
@@ -359,7 +379,11 @@ export async function reconcileCoverage(trx: Transaction<Database>, options: {
   }
 
   if (changedLotIds.size > 0) {
-    await incrementContractAndLotVersions(trx, options.contractId, [...changedLotIds]);
+    const changedLots = await trx.selectFrom("entitlement_lots").select(["id", "contract_id"])
+      .where("id", "in", [...changedLotIds]).execute();
+    for (const contractId of new Set(changedLots.map((row) => row.contract_id))) {
+      await incrementContractAndLotVersions(trx, contractId, changedLots.filter((row) => row.contract_id === contractId).map((row) => row.id));
+    }
   }
   return { coverageIds, factIds };
 }

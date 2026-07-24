@@ -29,7 +29,7 @@ case "$*" in
     printf '%s' "$count" > "$FAKE_OID_QUERY_COUNT_FILE"
     if [ "$count" -eq 1 ]; then printf '%s' "$FAKE_CREATED_TARGET_OID"; else printf '%s' "$FAKE_CLEANUP_TARGET_OID"; fi
     ;;
-  *"schema_migrations"*) printf '14' ;;
+  *"schema_migrations"*) printf '19' ;;
   *" pg_restore "*) if [ "$FAKE_RESTORE_FAILURE" = "1" ]; then exit 1; fi ;;
 esac
 `, { mode: 0o700 });
@@ -83,6 +83,11 @@ describe("restore script contract", () => {
       expect(calls).toContain("012_legacy_demo_inventory_catalog_backfill.sql");
       expect(calls).toContain("013_room_status_operations.sql");
       expect(calls).toContain("014_new_order_primary_guest_nickname.sql");
+      expect(calls).toContain("015_generated_room_operational_codes.sql");
+      expect(calls).toContain("016_member_property_links.sql");
+      expect(calls).toContain("017_membership_orders.sql");
+      expect(calls).toContain("018_member_stay_identity_and_coverage_guards.sql");
+      expect(calls).toContain("019_member_stay_booking_channel_rules.sql");
       expect(calls).not.toContain("dropdb");
     } finally {
       await rm(fixture.workdir, { recursive: true, force: true });

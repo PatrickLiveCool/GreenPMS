@@ -3,8 +3,10 @@ title: 'Guest Nickname And Split-Bed Occupancy'
 type: 'feature'
 created: '2026-07-22'
 status: 'done'
+current_display_status: 'superseded-pending-parent-stage-5'
 review_loop_iteration: 0
 baseline_commit: '137920e6d33831dccc64a51d3d96a2a8f1fd355c'
+superseded_display_requirement_by: '../../待开发项/房态与订单运营流程分步开发计划.md#阶段-5多人间首页显示全部住客昵称'
 context:
   - 'docs/implementation/room-status-ui-development-goal.md'
   - 'docs/implementation/spec-qintopia-pms-core-operations-mvp.md'
@@ -39,7 +41,15 @@ context:
 
 </frozen-after-approval>
 
-## Code Map
+## Post-Approval Display Supersession
+
+用户在 2026-07-23 查看真实房态后明确取消“首个昵称 +N、其余昵称仅悬停可见”的紧凑展示。最新权威要求是：多人间父房逐日格在首页直接显示当天每一个有权查看的住客昵称，并同时保留 `已占/总床数`；昵称按床位稳定顺序排列、同名不去重、历史缺失逐项显示“历史未记录”，Tooltip/键盘详情只补充床号和来源，不能作为其余昵称的唯一入口。
+
+本文件冻结块、已完成任务和验证数量继续记录 commit `4fbf90d` 之前的历史实现证据，不再定义当前目标展示。新增量由 `房态与订单运营流程分步开发计划.md` 的阶段 5 负责实现和人工验收；完成前本文件的 `status: done` 只能表示旧“昵称 +N”增量曾经完成，不能被解释为最新展示要求已经完成。
+
+以下 Code Map、勾选任务、变更记录、Design Notes、验证数量和手工检查全部是旧基线的历史证据；其中“固定高度”“昵称 +N”“客户端压缩显示”等描述已被上面的最新规则取代，不得作为新实现或验收标准。
+
+## Historical Baseline Code Map
 
 - `packages/contracts/src/index.ts` -- 可兼容历史空值的居住人快照与房态 occupancy DTO。
 - `apps/api/src/schemas.ts` -- 新命令必填昵称及 OpenAPI schema。
@@ -51,7 +61,7 @@ context:
 - `apps/web/src/pages/OrdersPage.tsx`, `apps/web/src/pages/OrderDetailPage.tsx`, `apps/web/src/ui.tsx` -- 昵称优先的查找、标题和履约显示。
 - `tests/` -- 领域、PostgreSQL、OpenAPI、共享协议和浏览器回归。
 
-## Tasks & Acceptance
+## Historical Baseline Tasks & Acceptance
 
 **Execution:**
 - [x] 扩展共享合同和 API schema，保持历史快照兼容并严格校验所有新建命令。
@@ -68,7 +78,7 @@ context:
 - Given 同日另有维修、内部占用或清洁事实，when 投影聚合占用，then 住客占用分子仍只来自正常订单和 `FREE_STAY`。
 - Given 历史快照无昵称，when 通过 Query 和 Web 查看，then API 保留空值语义且 UI 明确派生历史兼容提示。
 
-## Spec Change Log
+## Historical Baseline Change Log
 
 - 2026-07-23：完整 Playwright 最终通过 43 个适用场景、35 个按项目条件跳过；修复 Tooltip 前向 Tab 的嵌套焦点冒泡，并让滚动后的悬停验收先稳定可视位置再交互。Axe 仍执行全部规则，但只回传实际 violations，避免未使用结果放大浏览器协议负载。
 - 2026-07-23：将 migration 014 纳入 `databaseReady`、恢复、备份恢复及 Compose 冷启动的 14 个必需迁移门禁；主演示数据库已应用 014，最终镜像和 `127.0.0.1:4100` 实例均由 readiness 验证。
@@ -76,7 +86,7 @@ context:
 - 2026-07-23：新增 migration 014。迁移后新订单必须保存非空 `primaryGuest.nickname`；历史缺失或 `null` 昵称保持原样，Web 仅派生兼容提示。
 - 2026-07-23：记录已完成的单元、PostgreSQL 集成、契约、计价事实及 production Web build 结果；最终完整 Playwright 总数和实例恢复待交付流程确认。
 
-## Suggested Review Order
+## Historical Baseline Suggested Review Order
 
 1. 从共享合同与 `apps/api/src/schemas.ts` 核对新建命令的昵称输入、历史空值兼容及 OpenAPI 表达。
 2. 查看 migration 014 和 `packages/db/src/commands/`，确认数据库门禁、Preview/Confirm/Receipt 与 amendment 快照语义一致。
@@ -84,11 +94,11 @@ context:
 4. 查看 `InventoryPage.tsx`、`RoomStatusGrid.tsx` 和订单页面，核对表单必填、`已占/总床数`、全部昵称 Tooltip 与历史提示。
 5. 最后按 Verification 顺序运行自动化套件，并以最终 Playwright 和 readiness 结果完成运行态验收。
 
-## Design Notes
+## Historical Baseline Design Notes
 
 昵称属于订单确认时的不可变主要居住人快照，不另建可变住客档案字段。父格聚合由服务端提供 `occupiedBedCount`、`totalBedCount` 和按稳定床位顺序排列的居住人摘要；客户端只负责压缩显示和可访问展开，避免把来源筛选或人数计算复制到浏览器。
 
-## Verification
+## Historical Baseline Verification
 
 **Commands:**
 - `npm run verify` -- 16 files、201/201 tests 通过。

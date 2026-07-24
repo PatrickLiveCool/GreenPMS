@@ -136,15 +136,16 @@ export const api = {
   quote: (input: {
     propertyId: string;
     inventoryUnitId: string;
-    stayType: string;
+    stayType?: string;
     arrivalDate: string;
     departureDate: string;
     pricingPolicyVersionId: string;
-    memberContractId?: string;
-  }, metadata: ClientCommandMetadata) => request<CreateQuoteCommandResponseDto>("/api/v1/quotes", {
+    memberId?: string;
+  }, metadata: ClientCommandMetadata, signal?: AbortSignal) => request<CreateQuoteCommandResponseDto>("/api/v1/quotes", {
     method: "POST",
     headers: metadataHeaders(metadata),
-    body: JSON.stringify(input)
+    body: JSON.stringify(input),
+    ...(signal ? { signal } : {})
   }),
   orders: (propertyId: string, status?: string) => {
     const query = new URLSearchParams({ propertyId });
@@ -152,9 +153,9 @@ export const api = {
     return request<{ orders: OrderRowDto[] }>(`/api/v1/orders?${query.toString()}`);
   },
   order: (orderId: string) => request<OrderViewDto>(`/api/v1/orders/${encodeURIComponent(orderId)}`),
-  members: (propertyId: string, identityCardNumber?: string) => {
+  members: (propertyId: string, memberQuery?: string) => {
     const query = new URLSearchParams({ propertyId });
-    if (identityCardNumber?.trim()) query.set("identityCardNumber", identityCardNumber.trim());
+    if (memberQuery?.trim()) query.set("query", memberQuery.trim());
     return request<{ members: MemberSummaryDto[] }>(`/api/v1/members?${query.toString()}`);
   },
   member: (memberId: string, propertyId: string) => {

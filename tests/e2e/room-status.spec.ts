@@ -352,12 +352,15 @@ async function createFreeStayForToday(page: Page, options: {
   await page.getByTestId("room-status-unit-select").selectOption(options.unitId);
   await page.getByLabel("入住日期", { exact: true }).fill(options.arrivalDate);
   await page.getByLabel("退房日期", { exact: true }).fill(options.departureDate);
-  await page.getByRole("button", { name: "应用选区", exact: true }).click();
+  await expect(page.getByTestId("quote-result")).toBeVisible({ timeout: 15_000 });
+  const freeQuoteResponse = page.waitForResponse((response) => {
+    if (response.request().method() !== "POST" || new URL(response.url()).pathname !== "/api/v1/quotes") return false;
+    const payload = response.request().postDataJSON() as { stayType?: string };
+    return payload.stayType === "FREE" && response.status() === 200;
+  });
   await page.getByRole("button", { name: "创建免费入住", exact: true }).click();
-  await page.getByLabel("住宿类型").selectOption("FREE");
-  await page.getByLabel("计价政策版本").selectOption("policy_free_v1");
-  await page.getByTestId("request-quote").click();
-  await expect(page.getByTestId("quote-result")).toBeVisible();
+  await freeQuoteResponse;
+  await expect(page.getByTestId("free-stay-reason")).toBeVisible();
   await page.getByTestId("primary-guest-name").fill(options.guest);
   await page.getByTestId("free-stay-reason").fill(`Room-status OPEN_ORDER fixture: ${options.guest}`);
   await page.getByTestId("booking-channel-code").selectOption("WECOM");
@@ -423,7 +426,7 @@ test("desktop room-status matrix drives a typed Block journey and restores the w
   await expect(roomRow(page, bedBId)).toBeVisible();
 
   const bedAStart = roomCell(page, bedAId, arrivalDate);
-  await expect(bedAStart).toHaveAccessibleName(/104.*床位 A.*可售.*服务端标记可售/);
+  await expect(bedAStart).toHaveAccessibleName(/104.*床位 A.*可售.*可以安排/);
   await bedAStart.focus();
   await page.keyboard.press("Space");
   await page.keyboard.press("Shift+ArrowRight");
@@ -485,11 +488,11 @@ test("desktop room-status matrix drives a typed Block journey and restores the w
 
   await expect(bedAInterval).toBeVisible();
   await expect(parentInterval).toBeVisible();
-  await expect(bedAInterval).toHaveAccessibleName(/内部占用.*阻断库存/);
-  await expect(parentInterval).toHaveAccessibleName(/内部占用.*阻断库存.*阻断冲突/);
-  await expect(roomCell(page, roomId, arrivalDate)).toHaveAccessibleName(/内部占用.*服务端标记不可售.*阻断冲突/);
-  await expect(roomCell(page, bedAId, arrivalDate)).toHaveAccessibleName(/内部占用.*服务端标记不可售/);
-  await expect(roomCell(page, bedBId, arrivalDate)).toHaveAccessibleName(/可售.*服务端标记可售/);
+  await expect(bedAInterval).toHaveAccessibleName(/内部占用/);
+  await expect(parentInterval).toHaveAccessibleName(/内部占用/);
+  await expect(roomCell(page, roomId, arrivalDate)).toHaveAccessibleName(/内部占用.*当前不可安排.*已有住宿，不能重复安排/);
+  await expect(roomCell(page, bedAId, arrivalDate)).toHaveAccessibleName(/内部占用.*当前不可安排.*已有住宿，不能重复安排/);
+  await expect(roomCell(page, bedBId, arrivalDate)).toHaveAccessibleName(/可售.*可以安排/);
 
   await bedAStart.focus();
   await page.keyboard.press("Space");
@@ -497,33 +500,24 @@ test("desktop room-status matrix drives a typed Block journey and restores the w
   const relatedSources = page.locator("section.room-status-context-section").filter({
     has: page.getByRole("heading", { name: "选区关联来源事实" })
   });
-  await expect(relatedSources).toContainText("INTERNAL_USE");
-  await expect(relatedSources).toContainText(`[${arrivalDate}, ${departureDate})`);
-  await expect(relatedSources).toContainText(bedAId);
-  await expect(relatedSources.getByRole("button", { name: /内部占用 Block/ })).toHaveCount(0);
-  const relatedHistory = page.locator("section.room-status-context-section").filter({
-    has: page.getByRole("heading", { name: "事实历史" })
-  });
-  await expect(relatedHistory).toContainText("Receipt");
-  await expect(relatedHistory.getByRole("button", { name: /Receipt/ })).toHaveCount(1);
+  await expect(relatedSources).toContainText("内部占用");
+  await expect(relatedSources).toContainText("住宿日期");
+  await expect(relatedSources).not.toContainText(/INTERNAL_USE|unit_room_|Block|Receipt/);
 
   await bedAInterval.click();
   const sourceSection = page.locator("section.room-status-context-section").filter({
     has: page.getByRole("heading", { name: "来源事实" })
   });
   await expect(sourceSection).toContainText("内部占用");
-  await expect(sourceSection).toContainText(bedAId);
   await expect(sourceSection).toContainText(businessReason);
-  await expect(sourceSection).toContainText("当前窗口区间");
-  await expect(sourceSection).toContainText("来源完整区间");
-  await expect(sourceSection).toContainText(`[${arrivalDate}, ${departureDate})`);
+  await expect(sourceSection).toContainText("住宿日期");
+  await expect(sourceSection).not.toContainText(/unit_room_|Block|Claim/);
   const conflictSection = page.locator("section.room-status-context-section").filter({
-    has: page.getByRole("heading", { name: "精确冲突" })
+    has: page.getByRole("heading", { name: "日期占用" })
   });
   await expect(conflictSection.locator(".room-status-conflict-list > li")).toHaveCount(1);
-  await expect(conflictSection).toContainText(businessReason);
-  await expect(conflictSection).toContainText(bedAId);
-  await expect(conflictSection.locator(".room-status-text-button")).toHaveCount(0);
+  await expect(conflictSection).toContainText("已有住宿，不能重复安排");
+  await expect(conflictSection).not.toContainText(/unit_room_|Block|Claim|conflict/i);
   await page.screenshot({ path: testInfo.outputPath("room-status-desktop-typed-source-active.png"), fullPage: true });
 
   const bedBStart = roomCell(page, bedBId, arrivalDate);
@@ -545,18 +539,16 @@ test("desktop room-status matrix drives a typed Block journey and restores the w
   const bedBInterval = roomRow(page, bedBId).locator(".room-status-interval-internal-use");
   await expect(bedAInterval).toBeVisible();
   await expect(bedBInterval).toBeVisible();
-  await expect(roomCell(page, bedAId, arrivalDate)).toHaveAccessibleName(/内部占用.*服务端标记不可售/);
-  await expect(roomCell(page, bedBId, arrivalDate)).toHaveAccessibleName(/内部占用.*服务端标记不可售/);
+  await expect(roomCell(page, bedAId, arrivalDate)).toHaveAccessibleName(/内部占用.*当前不可安排/);
+  await expect(roomCell(page, bedBId, arrivalDate)).toHaveAccessibleName(/内部占用.*当前不可安排/);
 
   const parentStart = roomCell(page, roomId, arrivalDate);
   await parentStart.focus();
   await page.keyboard.press("Space");
   await page.keyboard.press("Shift+ArrowRight");
   await expect(conflictSection.locator(".room-status-conflict-list > li")).toHaveCount(2);
-  await expect(conflictSection).toContainText(businessReason);
-  await expect(conflictSection).toContainText(siblingReason);
-  await expect(conflictSection).toContainText(bedAId);
-  await expect(conflictSection).toContainText(bedBId);
+  await expect(conflictSection).toContainText("已有住宿，不能重复安排");
+  await expect(conflictSection).not.toContainText(/unit_room_|Block|Claim|conflict/i);
   await expect(actionRegion).toContainText("服务端未为当前对象下发可执行动作");
   for (const action of ["创建正常住宿订单", "创建免费入住", "放置内部占用", "放置维修锁房"]) {
     await expect(actionRegion.getByRole("button", { name: action, exact: true })).toHaveCount(0);
@@ -593,8 +585,8 @@ test("desktop room-status matrix drives a typed Block journey and restores the w
   await finishReceipt(page);
   await expect(bedAInterval).toHaveCount(0);
   await expect(parentInterval).toHaveCount(0);
-  await expect(roomCell(page, roomId, arrivalDate)).toHaveAccessibleName(/可售.*服务端标记可售/);
-  await expect(roomCell(page, bedAId, arrivalDate)).toHaveAccessibleName(/可售.*服务端标记可售/);
+  await expect(roomCell(page, roomId, arrivalDate)).toHaveAccessibleName(/可售.*可以安排/);
+  await expect(roomCell(page, bedAId, arrivalDate)).toHaveAccessibleName(/可售.*可以安排/);
 
   const search = page.getByLabel("搜索房间或床位");
   await search.fill("104");
@@ -916,10 +908,8 @@ test("desktop range selection, field errors, filtered-empty and range-loading fa
   expect(selectionErrorId).toBeTruthy();
   await expect(page.getByLabel("入住日期", { exact: true })).toHaveAttribute("aria-invalid", "true");
   await expect(page.getByLabel("退房日期", { exact: true })).toHaveAttribute("aria-describedby", selectionErrorId!);
-  await page.getByRole("button", { name: "应用选区", exact: true }).click();
-  await expect(selectionDateError).toBeFocused();
   await page.getByLabel("退房日期", { exact: true }).fill(candidate!.departureDate);
-  await page.getByRole("button", { name: "应用选区", exact: true }).click();
+  await expect(selectionDateError).toBeHidden();
 
   const search = page.getByLabel("搜索房间或床位");
   await search.focus();
@@ -1047,7 +1037,6 @@ test("a real delayed 403 clears the board, command draft, restoration and stable
     await page.getByTestId("room-status-unit-select").selectOption(candidate!.id);
     await page.getByLabel("入住日期", { exact: true }).fill(serviceDate);
     await page.getByLabel("退房日期", { exact: true }).fill(addDays(serviceDate, 1));
-    await page.getByRole("button", { name: "应用选区", exact: true }).click();
     await page.getByRole("button", { name: "放置内部占用", exact: true }).click();
     const businessReason = `Permission revocation draft ${candidate!.id}`;
     await page.getByLabel("内部占用原因").fill(businessReason);
@@ -1109,7 +1098,6 @@ test("a real WRITE to READ downgrade invalidates an open Preview without hiding 
     await page.getByTestId("room-status-unit-select").selectOption(candidate!.id);
     await page.getByLabel("入住日期", { exact: true }).fill(serviceDate);
     await page.getByLabel("退房日期", { exact: true }).fill(addDays(serviceDate, 1));
-    await page.getByRole("button", { name: "应用选区", exact: true }).click();
     await page.getByRole("button", { name: "放置内部占用", exact: true }).click();
     await page.getByLabel("内部占用原因").fill(businessReason);
     await page.getByRole("button", { name: "继续生成 Preview", exact: true }).click();
@@ -1378,14 +1366,24 @@ test("mobile room status uses task tabs and a full-screen fact detail instead of
   });
   await expect(page.getByLabel("入住日期", { exact: true })).toHaveValue(touchCandidate!.startDate);
   await expect(page.getByLabel("退房日期", { exact: true })).toHaveValue(addDays(touchCandidate!.endDate, 1));
+  await expect(page.getByTestId("quote-result")).toBeVisible({ timeout: 15_000 });
 
   const today = todayInTimeZone("Asia/Shanghai");
   const arrivalDate = today;
   const departureDate = addDays(today, 3);
+  const internalUseSelectionQuote = page.waitForResponse((response) => {
+    if (response.request().method() !== "POST" || new URL(response.url()).pathname !== "/api/v1/quotes") return false;
+    const payload = response.request().postDataJSON() as { inventoryUnitId?: string; arrivalDate?: string; departureDate?: string; stayType?: string };
+    return payload.inventoryUnitId === "unit_room_205"
+      && payload.arrivalDate === arrivalDate
+      && payload.departureDate === departureDate
+      && payload.stayType === undefined
+      && response.status() === 200;
+  });
   await page.getByTestId("room-status-unit-select").selectOption("unit_room_205");
   await page.getByLabel("入住日期", { exact: true }).fill(arrivalDate);
   await page.getByLabel("退房日期", { exact: true }).fill(departureDate);
-  await page.getByRole("button", { name: "应用选区", exact: true }).click();
+  await internalUseSelectionQuote;
   await page.getByRole("button", { name: "放置内部占用", exact: true }).click();
   const businessReason = `E2E mobile exception ${arrivalDate}`;
   await page.getByLabel("内部占用原因").fill(businessReason);

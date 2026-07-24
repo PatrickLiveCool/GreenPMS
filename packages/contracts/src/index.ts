@@ -13,6 +13,10 @@ export type BookingChannelCode = (typeof bookingChannelCodes)[number];
 
 export const commandTypes = [
   "CREATE_MEMBER",
+  "CREATE_MEMBERSHIP_ORDER",
+  "RECORD_MEMBERSHIP_PAYMENT",
+  "CORRECT_MEMBERSHIP_PAYMENT",
+  "ACTIVATE_MEMBERSHIP_ORDER",
   "CREATE_ORDER",
   "EXTEND_STAY",
   "SHORTEN_STAY",
@@ -33,6 +37,7 @@ export const commandTypes = [
   "REFRESH_MEMBER_COVERAGE",
   "ADD_MEMBER_ENTITLEMENT_LOT",
   "ADJUST_MEMBER_ENTITLEMENT",
+  "CORRECT_MEMBER_ENTITLEMENT_BALANCE",
   "EXPIRE_MEMBER_ENTITLEMENT",
   "ISSUE_TOKEN",
   "ROTATE_TOKEN",
@@ -254,15 +259,17 @@ export interface QuoteDto {
   cashRemainder: MoneyDto;
   currentContractAmount: MoneyDto;
   expiresAt: string;
+  memberId?: string;
 }
 
 export interface CreateQuoteCommandInputDto {
   propertyId: string;
   inventoryUnitId: string;
-  stayType: StayType;
+  stayType?: StayType;
   arrivalDate: string;
   departureDate: string;
   pricingPolicyVersionId: string;
+  memberId?: string;
   memberContractId?: string;
 }
 
@@ -580,19 +587,11 @@ export interface CreateMemberInput {
   identityCardNumber: string;
   phone: string;
   wechat: string;
-  validFrom?: string;
-  validUntil?: string;
-  memberContractId?: string;
-  sourceApplicationRecordId?: string;
 }
 
 export interface CreateMemberResultDto {
   memberId: string;
-  memberContractId: string | null;
-  memberCreated: boolean;
-  memberContractCreated: boolean;
-  memberExternalReferenceId: string | null;
-  externalReferenceCreated: boolean;
+  memberCreated: true;
 }
 
 export interface ExpireMemberEntitlementInput {

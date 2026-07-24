@@ -405,12 +405,12 @@ test("a short 200 percent reflow keeps critical controls reachable outside inten
     await expectFullyHitTestable(cell, "200 percent focused room-status cell");
 
     await cell.click();
-    const applySelection = page.getByRole("button", { name: "应用选区", exact: true });
-    await expect(applySelection).toBeEnabled();
+    const createNormalStay = page.getByRole("button", { name: "创建正常住宿订单", exact: true });
+    await expect(createNormalStay).toBeEnabled();
     await page.getByTestId("room-status-unit-select").focus();
-    await tabTo(page, applySelection, "200 percent keyboard context selection action", 24);
-    expect(await applySelection.evaluate((element) => element.matches(":focus-visible"))).toBe(true);
-    await expectFullyHitTestable(applySelection, "200 percent context selection action");
+    await tabTo(page, createNormalStay, "200 percent keyboard context selection action", 24);
+    expect(await createNormalStay.evaluate((element) => element.matches(":focus-visible"))).toBe(true);
+    await expectFullyHitTestable(createNormalStay, "200 percent context selection action");
     const activeNavigation = page.locator(".mobile-navigation").getByRole("link", { name: "房态", exact: true });
     await expectFullyHitTestable(activeNavigation, "200 percent fixed room-status navigation");
     await page.screenshot({ path: testInfo.outputPath("room-status-200-percent-short-context-viewport.png") });
@@ -432,7 +432,6 @@ test("mouse drag selection keeps extending while the pointer crosses a continuou
     await page.getByTestId("room-status-unit-select").selectOption(candidate.unitId);
     await page.getByLabel("入住日期", { exact: true }).fill(candidate.blockStart);
     await page.getByLabel("退房日期", { exact: true }).fill(candidate.blockEnd);
-    await page.getByRole("button", { name: "应用选区", exact: true }).click();
     await page.getByRole("button", { name: "放置内部占用", exact: true }).click();
     await page.getByLabel("内部占用原因").fill(businessReason);
     await page.getByRole("button", { name: "继续生成 Preview", exact: true }).click();
@@ -444,8 +443,8 @@ test("mouse drag selection keeps extending while the pointer crosses a continuou
     const startCell = roomCell(page, candidate.unitId, candidate.dragStart);
     const endCell = roomCell(page, candidate.unitId, candidate.dragEnd);
     await expect(interval).toHaveCount(1);
-    await expect(startCell).toHaveAccessibleName(/可售.*服务端标记可售/);
-    await expect(endCell).toHaveAccessibleName(/可售.*服务端标记可售/);
+    await expect(startCell).toHaveAccessibleName(/可售.*可以安排/);
+    await expect(endCell).toHaveAccessibleName(/可售.*可以安排/);
 
     await endCell.evaluate((element) => element.scrollIntoView({ block: "nearest", inline: "end" }));
     await expectFullyHitTestable(startCell, "drag selection start cell before pointer input");
@@ -507,7 +506,6 @@ test("Block drafts cannot leave the server-validated room-status selection", asy
   await page.getByTestId("room-status-unit-select").selectOption(candidate.unitId);
   await page.getByLabel("入住日期", { exact: true }).fill(candidate.arrivalDate);
   await page.getByLabel("退房日期", { exact: true }).fill(candidate.departureDate);
-  await page.getByRole("button", { name: "应用选区", exact: true }).click();
   await page.getByRole("button", { name: "放置内部占用", exact: true }).click();
 
   const dialog = page.getByRole("dialog", { name: /^内部占用 ·/ });
@@ -536,7 +534,6 @@ test("an internal-use draft survives stale query conditions at 320px and resumes
   await page.getByTestId("room-status-unit-select").selectOption(candidate.unitId);
   await page.getByLabel("入住日期", { exact: true }).fill(candidate.arrivalDate);
   await page.getByLabel("退房日期", { exact: true }).fill(candidate.departureDate);
-  await page.getByRole("button", { name: "应用选区", exact: true }).click();
   await page.getByRole("button", { name: "放置内部占用", exact: true }).click();
 
   let dialog = page.getByRole("dialog", { name: /^内部占用 ·/ });

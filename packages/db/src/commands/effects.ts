@@ -12,7 +12,7 @@ import {
 } from "@qintopia/domain";
 import { adjustedEntitlementAvailableBalance, entitlementAvailableBalance, parsePostgresBigInt } from "../entitlement-balance.ts";
 import { activeCoverageCandidates, loadActiveStayTimeline, loadOrderContext, orderAmountSummary, type StayTimelineItem } from "../orders.ts";
-import { allocateCoverageCandidates, loadPricingPolicy, loadStoredQuote } from "../pricing-service.ts";
+import { allocateCoverageCandidates, loadPricingPolicy, loadStoredQuote, resolveMemberCoverage } from "../pricing-service.ts";
 import { inventoryFingerprint, loadInventoryUnit, type DbExecutor } from "../inventory.ts";
 import { propertyLocalToday } from "../members.ts";
 
@@ -45,12 +45,6 @@ export function normalizeIdentityCardNumber(value: unknown): string {
   if (typeof value !== "string" || value.trim() === "") throw new DomainError("VALIDATION_ERROR", "identityCardNumber is required");
   return value.trim().toUpperCase();
 }
-
-const memberApplicationSource = {
-  provider: "FEISHU_BASE" as const,
-  sourceContainerId: "wiki:FtxUwOE6diwS8wkmaawcDhEPnMc",
-  sourceTableId: "tbl4OryeWd0Td8jN"
-};
 
 const strictDateTime = /^(\d{4}-\d{2}-\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/;
 const sha256Hex = /^[a-f0-9]{64}$/;
@@ -100,21 +94,65 @@ function requireNonNegativeWholeYuanMinor(input: Record<string, unknown>, field:
   return value;
 }
 
+function money(currency: string, minorUnits: number) {
+  return { currency, minorUnits };
+}
+
+function addOneCalendarYear(localDate: string): string {
+  const parsed = parseLocalDate(localDate);
+  const year = parsed.getUTCFullYear() + 1;
+  const month = parsed.getUTCMonth();
+  const day = parsed.getUTCDate();
+  const lastDay = new Date(Date.UTC(year, month + 1, 0)).getUTCDate();
+  return new Date(Date.UTC(year, month, Math.min(day, lastDay))).toISOString().slice(0, 10);
+}
+
+async function membershipPaymentState(db: DbExecutor, membershipOrderId: string) {
+  const facts = await db.selectFrom("membership_payment_facts")
+    .selectAll()
+    .where("membership_order_id", "=", membershipOrderId)
+    .orderBy("created_at")
+    .orderBy("fact_id")
+    .execute();
+  const total = facts.reduce((sum, fact) => sum + fact.net_effect_minor, 0);
+  if (!Number.isSafeInteger(total) || total < 0 || total > 2_147_483_647) {
+    throw new DomainError("VALIDATION_ERROR", "会员订单收款合计超出支持范围");
+  }
+  return {
+    facts,
+    total,
+    hash: stableHash(facts.map((fact) => ({
+      factId: fact.fact_id,
+      type: fact.fact_type,
+      amountMinor: fact.amount_minor,
+      netEffectMinor: fact.net_effect_minor,
+      transactionReference: fact.transaction_reference,
+      correctsFactId: fact.corrects_fact_id,
+      reversesFactId: fact.reverses_fact_id
+    })))
+  };
+}
+
 function assertOrderMutable(status: string): void {
   if (!new Set(["RESERVED", "CHECKED_IN"]).has(status)) throw new DomainError("INVALID_ORDER_STATE", `Order cannot be changed from ${status}`, 409);
 }
 
-async function memberBasis(db: DbExecutor, memberContractId: string | null) {
-  if (!memberContractId) return null;
-  const contract = await db.selectFrom("member_contracts").select(["id", "version", "status"]).where("id", "=", memberContractId).executeTakeFirst();
+async function memberBasis(db: DbExecutor, memberContractId: string | null, memberId?: string | null) {
+  if (!memberContractId && !memberId) return null;
+  let contractQuery = db.selectFrom("member_contracts").select(["id", "version", "status"]);
+  contractQuery = memberId
+    ? contractQuery.where("member_id", "=", memberId)
+    : contractQuery.where("id", "=", memberContractId!);
+  const contracts = await contractQuery.orderBy("id").execute();
+  const contractIds = contracts.map((contract) => contract.id);
   const lots = await db.selectFrom("entitlement_lots")
     .leftJoin("entitlement_ledger", "entitlement_ledger.lot_id", "entitlement_lots.id")
     .select(["entitlement_lots.id", "entitlement_lots.version", sql<string>`cast(coalesce(sum(entitlement_ledger.quantity_delta), 0) as text)`.as("delta")])
-    .where("entitlement_lots.contract_id", "=", memberContractId)
+    .where("entitlement_lots.contract_id", "in", contractIds.length ? contractIds : ["__none__"])
     .groupBy(["entitlement_lots.id", "entitlement_lots.version"])
     .orderBy("entitlement_lots.id").execute();
   return {
-    contract,
+    contracts,
     lots: lots.map((lot) => ({ ...lot, delta: parsePostgresBigInt(lot.delta, "Entitlement ledger sum").toString() }))
   };
 }
@@ -122,6 +160,7 @@ async function memberBasis(db: DbExecutor, memberContractId: string | null) {
 async function priceSingleUnit(db: DbExecutor, options: {
   propertyId: string;
   orderId?: string;
+  memberId: string | null;
   memberContractId: string | null;
   unitId: string;
   arrivalDate: string;
@@ -130,19 +169,28 @@ async function priceSingleUnit(db: DbExecutor, options: {
   policyVersionId: string;
   manualAdjustmentMinor: number;
 }): Promise<PricingResult> {
-  if (options.stayType === "FREE" && options.memberContractId) {
+  if (options.stayType === "FREE" && (options.memberId || options.memberContractId)) {
     throw new DomainError("PRICING_POLICY_UNCONFIGURED", "Free stays cannot use member entitlement coverage", 409);
   }
   const unit = await loadInventoryUnit(db, options.propertyId, options.unitId);
   const dates = enumerateServiceDates(options.arrivalDate, options.departureDate);
   const preserved = options.orderId ? await activeCoverageCandidates(db, options.orderId, dates) : [];
-  const candidates = await allocateCoverageCandidates(db, {
-    propertyId: options.propertyId,
-    inventoryUnitKind: unit.kind,
-    dates,
-    preserved,
-    ...(options.memberContractId ? { memberContractId: options.memberContractId } : {})
-  });
+  const candidates = options.memberId
+    ? (await resolveMemberCoverage(db, {
+      propertyId: options.propertyId,
+      memberId: options.memberId,
+      inventoryUnitKind: unit.kind,
+      roomTypeCode: unit.roomTypeCode,
+      dates,
+      preserved
+    })).coverageCandidates
+    : await allocateCoverageCandidates(db, {
+      propertyId: options.propertyId,
+      inventoryUnitKind: unit.kind,
+      dates,
+      preserved,
+      ...(options.memberContractId ? { memberContractId: options.memberContractId } : {})
+    });
   const policy = await loadPricingPolicy(db, options.propertyId, options.policyVersionId);
   return calculatePricing({
     propertyId: options.propertyId,
@@ -153,7 +201,7 @@ async function priceSingleUnit(db: DbExecutor, options: {
     departureDate: options.departureDate,
     stayType: options.stayType,
     policy,
-    memberCoverage: Boolean(options.memberContractId),
+    memberCoverage: Boolean(options.memberId || options.memberContractId),
     coverageCandidates: candidates,
     manualAdjustmentMinor: options.manualAdjustmentMinor
   });
@@ -181,6 +229,7 @@ function timelineRuns(timeline: StayTimelineItem[]): Array<{ inventoryUnitId: st
 async function priceStayTimeline(db: DbExecutor, options: {
   propertyId: string;
   orderId: string;
+  memberId: string | null;
   memberContractId: string | null;
   arrivalDate: string;
   departureDate: string;
@@ -189,7 +238,7 @@ async function priceStayTimeline(db: DbExecutor, options: {
   timeline: StayTimelineItem[];
   manualAdjustmentMinor: number;
 }): Promise<PricingResult> {
-  if (options.stayType === "FREE" && options.memberContractId) {
+  if (options.stayType === "FREE" && (options.memberId || options.memberContractId)) {
     throw new DomainError("PRICING_POLICY_UNCONFIGURED", "Free stays cannot use member entitlement coverage", 409);
   }
   const expectedDates = enumerateServiceDates(options.arrivalDate, options.departureDate);
@@ -200,19 +249,31 @@ async function priceStayTimeline(db: DbExecutor, options: {
   const unitIds = [...new Set(options.timeline.map((item) => item.inventoryUnitId))];
   const units = new Map((await Promise.all(unitIds.map((unitId) => loadInventoryUnit(db, options.propertyId, unitId)))).map((unit) => [unit.id, unit]));
   const unitKinds = new Set([...units.values()].map((unit) => unit.kind));
-  if (options.memberContractId && unitKinds.size !== 1) {
+  if ((options.memberId || options.memberContractId) && unitKinds.size !== 1) {
     throw new DomainError("ENTITLEMENT_CONFLICT", "Member coverage cannot span room and bed inventory without an approved business case", 409);
   }
 
   const preserved = await activeCoverageCandidates(db, options.orderId, expectedDates);
   const firstUnit = units.get(options.timeline[0]!.inventoryUnitId)!;
-  const candidates = await allocateCoverageCandidates(db, {
-    propertyId: options.propertyId,
-    inventoryUnitKind: firstUnit.kind,
-    dates: expectedDates,
-    preserved,
-    ...(options.memberContractId ? { memberContractId: options.memberContractId } : {})
-  });
+  if (options.memberId && [...units.values()].some((unit) => unit.kind !== firstUnit.kind || unit.roomTypeCode !== firstUnit.roomTypeCode)) {
+    throw new DomainError("ENTITLEMENT_CONFLICT", "会员住宿不能跨越不同会员产品对应的房型", 409);
+  }
+  const candidates = options.memberId
+    ? (await resolveMemberCoverage(db, {
+      propertyId: options.propertyId,
+      memberId: options.memberId,
+      inventoryUnitKind: firstUnit.kind,
+      roomTypeCode: firstUnit.roomTypeCode,
+      dates: expectedDates,
+      preserved
+    })).coverageCandidates
+    : await allocateCoverageCandidates(db, {
+      propertyId: options.propertyId,
+      inventoryUnitKind: firstUnit.kind,
+      dates: expectedDates,
+      preserved,
+      ...(options.memberContractId ? { memberContractId: options.memberContractId } : {})
+    });
   const policy = await loadPricingPolicy(db, options.propertyId, options.policyVersionId);
   if (policy.calculationKind === "DURATION_BAND_TOTAL") {
     return calculateDurationTimelinePricing({
@@ -221,7 +282,7 @@ async function priceStayTimeline(db: DbExecutor, options: {
       departureDate: options.departureDate,
       stayType: options.stayType,
       policy,
-      memberCoverage: Boolean(options.memberContractId),
+      memberCoverage: Boolean(options.memberId || options.memberContractId),
       timeline: options.timeline.map((item) => {
         const unit = units.get(item.inventoryUnitId)!;
         return {
@@ -246,7 +307,7 @@ async function priceStayTimeline(db: DbExecutor, options: {
       departureDate: run.departureDate,
       stayType: options.stayType,
       policy,
-      memberCoverage: Boolean(options.memberContractId),
+      memberCoverage: Boolean(options.memberId || options.memberContractId),
       coverageCandidates: candidates.filter((candidate) => candidate.serviceDate >= run.arrivalDate && candidate.serviceDate < run.departureDate),
       manualAdjustmentMinor: 0
     });
@@ -286,110 +347,166 @@ export async function buildCommandEffect(db: DbExecutor, commandType: CommandTyp
   const propertyId = requireString(input, "propertyId");
 
   if (commandType === "CREATE_MEMBER") {
-    const submittedProfile = {
+    const member = {
       fullName: requireString(input, "fullName"),
       identityCardNumber: normalizeIdentityCardNumber(input.identityCardNumber),
       phone: requireString(input, "phone"),
       wechat: requireString(input, "wechat")
     };
-    const requestedContractId = optionalString(input, "memberContractId");
-    const sourceApplicationRecordId = optionalString(input, "sourceApplicationRecordId");
     const existingMember = await db.selectFrom("members").selectAll()
-      .where("identity_card_number", "=", submittedProfile.identityCardNumber).executeTakeFirst();
-    const member = existingMember ? {
-      fullName: existingMember.full_name,
-      identityCardNumber: existingMember.identity_card_number,
-      phone: existingMember.phone,
-      wechat: existingMember.wechat
-    } : submittedProfile;
-    const profileMatch = !existingMember || (
-      existingMember.full_name === submittedProfile.fullName
-      && existingMember.phone === submittedProfile.phone
-      && existingMember.wechat === submittedProfile.wechat
-    );
-
-    let memberContractId: string | null = null;
-    let contractValidFrom: string | null = null;
-    let contractValidUntil: string | null = null;
-    let contractOperation: "CREATE_INITIAL_EMPTY_CONTRACT" | "USE_EXISTING_CONTRACT" | "NO_CONTRACT_SELECTED" = "NO_CONTRACT_SELECTED";
+      .where("identity_card_number", "=", member.identityCardNumber)
+      .executeTakeFirst();
     if (existingMember) {
-      const activeContracts = await db.selectFrom("member_contracts").selectAll()
-        .where("member_id", "=", existingMember.id)
-        .where("property_id", "=", propertyId)
-        .where("status", "=", "ACTIVE")
-        .orderBy("created_at")
-        .orderBy("id")
-        .execute();
-      const selectedContract = requestedContractId
-        ? activeContracts.find((contract) => contract.id === requestedContractId)
-        : activeContracts.length === 1 ? activeContracts[0] : undefined;
-      if (requestedContractId && !selectedContract) throw new DomainError("NOT_FOUND", "Selected active member contract was not found", 404);
-      if (selectedContract) {
-        memberContractId = selectedContract.id;
-        contractValidFrom = selectedContract.valid_from;
-        contractValidUntil = selectedContract.valid_until;
-        contractOperation = "USE_EXISTING_CONTRACT";
-      }
-    } else if (requestedContractId) {
-      throw new DomainError("VALIDATION_ERROR", "memberContractId cannot be supplied when creating a new member");
-    } else {
-      const validFrom = requireString(input, "validFrom");
-      const validUntil = requireString(input, "validUntil");
-      parseLocalDate(validFrom);
-      parseLocalDate(validUntil);
-      if (validUntil < validFrom) throw new DomainError("VALIDATION_ERROR", "validUntil must not be before validFrom");
-      contractValidFrom = validFrom;
-      contractValidUntil = validUntil;
-      contractOperation = "CREATE_INITIAL_EMPTY_CONTRACT";
+      throw new DomainError("VALIDATION_ERROR", "该身份证号已登记，不能重复创建会员档案", 409);
     }
 
-    let externalReference: null | {
-      operation: "CREATE_LINK" | "USE_EXISTING_LINK";
-      id: string | null;
-      provider: "FEISHU_BASE";
-      sourceContainerId: string;
-      sourceTableId: string;
-      externalRecordId: string;
-    } = null;
-    let existingReferenceBasis: unknown = null;
-    if (sourceApplicationRecordId) {
-      const reference = await db.selectFrom("member_external_references").selectAll()
-        .where("provider", "=", memberApplicationSource.provider)
-        .where("source_container_id", "=", memberApplicationSource.sourceContainerId)
-        .where("source_table_id", "=", memberApplicationSource.sourceTableId)
-        .where("external_record_id", "=", sourceApplicationRecordId)
-        .executeTakeFirst();
-      if (reference && (!existingMember || reference.member_id !== existingMember.id || reference.property_id !== propertyId)) {
-        throw new DomainError("AGGREGATE_VERSION_CONFLICT", "The Feishu application record is already linked to another member or property", 409);
-      }
-      existingReferenceBasis = reference ?? null;
-      externalReference = {
-        operation: reference ? "USE_EXISTING_LINK" : "CREATE_LINK",
-        id: reference?.id ?? null,
-        ...memberApplicationSource,
-        externalRecordId: sourceApplicationRecordId
-      };
-    }
-
-    const operation = existingMember ? "MATCH_EXISTING_MEMBER" : "CREATE_MEMBER_WITH_INITIAL_CONTRACT";
     return finalize(propertyId, {
-      operation,
-      memberId: existingMember?.id ?? null,
-      memberContractId,
+      operation: "CREATE_MEMBER_PROFILE",
+      memberId: null,
       member,
-      submittedProfile,
-      profileMatch,
-      contract: {
-        operation: contractOperation,
-        validFrom: contractValidFrom,
-        validUntil: contractValidUntil
-      },
-      externalReference
+      propertyLink: { operation: "CREATE" }
     }, {
-      member: existingMember ?? null,
-      memberContractId,
-      externalReference: existingReferenceBasis
+      member: null
     });
+  }
+
+  if (commandType === "CREATE_MEMBERSHIP_ORDER") {
+    const memberId = requireString(input, "memberId");
+    const membershipProductId = requireString(input, "membershipProductId");
+    const agreedPriceMinor = requireNonNegativeWholeYuanMinor(input, "agreedPriceMinor");
+    const adjustmentReason = optionalString(input, "priceAdjustmentReason");
+    const member = await db.selectFrom("members")
+      .innerJoin("member_property_links", "member_property_links.member_id", "members.id")
+      .select(["members.id", "members.full_name"])
+      .where("members.id", "=", memberId)
+      .where("member_property_links.property_id", "=", propertyId)
+      .executeTakeFirst();
+    if (!member) throw new DomainError("NOT_FOUND", "当前门店未找到该会员", 404);
+    const product = await db.selectFrom("membership_products").selectAll()
+      .where("id", "=", membershipProductId)
+      .where("status", "=", "PUBLISHED")
+      .executeTakeFirst();
+    if (!product) throw new DomainError("NOT_FOUND", "会员产品不存在", 404);
+    const property = await db.selectFrom("properties").select("currency").where("id", "=", propertyId).executeTakeFirst();
+    if (!property) throw new DomainError("NOT_FOUND", "Property not found", 404);
+    if (product.currency !== property.currency) throw new DomainError("VALIDATION_ERROR", "会员产品币种与门店不一致");
+    if (agreedPriceMinor !== product.list_price_minor && !adjustmentReason) {
+      throw new DomainError("VALIDATION_ERROR", "修改会员成交价时必须填写调价原因");
+    }
+    if (agreedPriceMinor === product.list_price_minor && adjustmentReason) {
+      throw new DomainError("VALIDATION_ERROR", "未修改成交价时不需要填写调价原因");
+    }
+    return finalize(propertyId, {
+      operation: "CREATE_MEMBERSHIP_ORDER",
+      member: { memberId: member.id, fullName: member.full_name },
+      product: {
+        productId: product.id,
+        code: product.code,
+        version: product.version,
+        name: product.name,
+        entitlementUnitKind: product.entitlement_unit_kind,
+        entitlementUnits: product.entitlement_units,
+        allowedRoomTypeCode: product.allowed_room_type_code,
+        allowedInventoryKind: product.allowed_inventory_kind
+      },
+      pricing: {
+        listedPrice: money(product.currency, product.list_price_minor),
+        agreedPrice: money(product.currency, agreedPriceMinor),
+        adjustment: money(product.currency, agreedPriceMinor - product.list_price_minor),
+        adjustmentReason: adjustmentReason ?? null
+      },
+      status: "DRAFT"
+    }, {
+      member: { id: member.id, fullName: member.full_name },
+      product: { id: product.id, version: product.version, status: product.status }
+    });
+  }
+
+  if (commandType === "RECORD_MEMBERSHIP_PAYMENT" || commandType === "CORRECT_MEMBERSHIP_PAYMENT" || commandType === "ACTIVATE_MEMBERSHIP_ORDER") {
+    const membershipOrderId = requireString(input, "membershipOrderId");
+    const order = await db.selectFrom("membership_orders")
+      .innerJoin("members", "members.id", "membership_orders.member_id")
+      .selectAll("membership_orders")
+      .select("members.full_name as member_name")
+      .where("membership_orders.id", "=", membershipOrderId)
+      .where("membership_orders.property_id", "=", propertyId)
+      .executeTakeFirst();
+    if (!order) throw new DomainError("NOT_FOUND", "会员订单不存在", 404);
+    if (order.status !== "DRAFT") throw new DomainError("AGGREGATE_VERSION_CONFLICT", "已生效的会员订单不能再修改", 409);
+    const paymentState = await membershipPaymentState(db, order.id);
+
+    if (commandType === "RECORD_MEMBERSHIP_PAYMENT") {
+      const amountMinor = requireInteger(input, "amountMinor", { min: 1 });
+      const transactionReference = requireTransactionReference(input.transactionReference);
+      const note = optionalString(input, "note") ?? "";
+      const after = paymentState.total + amountMinor;
+      if (!Number.isSafeInteger(after) || after > 2_147_483_647) throw new DomainError("VALIDATION_ERROR", "会员订单收款合计超出支持范围");
+      return finalize(propertyId, {
+        operation: "RECORD_MEMBERSHIP_PAYMENT",
+        membershipOrderId: order.id,
+        memberName: order.member_name,
+        productName: order.product_name,
+        payment: { amount: money(order.currency, amountMinor), transactionReference, note },
+        totals: {
+          before: money(order.currency, paymentState.total),
+          after: money(order.currency, after),
+          agreedPrice: money(order.currency, order.agreed_price_minor),
+          differenceAfter: money(order.currency, after - order.agreed_price_minor)
+        },
+        status: "DRAFT"
+      }, { membershipOrderVersion: order.version, paymentFactsHash: paymentState.hash });
+    }
+
+    if (commandType === "CORRECT_MEMBERSHIP_PAYMENT") {
+      const originalPaymentFactId = requireString(input, "originalPaymentFactId");
+      const original = paymentState.facts.find((fact) => fact.fact_id === originalPaymentFactId);
+      if (!original || original.fact_type !== "COLLECTION") throw new DomainError("NOT_FOUND", "待更正的企微收款不存在", 404);
+      if (paymentState.facts.some((fact) => fact.reverses_fact_id === original.fact_id)) {
+        throw new DomainError("FACT_ALREADY_REVERSED", "该企微收款已经更正", 409);
+      }
+      const correctedAmountMinor = requireInteger(input, "correctedAmountMinor", { min: 1 });
+      const correctedTransactionReference = requireTransactionReference(input.correctedTransactionReference);
+      const note = optionalString(input, "note") ?? "";
+      const after = paymentState.total - original.amount_minor + correctedAmountMinor;
+      if (!Number.isSafeInteger(after) || after < 0 || after > 2_147_483_647) throw new DomainError("VALIDATION_ERROR", "更正后的收款合计超出支持范围");
+      return finalize(propertyId, {
+        operation: "CORRECT_MEMBERSHIP_PAYMENT",
+        membershipOrderId: order.id,
+        memberName: order.member_name,
+        productName: order.product_name,
+        originalPaymentFactId: original.fact_id,
+        original: { amount: money(order.currency, original.amount_minor), transactionReference: requireTransactionReference(original.transaction_reference) },
+        replacement: { amount: money(order.currency, correctedAmountMinor), transactionReference: correctedTransactionReference, note },
+        totals: {
+          before: money(order.currency, paymentState.total),
+          after: money(order.currency, after),
+          agreedPrice: money(order.currency, order.agreed_price_minor),
+          differenceAfter: money(order.currency, after - order.agreed_price_minor)
+        },
+        status: "DRAFT"
+      }, { membershipOrderVersion: order.version, paymentFactsHash: paymentState.hash });
+    }
+
+    if (paymentState.total <= 0 || !paymentState.facts.some((fact) => fact.fact_type === "COLLECTION" && !paymentState.facts.some((candidate) => candidate.reverses_fact_id === fact.fact_id))) {
+      throw new DomainError("VALIDATION_ERROR", "会员订单至少登记一笔有效企微收款后才能生效");
+    }
+    const validFrom = await propertyLocalToday(db, propertyId);
+    const validUntil = addOneCalendarYear(validFrom);
+    return finalize(propertyId, {
+      operation: "ACTIVATE_MEMBERSHIP_ORDER",
+      membershipOrderId: order.id,
+      memberName: order.member_name,
+      productName: order.product_name,
+      paymentTotal: money(order.currency, paymentState.total),
+      agreedPrice: money(order.currency, order.agreed_price_minor),
+      paymentDifference: money(order.currency, paymentState.total - order.agreed_price_minor),
+      validFrom,
+      validUntil,
+      entitlementUnitKind: order.entitlement_unit_kind,
+      entitlementUnits: order.entitlement_units,
+      fromStatus: "DRAFT",
+      toStatus: "ACTIVE"
+    }, { membershipOrderVersion: order.version, paymentFactsHash: paymentState.hash, validFrom });
   }
 
   if (commandType === "LOCK_MAINTENANCE" || commandType === "PLACE_INTERNAL_USE") {
@@ -412,12 +529,16 @@ export async function buildCommandEffect(db: DbExecutor, commandType: CommandTyp
       ...(phone ? { phone } : {}),
       ...(documentNumber ? { documentNumber } : {})
     };
-    const { bookingChannelCode, channelOrderReference } = validateBookingChannel(
-      input.bookingChannelCode,
-      input.channelOrderReference
-    );
     const quote = await loadStoredQuote(db, quoteId);
     if (quote.propertyId !== propertyId) throw new DomainError("RESOURCE_SCOPE_DENIED", "Quote belongs to another property", 403);
+    const memberStay = Boolean(quote.memberId || quote.memberContractId);
+    if (memberStay && ((input.bookingChannelCode !== undefined && input.bookingChannelCode !== null)
+      || (input.channelOrderReference !== undefined && input.channelOrderReference !== null && input.channelOrderReference !== ""))) {
+      throw new DomainError("VALIDATION_ERROR", "会员住宿不应填写订单来源渠道或渠道订单号");
+    }
+    const { bookingChannelCode, channelOrderReference } = memberStay
+      ? { bookingChannelCode: null, channelOrderReference: null }
+      : validateBookingChannel(input.bookingChannelCode, input.channelOrderReference);
     const freeStayReason = quote.stayType === "FREE" ? requireString(input, "freeStayReason") : null;
     if (quote.stayType !== "FREE" && input.freeStayReason !== undefined && input.freeStayReason !== null) {
       throw new DomainError("VALIDATION_ERROR", "freeStayReason is only allowed for FREE stays");
@@ -427,6 +548,7 @@ export async function buildCommandEffect(db: DbExecutor, commandType: CommandTyp
     if (fingerprint.length > 0) throw new DomainError("INVENTORY_CONFLICT", "Quoted inventory is no longer available", 409);
     const pricing = await priceSingleUnit(db, {
       propertyId,
+      memberId: quote.memberId ?? null,
       memberContractId: quote.memberContractId ?? null,
       unitId: quote.inventoryUnitId,
       arrivalDate: quote.arrivalDate,
@@ -446,10 +568,11 @@ export async function buildCommandEffect(db: DbExecutor, commandType: CommandTyp
       arrivalDate: quote.arrivalDate,
       departureDate: quote.departureDate,
       pricingPolicyVersionId: quote.pricingPolicyVersionId,
+      memberId: quote.memberId ?? null,
       memberContractId: quote.memberContractId ?? null,
       pricing
     };
-    return finalize(propertyId, effect, { quoteInputHash: quote.inputHash, inventory: fingerprint, membership: await memberBasis(db, quote.memberContractId ?? null) });
+    return finalize(propertyId, effect, { quoteInputHash: quote.inputHash, inventory: fingerprint, membership: await memberBasis(db, quote.memberContractId ?? null, quote.memberId) });
   }
 
   if (commandType === "LOCK_MAINTENANCE") {
@@ -542,9 +665,8 @@ export async function buildCommandEffect(db: DbExecutor, commandType: CommandTyp
     return finalize(propertyId, { contractId, unitKind, units, expiresOn }, { contractVersion: contract.version, propertyToday });
   }
 
-  if (commandType === "ADJUST_MEMBER_ENTITLEMENT") {
+  if (commandType === "ADJUST_MEMBER_ENTITLEMENT" || commandType === "CORRECT_MEMBER_ENTITLEMENT_BALANCE") {
     const lotId = requireString(input, "entitlementLotId");
-    const quantityDelta = requireInteger(input, "quantityDelta", { allowZero: false });
     const adjustmentReason = requireString(input, "adjustmentReason");
     const propertyToday = await propertyLocalToday(db, propertyId);
     const lot = await db.selectFrom("entitlement_lots").innerJoin("member_contracts", "member_contracts.id", "entitlement_lots.contract_id")
@@ -562,6 +684,19 @@ export async function buildCommandEffect(db: DbExecutor, commandType: CommandTyp
       .where("lot_id", "=", lotId)
       .executeTakeFirstOrThrow();
     const availableBefore = entitlementAvailableBalance(lot.total_units, ledger.delta);
+    const quantityDelta = commandType === "CORRECT_MEMBER_ENTITLEMENT_BALANCE"
+      ? (() => {
+        const expectedAvailableBalance = requireInteger(input, "expectedAvailableBalance", { min: 0 });
+        if (expectedAvailableBalance !== availableBefore) {
+          throw new DomainError("AGGREGATE_VERSION_CONFLICT", "会员余额已变化，请刷新后重新更正", 409, false, { expectedAvailableBalance, availableBefore });
+        }
+        const targetAvailableBalance = requireInteger(input, "targetAvailableBalance", { min: 0 });
+        if (targetAvailableBalance === availableBefore) {
+          throw new DomainError("VALIDATION_ERROR", "更正后余额必须与当前余额不同");
+        }
+        return targetAvailableBalance - availableBefore;
+      })()
+      : requireInteger(input, "quantityDelta", { allowZero: false });
     const availableAfter = adjustedEntitlementAvailableBalance(availableBefore, quantityDelta);
     return finalize(propertyId, {
       entitlementLotId: lot.id,
@@ -690,7 +825,7 @@ export async function buildCommandEffect(db: DbExecutor, commandType: CommandTyp
     orderVersion: context.order.version,
     orderStatus: context.order.status,
     policyVersionId: context.order.pricing_policy_version_id,
-    membership: await memberBasis(db, context.order.member_contract_id)
+    membership: await memberBasis(db, context.order.member_contract_id, context.order.member_id)
   };
 
   if (commandType === "SHORTEN_STAY") {
@@ -701,7 +836,7 @@ export async function buildCommandEffect(db: DbExecutor, commandType: CommandTyp
     const currentTimeline = await loadActiveStayTimeline(db, context);
     const stayTimeline = currentTimeline.filter((item) => item.serviceDate < newDepartureDate);
     const pricing = await priceStayTimeline(db, {
-      propertyId, orderId, memberContractId: context.order.member_contract_id,
+      propertyId, orderId, memberId: context.order.member_id, memberContractId: context.order.member_contract_id,
       arrivalDate: context.order.arrival_date, departureDate: newDepartureDate,
       stayType: context.order.stay_type as StayType, policyVersionId: context.order.pricing_policy_version_id,
       timeline: stayTimeline, manualAdjustmentMinor: 0
@@ -726,7 +861,7 @@ export async function buildCommandEffect(db: DbExecutor, commandType: CommandTyp
       ...enumerateServiceDates(context.order.departure_date, newDepartureDate).map((serviceDate) => ({ serviceDate, inventoryUnitId: extensionUnitId }))
     ];
     const pricing = await priceStayTimeline(db, {
-      propertyId, orderId, memberContractId: context.order.member_contract_id,
+      propertyId, orderId, memberId: context.order.member_id, memberContractId: context.order.member_contract_id,
       arrivalDate: context.order.arrival_date, departureDate: newDepartureDate,
       stayType: context.order.stay_type as StayType, policyVersionId: context.order.pricing_policy_version_id,
       timeline: stayTimeline, manualAdjustmentMinor: 0
@@ -749,12 +884,15 @@ export async function buildCommandEffect(db: DbExecutor, commandType: CommandTyp
     const currentUnit = await loadInventoryUnit(db, propertyId, effectiveUnitId);
     const newUnit = await loadInventoryUnit(db, propertyId, newInventoryUnitId);
     if (currentUnit.id === newUnit.id) throw new DomainError("VALIDATION_ERROR", "New inventory unit must differ from the current unit");
-    if (context.order.member_contract_id && currentUnit.kind !== newUnit.kind) throw new DomainError("ENTITLEMENT_CONFLICT", "Cross-kind move with member coverage requires an approved business case", 409);
+    if ((context.order.member_id || context.order.member_contract_id)
+      && (currentUnit.kind !== newUnit.kind || currentUnit.roomTypeCode !== newUnit.roomTypeCode)) {
+      throw new DomainError("ENTITLEMENT_CONFLICT", "会员住宿只能更换到同一会员产品适用的房型", 409);
+    }
     const fingerprint = await inventoryFingerprint(db, propertyId, newUnit.id, effectiveDate, context.order.departure_date, context.segmentIds);
     if (fingerprint.length > 0) throw new DomainError("INVENTORY_CONFLICT", "Destination inventory is unavailable", 409);
     const stayTimeline = currentTimeline.map((item) => item.serviceDate < effectiveDate ? item : { ...item, inventoryUnitId: newUnit.id });
     const pricing = await priceStayTimeline(db, {
-      propertyId, orderId, memberContractId: context.order.member_contract_id,
+      propertyId, orderId, memberId: context.order.member_id, memberContractId: context.order.member_contract_id,
       arrivalDate: context.order.arrival_date, departureDate: context.order.departure_date,
       stayType: context.order.stay_type as StayType, policyVersionId: context.order.pricing_policy_version_id,
       timeline: stayTimeline, manualAdjustmentMinor: 0
@@ -770,7 +908,7 @@ export async function buildCommandEffect(db: DbExecutor, commandType: CommandTyp
     }
     const stayTimeline = await loadActiveStayTimeline(db, context);
     const policyPricing = await priceStayTimeline(db, {
-      propertyId, orderId, memberContractId: context.order.member_contract_id,
+      propertyId, orderId, memberId: context.order.member_id, memberContractId: context.order.member_contract_id,
       arrivalDate: context.order.arrival_date, departureDate: context.order.departure_date,
       stayType: context.order.stay_type as StayType, policyVersionId: context.order.pricing_policy_version_id,
       timeline: stayTimeline, manualAdjustmentMinor: 0
@@ -791,10 +929,10 @@ export async function buildCommandEffect(db: DbExecutor, commandType: CommandTyp
 
   if (commandType === "REFRESH_MEMBER_COVERAGE") {
     assertOrderMutable(context.order.status);
-    if (!context.order.member_contract_id) throw new DomainError("ENTITLEMENT_CONFLICT", "Order has no member contract to refresh", 409);
+    if (!context.order.member_id && !context.order.member_contract_id) throw new DomainError("ENTITLEMENT_CONFLICT", "订单未选择会员档案，不能刷新会员覆盖", 409);
     const stayTimeline = await loadActiveStayTimeline(db, context);
     const pricing = await priceStayTimeline(db, {
-      propertyId, orderId, memberContractId: context.order.member_contract_id,
+      propertyId, orderId, memberId: context.order.member_id, memberContractId: context.order.member_contract_id,
       arrivalDate: context.order.arrival_date, departureDate: context.order.departure_date,
       stayType: context.order.stay_type as StayType, policyVersionId: context.order.pricing_policy_version_id,
       timeline: stayTimeline, manualAdjustmentMinor: 0
@@ -965,7 +1103,8 @@ export function projectCommandEffectForRead(commandType: string, effect: Record<
       primaryGuest: projectPrimaryGuestForRead(effect.primaryGuest),
       bookingChannelCode: Object.hasOwn(effect, "bookingChannelCode") ? effect.bookingChannelCode : null,
       channelOrderReference: Object.hasOwn(effect, "channelOrderReference") ? effect.channelOrderReference : null,
-      freeStayReason: Object.hasOwn(effect, "freeStayReason") ? effect.freeStayReason : null
+      freeStayReason: Object.hasOwn(effect, "freeStayReason") ? effect.freeStayReason : null,
+      memberId: Object.hasOwn(effect, "memberId") ? effect.memberId : null
     };
   }
   if (commandType === "RECORD_COLLECTION" || commandType === "RECORD_REFUND") {

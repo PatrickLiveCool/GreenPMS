@@ -98,7 +98,7 @@ type CanonicalPricingProductTuple = readonly [
   derivation: PricingProductSnapshot["derivation"]
 ];
 
-const revision561ImportId = "qintopia-2026-feishu-revision-561-user-confirmed-v3";
+const revision561ImportId = "qintopia-2026-feishu-revision-561-user-confirmed-v4";
 const revision561SourceRevision = 561;
 
 // These tuples are the independent data seal for the user-confirmed revision, not derived totals.
@@ -115,14 +115,14 @@ const revision561RoomTuples = [
   ["C02", "C", "private_bath_single", "I02", "I02", "USER_CONFIRMED_RENAMED", 1, null, "INDEPENDENT_ROOM"],
   ["C03", "C", "private_bath_single", "I03", "I03", "USER_CONFIRMED_RENAMED", 1, null, "INDEPENDENT_ROOM"],
   ["C04", "C", "private_bath_single", "I04", "I04", "USER_CONFIRMED_RENAMED", 1, null, "INDEPENDENT_ROOM"],
-  ["D-GEN-01", "D", "shared_bath_single", null, "养蜂 单", "PMS_GENERATED", 1, null, "INDEPENDENT_ROOM"],
-  ["D-GEN-02", "D", "shared_bath_single", null, "养蜂 单", "PMS_GENERATED", 1, null, "INDEPENDENT_ROOM"],
-  ["D-GEN-03", "D", "shared_bath_standard", null, "养蜂 双", "PMS_GENERATED", 2, ["A", "B"], "INDEPENDENT_ROOM"],
-  ["D-GEN-04", "D", "shared_bath_standard", null, "养蜂 双", "PMS_GENERATED", 2, ["A", "B"], "INDEPENDENT_ROOM"],
-  ["D-GEN-05", "D", "shared_bath_standard", null, "养蜂 双", "PMS_GENERATED", 2, ["A", "B"], "INDEPENDENT_ROOM"],
-  ["E-GEN-01", "E", "private_bath_standard", null, "蝴蝶 标间", "PMS_GENERATED", 2, ["A", "B"], "INDEPENDENT_ROOM"],
-  ["E-GEN-02", "E", "private_bath_single", null, "蝴蝶 单人间", "PMS_GENERATED", 1, null, "INDEPENDENT_ROOM"],
-  ["E-GEN-03", "E", "private_bath_suite", null, "蝴蝶 套房", "PMS_GENERATED", 2, ["A", "B"], "INDEPENDENT_ROOM"],
+  ["D01", "D", "shared_bath_single", null, "养蜂 单", "PMS_GENERATED", 1, null, "INDEPENDENT_ROOM"],
+  ["D02", "D", "shared_bath_single", null, "养蜂 单", "PMS_GENERATED", 1, null, "INDEPENDENT_ROOM"],
+  ["D03", "D", "shared_bath_standard", null, "养蜂 双", "PMS_GENERATED", 2, ["A", "B"], "INDEPENDENT_ROOM"],
+  ["D04", "D", "shared_bath_standard", null, "养蜂 双", "PMS_GENERATED", 2, ["A", "B"], "INDEPENDENT_ROOM"],
+  ["D05", "D", "shared_bath_standard", null, "养蜂 双", "PMS_GENERATED", 2, ["A", "B"], "INDEPENDENT_ROOM"],
+  ["E01", "E", "private_bath_standard", null, "蝴蝶 标间", "PMS_GENERATED", 2, ["A", "B"], "INDEPENDENT_ROOM"],
+  ["E02", "E", "private_bath_single", null, "蝴蝶 单人间", "PMS_GENERATED", 1, null, "INDEPENDENT_ROOM"],
+  ["E03", "E", "private_bath_suite", null, "蝴蝶 套房", "PMS_GENERATED", 2, ["A", "B"], "INDEPENDENT_ROOM"],
   ["101", "1", "shared_bath_quad", "101", "101", "SOURCE_EXPLICIT", 4, ["A", "B", "C", "D"], "BED_WITH_WHOLE_ROOM_COMBINATION"],
   ["102", "1", "shared_bath_quad", "102", "102", "SOURCE_EXPLICIT", 4, ["A", "B", "C", "D"], "BED_WITH_WHOLE_ROOM_COMBINATION"],
   ["103", "1", "shared_bath_quad", "103", "103", "SOURCE_EXPLICIT", 4, ["A", "B", "C", "D"], "BED_WITH_WHOLE_ROOM_COMBINATION"],

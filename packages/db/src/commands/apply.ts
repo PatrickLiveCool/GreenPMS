@@ -23,11 +23,8 @@ function rethrowTokenSecretConflict(error: unknown): never {
 
 function rethrowMemberRegistrationConflict(error: unknown): never {
   const databaseError = error as { code?: unknown; constraint?: unknown };
-  if (databaseError.code === "23505" && (
-    databaseError.constraint === "members_identity_card_number_key"
-    || databaseError.constraint === "member_external_references_source_key"
-  )) {
-    throw new DomainError("AGGREGATE_VERSION_CONFLICT", "Member identity or external application linkage changed after Preview", 409);
+  if (databaseError.code === "23505" && databaseError.constraint === "members_identity_card_number_key") {
+    throw new DomainError("VALIDATION_ERROR", "该身份证号已登记，不能重复创建会员档案", 409);
   }
   throw error;
 }
@@ -93,35 +90,43 @@ export async function lockCommandResources(trx: Transaction<Database>, commandTy
 
   if (commandType === "CREATE_MEMBER") {
     const identityCardNumber = normalizeIdentityCardNumber(input.identityCardNumber);
-    const sourceApplicationRecordId = typeof input.sourceApplicationRecordId === "string" && input.sourceApplicationRecordId.trim()
-      ? input.sourceApplicationRecordId.trim()
-      : undefined;
-    const lockKeys = [`qintopia:member-identity:${identityCardNumber}`];
-    if (sourceApplicationRecordId) {
-      lockKeys.push(`qintopia:member-external:FEISHU_BASE:wiki:FtxUwOE6diwS8wkmaawcDhEPnMc:tbl4OryeWd0Td8jN:${sourceApplicationRecordId}`);
-    }
-    for (const lockKey of lockKeys.sort()) {
-      await sql`select pg_advisory_xact_lock(hashtextextended(${lockKey}, 0::bigint))`.execute(trx);
-    }
-    const member = await trx.selectFrom("members").select("id")
+    await sql`select pg_advisory_xact_lock(hashtextextended(${`qintopia:member-identity:${identityCardNumber}`}, 0::bigint))`.execute(trx);
+    await trx.selectFrom("members").select("id")
       .where("identity_card_number", "=", identityCardNumber).forUpdate().executeTakeFirst();
-    if (member) {
-      await trx.selectFrom("member_contracts").select("id")
-        .where("member_id", "=", member.id).where("property_id", "=", propertyId).forUpdate().execute();
+    return;
+  }
+
+  if (commandType === "CREATE_MEMBERSHIP_ORDER") {
+    const memberId = requireString(input, "memberId");
+    const productId = requireString(input, "membershipProductId");
+    const member = await trx.selectFrom("member_property_links").select("member_id")
+      .where("member_id", "=", memberId).where("property_id", "=", propertyId).forShare().executeTakeFirst();
+    if (!member) throw new DomainError("NOT_FOUND", "当前门店未找到该会员", 404);
+    const product = await trx.selectFrom("membership_products").select("id").where("id", "=", productId).forShare().executeTakeFirst();
+    if (!product) throw new DomainError("NOT_FOUND", "会员产品不存在", 404);
+    return;
+  }
+
+  if (commandType === "RECORD_MEMBERSHIP_PAYMENT" || commandType === "CORRECT_MEMBERSHIP_PAYMENT" || commandType === "ACTIVATE_MEMBERSHIP_ORDER") {
+    const membershipOrderId = requireString(input, "membershipOrderId");
+    const order = await trx.selectFrom("membership_orders").select(["id", "member_id"])
+      .where("id", "=", membershipOrderId).where("property_id", "=", propertyId).forUpdate().executeTakeFirst();
+    if (!order) throw new DomainError("NOT_FOUND", "会员订单不存在", 404);
+    if (commandType === "ACTIVATE_MEMBERSHIP_ORDER") {
+      await sql`select pg_advisory_xact_lock(hashtextextended(${`qintopia:member-entitlements:${order.member_id}`}, 0::bigint))`.execute(trx);
+      await trx.selectFrom("members").select("id").where("id", "=", order.member_id).forUpdate().executeTakeFirst();
     }
-    if (sourceApplicationRecordId) {
-      await trx.selectFrom("member_external_references").select("id")
-        .where("provider", "=", "FEISHU_BASE")
-        .where("source_container_id", "=", "wiki:FtxUwOE6diwS8wkmaawcDhEPnMc")
-        .where("source_table_id", "=", "tbl4OryeWd0Td8jN")
-        .where("external_record_id", "=", sourceApplicationRecordId)
-        .forUpdate().executeTakeFirst();
-    }
+    await trx.selectFrom("membership_payment_facts").select("fact_id")
+      .where("membership_order_id", "=", membershipOrderId).forUpdate().execute();
     return;
   }
 
   if (commandType === "CREATE_ORDER") {
     const quote = await loadStoredQuote(trx, requireString(input, "quoteId"));
+    if (quote.memberId) {
+      await sql`select pg_advisory_xact_lock(hashtextextended(${`qintopia:member-entitlements:${quote.memberId}`}, 0::bigint))`.execute(trx);
+      await trx.selectFrom("members").select("id").where("id", "=", quote.memberId).forUpdate().executeTakeFirst();
+    }
     await lockEntitlementLots(trx, quote.memberContractId);
     await lockUnitDates(trx, propertyId, quote.inventoryUnitId, quote.arrivalDate, quote.departureDate);
     return;
@@ -167,7 +172,7 @@ export async function lockCommandResources(trx: Transaction<Database>, commandTy
     await lockEntitlementLots(trx, contractId);
     return;
   }
-  if (commandType === "ADJUST_MEMBER_ENTITLEMENT" || commandType === "EXPIRE_MEMBER_ENTITLEMENT") {
+  if (commandType === "ADJUST_MEMBER_ENTITLEMENT" || commandType === "CORRECT_MEMBER_ENTITLEMENT_BALANCE" || commandType === "EXPIRE_MEMBER_ENTITLEMENT") {
     const lot = await trx.selectFrom("entitlement_lots").innerJoin("member_contracts", "member_contracts.id", "entitlement_lots.contract_id")
       .select(["entitlement_lots.id", "entitlement_lots.contract_id"])
       .where("entitlement_lots.id", "=", requireString(input, "entitlementLotId"))
@@ -260,8 +265,14 @@ async function insertRevision(trx: Transaction<Database>, options: {
 }
 
 async function bumpMembershipForCoverage(trx: Transaction<Database>, contractId: string | null, coverageSet: CoverageItemDto[]): Promise<void> {
-  if (!contractId || coverageSet.length === 0) return;
-  await incrementContractAndLotVersions(trx, contractId, [...new Set(coverageSet.map((item) => item.entitlementLotId))]);
+  if (coverageSet.length === 0) return;
+  const lotIds = [...new Set(coverageSet.map((item) => item.entitlementLotId))];
+  const lots = await trx.selectFrom("entitlement_lots").select(["id", "contract_id"]).where("id", "in", lotIds).execute();
+  if (lots.length !== lotIds.length) throw new DomainError("ENTITLEMENT_CONFLICT", "会员权益批次不存在", 409);
+  for (const ownerContractId of new Set(lots.map((lot) => lot.contract_id))) {
+    if (!contractId && !ownerContractId) continue;
+    await incrementContractAndLotVersions(trx, ownerContractId, lots.filter((lot) => lot.contract_id === ownerContractId).map((lot) => lot.id));
+  }
 }
 
 export async function applyCommand(trx: Transaction<Database>, options: {
@@ -278,74 +289,212 @@ export async function applyCommand(trx: Transaction<Database>, options: {
   if (options.commandType === "CREATE_MEMBER") {
     const operation = requireString(effect, "operation");
     const memberProfile = nestedObject(effect, "member");
-    const contractEffect = nestedObject(effect, "contract");
-    const memberCreated = operation === "CREATE_MEMBER_WITH_INITIAL_CONTRACT";
-    if (!memberCreated && operation !== "MATCH_EXISTING_MEMBER") {
+    const propertyLink = nestedObject(effect, "propertyLink");
+    if (operation !== "CREATE_MEMBER_PROFILE"
+      || effect.memberId !== null
+      || requireString(propertyLink, "operation") !== "CREATE") {
       throw new DomainError("INTERNAL_ERROR", "Member registration effect has an invalid operation", 500);
     }
-    const memberId = memberCreated ? newId("member") : requireString(effect, "memberId");
-    const memberContractId = memberCreated ? newId("contract") : typeof effect.memberContractId === "string" ? effect.memberContractId : null;
+    const memberId = newId("member");
     try {
-      if (memberCreated) {
-        if (!memberContractId) throw new DomainError("INTERNAL_ERROR", "New member registration has no initial contract ID", 500);
-        await trx.insertInto("members").values({
-          id: memberId,
-          identity_card_number: normalizeIdentityCardNumber(memberProfile.identityCardNumber),
-          full_name: requireString(memberProfile, "fullName"),
-          phone: requireString(memberProfile, "phone"),
-          wechat: requireString(memberProfile, "wechat")
-        }).execute();
-        await trx.insertInto("member_contracts").values({
-          id: memberContractId,
-          property_id: propertyId,
-          member_id: memberId,
-          member_name: requireString(memberProfile, "fullName"),
-          status: "ACTIVE",
-          valid_from: requireString(contractEffect, "validFrom"),
-          valid_until: requireString(contractEffect, "validUntil"),
-          version: 1
-        }).execute();
-      }
-
-      let memberExternalReferenceId: string | null = null;
-      let externalReferenceCreated = false;
-      if (effect.externalReference !== null && effect.externalReference !== undefined) {
-        const externalReference = requireObject(effect.externalReference, "externalReference");
-        const referenceOperation = requireString(externalReference, "operation");
-        if (referenceOperation === "CREATE_LINK") {
-          memberExternalReferenceId = newId("memberref");
-          externalReferenceCreated = true;
-          await trx.insertInto("member_external_references").values({
-            id: memberExternalReferenceId,
-            member_id: memberId,
-            property_id: propertyId,
-            provider: "FEISHU_BASE",
-            source_container_id: requireString(externalReference, "sourceContainerId"),
-            source_table_id: requireString(externalReference, "sourceTableId"),
-            external_record_id: requireString(externalReference, "externalRecordId")
-          }).execute();
-        } else if (referenceOperation === "USE_EXISTING_LINK") {
-          memberExternalReferenceId = requireString(externalReference, "id");
-        } else {
-          throw new DomainError("INTERNAL_ERROR", "Member external-reference effect has an invalid operation", 500);
-        }
-      }
-      const resourceRefs = [memberId, ...(memberContractId ? [memberContractId] : []), ...(memberExternalReferenceId ? [memberExternalReferenceId] : [])];
+      await trx.insertInto("members").values({
+        id: memberId,
+        identity_card_number: normalizeIdentityCardNumber(memberProfile.identityCardNumber),
+        full_name: requireString(memberProfile, "fullName"),
+        phone: requireString(memberProfile, "phone"),
+        wechat: requireString(memberProfile, "wechat")
+      }).execute();
+      await trx.insertInto("member_property_links").values({
+        member_id: memberId,
+        property_id: propertyId
+      }).execute();
       return {
-        persistedResult: {
-          memberId,
-          memberContractId,
-          memberCreated,
-          memberContractCreated: memberCreated,
-          memberExternalReferenceId,
-          externalReferenceCreated
-        },
-        resourceRefs,
+        persistedResult: { memberId, memberCreated: true },
+        resourceRefs: [memberId],
         factRefs: []
       };
     } catch (error) {
       rethrowMemberRegistrationConflict(error);
     }
+  }
+
+  if (options.commandType === "CREATE_MEMBERSHIP_ORDER") {
+    const member = nestedObject(effect, "member");
+    const product = nestedObject(effect, "product");
+    const pricing = nestedObject(effect, "pricing");
+    const listedPrice = moneyMinor(pricing.listedPrice, "listedPrice");
+    const agreedPrice = moneyMinor(pricing.agreedPrice, "agreedPrice");
+    const adjustment = moneyMinor(pricing.adjustment, "adjustment");
+    const adjustmentReason = typeof pricing.adjustmentReason === "string" ? pricing.adjustmentReason : null;
+    const entitlementUnitKind = requireString(product, "entitlementUnitKind");
+    const allowedInventoryKind = requireString(product, "allowedInventoryKind");
+    if (entitlementUnitKind !== "ROOM_NIGHT" && entitlementUnitKind !== "BED_NIGHT") throw new DomainError("INTERNAL_ERROR", "Invalid membership entitlement unit", 500);
+    if (allowedInventoryKind !== "ROOM" && allowedInventoryKind !== "BED") throw new DomainError("INTERNAL_ERROR", "Invalid membership inventory kind", 500);
+    const entitlementUnits = product.entitlementUnits;
+    const productVersion = product.version;
+    if (!Number.isInteger(entitlementUnits) || (entitlementUnits as number) <= 0 || !Number.isInteger(productVersion) || (productVersion as number) <= 0) {
+      throw new DomainError("INTERNAL_ERROR", "Invalid membership product snapshot", 500);
+    }
+    const membershipOrderId = newId("membership_order");
+    await trx.insertInto("membership_orders").values({
+      id: membershipOrderId,
+      property_id: propertyId,
+      member_id: requireString(member, "memberId"),
+      product_id: requireString(product, "productId"),
+      product_code: requireString(product, "code"),
+      product_version: productVersion as number,
+      product_name: requireString(product, "name"),
+      listed_price_minor: listedPrice.minorUnits,
+      agreed_price_minor: agreedPrice.minorUnits,
+      price_adjustment_minor: adjustment.minorUnits,
+      price_adjustment_reason: adjustmentReason,
+      currency: agreedPrice.currency,
+      entitlement_unit_kind: entitlementUnitKind,
+      entitlement_units: entitlementUnits as number,
+      allowed_room_type_code: requireString(product, "allowedRoomTypeCode"),
+      allowed_inventory_kind: allowedInventoryKind,
+      status: "DRAFT",
+      activated_at: null,
+      valid_from: null,
+      valid_until: null,
+      contract_id: null,
+      entitlement_lot_id: null,
+      version: 1,
+      created_by_command_id: options.commandId,
+      activated_by_command_id: null
+    }).execute();
+    return {
+      persistedResult: { membershipOrderId, status: "DRAFT" },
+      resourceRefs: [membershipOrderId, requireString(member, "memberId")],
+      factRefs: []
+    };
+  }
+
+  if (options.commandType === "RECORD_MEMBERSHIP_PAYMENT") {
+    const payment = nestedObject(effect, "payment");
+    const amount = moneyMinor(payment.amount, "payment.amount");
+    const factId = newId("membership_payment");
+    const membershipOrderId = requireString(effect, "membershipOrderId");
+    await trx.insertInto("membership_payment_facts").values({
+      fact_id: factId,
+      membership_order_id: membershipOrderId,
+      fact_type: "COLLECTION",
+      amount_minor: amount.minorUnits,
+      net_effect_minor: amount.minorUnits,
+      currency: amount.currency,
+      transaction_reference: requireTransactionReference(payment.transactionReference),
+      corrects_fact_id: null,
+      reverses_fact_id: null,
+      note: typeof payment.note === "string" ? payment.note : "",
+      command_id: options.commandId
+    }).execute();
+    await trx.updateTable("membership_orders").set({ version: sql`version + 1`, updated_at: new Date() })
+      .where("id", "=", membershipOrderId).where("status", "=", "DRAFT").executeTakeFirstOrThrow();
+    return { persistedResult: { membershipOrderId, paymentFactId: factId, status: "DRAFT" }, resourceRefs: [membershipOrderId], factRefs: [factId] };
+  }
+
+  if (options.commandType === "CORRECT_MEMBERSHIP_PAYMENT") {
+    const originalPaymentFactId = requireString(effect, "originalPaymentFactId");
+    const original = nestedObject(effect, "original");
+    const replacement = nestedObject(effect, "replacement");
+    const originalAmount = moneyMinor(original.amount, "original.amount");
+    const replacementAmount = moneyMinor(replacement.amount, "replacement.amount");
+    const membershipOrderId = requireString(effect, "membershipOrderId");
+    const reversalFactId = newId("membership_payment_reversal");
+    const replacementFactId = newId("membership_payment");
+    const note = typeof replacement.note === "string" ? replacement.note : "";
+    await trx.insertInto("membership_payment_facts").values({
+      fact_id: reversalFactId,
+      membership_order_id: membershipOrderId,
+      fact_type: "REVERSAL",
+      amount_minor: originalAmount.minorUnits,
+      net_effect_minor: -originalAmount.minorUnits,
+      currency: originalAmount.currency,
+      transaction_reference: null,
+      corrects_fact_id: null,
+      reverses_fact_id: originalPaymentFactId,
+      note: `更正原企微收款：${note}`,
+      command_id: options.commandId
+    }).execute();
+    await trx.insertInto("membership_payment_facts").values({
+      fact_id: replacementFactId,
+      membership_order_id: membershipOrderId,
+      fact_type: "COLLECTION",
+      amount_minor: replacementAmount.minorUnits,
+      net_effect_minor: replacementAmount.minorUnits,
+      currency: replacementAmount.currency,
+      transaction_reference: requireTransactionReference(replacement.transactionReference),
+      corrects_fact_id: originalPaymentFactId,
+      reverses_fact_id: null,
+      note,
+      command_id: options.commandId
+    }).execute();
+    await trx.updateTable("membership_orders").set({ version: sql`version + 1`, updated_at: new Date() })
+      .where("id", "=", membershipOrderId).where("status", "=", "DRAFT").executeTakeFirstOrThrow();
+    return {
+      persistedResult: { membershipOrderId, originalPaymentFactId, reversalFactId, replacementFactId, status: "DRAFT" },
+      resourceRefs: [membershipOrderId],
+      factRefs: [reversalFactId, replacementFactId]
+    };
+  }
+
+  if (options.commandType === "ACTIVATE_MEMBERSHIP_ORDER") {
+    const membershipOrderId = requireString(effect, "membershipOrderId");
+    const order = await trx.selectFrom("membership_orders")
+      .innerJoin("members", "members.id", "membership_orders.member_id")
+      .selectAll("membership_orders")
+      .select("members.full_name as member_name")
+      .where("membership_orders.id", "=", membershipOrderId)
+      .where("membership_orders.property_id", "=", propertyId)
+      .where("membership_orders.status", "=", "DRAFT")
+      .executeTakeFirst();
+    if (!order) throw new DomainError("AGGREGATE_VERSION_CONFLICT", "会员订单已经生效或不存在", 409);
+    const contractId = newId("contract");
+    const lotId = newId("lot");
+    const activatedAt = new Date();
+    const validFrom = requireString(effect, "validFrom");
+    const validUntil = requireString(effect, "validUntil");
+    const entitlementUnitKind = requireString(effect, "entitlementUnitKind");
+    const entitlementUnits = effect.entitlementUnits;
+    if ((entitlementUnitKind !== "ROOM_NIGHT" && entitlementUnitKind !== "BED_NIGHT") || !Number.isInteger(entitlementUnits) || (entitlementUnits as number) <= 0) {
+      throw new DomainError("INTERNAL_ERROR", "Invalid activation entitlement", 500);
+    }
+    await trx.insertInto("member_contracts").values({
+      id: contractId,
+      property_id: propertyId,
+      member_id: order.member_id,
+      member_name: order.member_name,
+      status: "ACTIVE",
+      valid_from: validFrom,
+      valid_until: validUntil,
+      version: 1,
+      membership_order_id: membershipOrderId
+    }).execute();
+    await trx.insertInto("entitlement_lots").values({
+      id: lotId,
+      contract_id: contractId,
+      unit_kind: entitlementUnitKind,
+      total_units: entitlementUnits as number,
+      expires_on: validUntil,
+      version: 1
+    }).execute();
+    const updated = await trx.updateTable("membership_orders").set({
+      status: "ACTIVE",
+      activated_at: activatedAt,
+      valid_from: validFrom,
+      valid_until: validUntil,
+      contract_id: contractId,
+      entitlement_lot_id: lotId,
+      version: sql`version + 1`,
+      activated_by_command_id: options.commandId,
+      updated_at: activatedAt
+    }).where("id", "=", membershipOrderId).where("status", "=", "DRAFT").returning("id").executeTakeFirst();
+    if (!updated) throw new DomainError("AGGREGATE_VERSION_CONFLICT", "会员订单已经生效", 409);
+    return {
+      persistedResult: { membershipOrderId, status: "ACTIVE", contractId, entitlementLotId: lotId, validFrom, validUntil, entitlementUnits },
+      resourceRefs: [membershipOrderId, contractId, lotId],
+      factRefs: []
+    };
   }
 
   if (options.commandType === "CREATE_ORDER") {
@@ -363,17 +512,21 @@ export async function applyCommand(trx: Transaction<Database>, options: {
     const departureDate = requireString(effect, "departureDate");
     const stayType = requireString(effect, "stayType");
     const policyVersionId = requireString(effect, "pricingPolicyVersionId");
+    const memberId = typeof effect.memberId === "string" ? effect.memberId : null;
     const memberContractId = typeof effect.memberContractId === "string" ? effect.memberContractId : null;
-    const { bookingChannelCode, channelOrderReference } = validateBookingChannel(
-      effect.bookingChannelCode,
-      effect.channelOrderReference
-    );
+    const memberStay = Boolean(memberId || memberContractId);
+    if (memberStay && (effect.bookingChannelCode !== null || effect.channelOrderReference !== null)) {
+      throw new DomainError("VALIDATION_ERROR", "会员住宿不得写入订单来源渠道或渠道订单号");
+    }
+    const { bookingChannelCode, channelOrderReference } = memberStay
+      ? { bookingChannelCode: null, channelOrderReference: null }
+      : validateBookingChannel(effect.bookingChannelCode, effect.channelOrderReference);
     const freeStayReason = stayType === "FREE" ? requireString(effect, "freeStayReason") : null;
     await trx.insertInto("orders").values({
       id: orderId, property_id: propertyId, status: "RESERVED", stay_type: stayType,
       arrival_date: arrivalDate, departure_date: departureDate, primary_guest_snapshot: primaryGuest,
       booking_channel_code: bookingChannelCode, channel_order_reference: channelOrderReference, free_stay_reason: freeStayReason,
-      pricing_policy_version_id: policyVersionId, member_contract_id: memberContractId, current_revision_id: null, version: 1
+      pricing_policy_version_id: policyVersionId, member_id: memberId, member_contract_id: memberContractId, current_revision_id: null, version: 1
     }).execute();
     await trx.insertInto("stays").values({ id: stayId, order_id: orderId, status: "PLANNED" }).execute();
     await trx.insertInto("amendments").values({
@@ -391,7 +544,7 @@ export async function applyCommand(trx: Transaction<Database>, options: {
     const unit = await loadInventoryUnit(trx, propertyId, unitId);
     await createInventoryClaims(trx, { propertyId, unit, dates: enumerateServiceDates(arrivalDate, departureDate), sourceType: "ORDER_SEGMENT", sourceId: segmentId });
     const coverageRefs = memberContractId
-      ? await holdCoverage(trx, { orderId, contractId: memberContractId, inventoryUnitId: unitId, revisionId, coverageSet: pricing.coverageSet, commandId: options.commandId })
+      ? await holdCoverage(trx, { orderId, contractId: memberContractId, ...(memberId ? { memberId } : {}), inventoryUnitId: unitId, revisionId, coverageSet: pricing.coverageSet, commandId: options.commandId })
       : { coverageIds: [], factIds: [] };
     if (memberContractId) {
       await bumpMembershipForCoverage(trx, memberContractId, pricing.coverageSet);
@@ -525,7 +678,7 @@ export async function applyCommand(trx: Transaction<Database>, options: {
     };
   }
 
-  if (options.commandType === "ADJUST_MEMBER_ENTITLEMENT") {
+  if (options.commandType === "ADJUST_MEMBER_ENTITLEMENT" || options.commandType === "CORRECT_MEMBER_ENTITLEMENT_BALANCE") {
     const lotId = requireString(effect, "entitlementLotId");
     const contractId = requireString(effect, "contractId");
     const factId = newId("fact");
@@ -534,7 +687,17 @@ export async function applyCommand(trx: Transaction<Database>, options: {
       service_date: null, order_id: null, coverage_id: null, reason: requireString(effect, "adjustmentReason"), command_id: options.commandId
     }).execute();
     await incrementContractAndLotVersions(trx, contractId, [lotId]);
-    return { persistedResult: { entitlementLotId: lotId, adjustmentFactId: factId }, resourceRefs: [contractId, lotId], factRefs: [factId] };
+    return {
+      persistedResult: {
+        entitlementLotId: lotId,
+        adjustmentFactId: factId,
+        availableBefore: effect.availableBefore,
+        availableAfter: effect.availableAfter,
+        quantityDelta: effect.quantityDelta
+      },
+      resourceRefs: [contractId, lotId],
+      factRefs: [factId]
+    };
   }
 
   if (options.commandType === "EXPIRE_MEMBER_ENTITLEMENT") {
@@ -674,8 +837,8 @@ export async function applyCommand(trx: Transaction<Database>, options: {
       policyVersionId: context.order.pricing_policy_version_id,
       arrivalDate: context.order.arrival_date, departureDate, pricing
     });
-    if (context.order.member_contract_id) {
-      const held = await holdCoverage(trx, { orderId, contractId: context.order.member_contract_id, inventoryUnitId: unitId, revisionId, coverageSet: pricing.coverageSet, commandId: options.commandId });
+    if (context.order.member_id || context.order.member_contract_id) {
+      const held = await holdCoverage(trx, { orderId, contractId: context.order.member_contract_id ?? "", ...(context.order.member_id ? { memberId: context.order.member_id } : {}), inventoryUnitId: unitId, revisionId, coverageSet: pricing.coverageSet, commandId: options.commandId });
       coverageIds.push(...held.coverageIds);
       coverageFactIds.push(...held.factIds);
       await bumpMembershipForCoverage(trx, context.order.member_contract_id, pricing.coverageSet);
@@ -708,16 +871,17 @@ export async function applyCommand(trx: Transaction<Database>, options: {
       policyVersionId: context.order.pricing_policy_version_id,
       arrivalDate: context.order.arrival_date, departureDate: context.order.departure_date, pricing
     });
-    const reconciledCoverage = context.order.member_contract_id
+    const reconciledCoverage = context.order.member_id || context.order.member_contract_id
       ? await reconcileCoverage(trx, {
         orderId,
-        contractId: context.order.member_contract_id,
+        contractId: context.order.member_contract_id ?? "",
+        ...(context.order.member_id ? { memberId: context.order.member_id } : {}),
         revisionId,
         coverageSet: pricing.coverageSet,
         commandId: options.commandId
       })
       : { coverageIds: [], factIds: [] };
-    const consumedCoverage = context.order.member_contract_id && context.order.status === "CHECKED_IN"
+    const consumedCoverage = (context.order.member_id || context.order.member_contract_id) && context.order.status === "CHECKED_IN"
       ? await consumeCoverage(trx, orderId, options.commandId)
       : { coverageIds: [], factIds: [] };
     const coverageRefs = {

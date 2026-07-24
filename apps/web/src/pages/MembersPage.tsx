@@ -1,42 +1,75 @@
-import { useCallback, useEffect, useMemo, useState, type FormEvent } from "react";
-import { CalendarX2, Plus, RefreshCw, Search, SlidersHorizontal, UserPlus } from "lucide-react";
+import { useEffect, useState, type FormEvent } from "react";
+import { BadgeCheck, CircleDollarSign, CreditCard, PencilLine, RefreshCw, Search, UserPlus } from "lucide-react";
 import { api } from "../api";
-import { addLocalDateDays } from "../dates";
 import { useWorkspace } from "../session";
-import type { CommandRequest, EntitlementLotDto, MemberContractDto, MemberSummaryDto, MemberViewDto } from "../types";
+import type { CommandRequest, MemberContractDto, MemberSummaryDto, MemberViewDto, MembershipOrderSummaryDto, MembershipPaymentFactDto, MembershipProductDto } from "../types";
 import {
   CommandDialog,
   CommandRecoveryBar,
   EmptyState,
   formatDate,
-  formatDateTime,
+  formatMinor,
   InlineError,
   isTerminalCommandRecovery,
   LoadingBlock,
   Modal,
   recoveryCommandRequest,
-  StatusBadge,
   usePersistentCommandRecovery
 } from "../ui";
 
-type MemberAction = "ADJUST_MEMBER_ENTITLEMENT" | "EXPIRE_MEMBER_ENTITLEMENT";
-
-export function serverAvailableUnits(member: MemberViewDto, lotId: string): number {
-  return member.lotBalances.find((balance) => balance.lotId === lotId)?.availableUnits ?? 0;
+export function effectiveMemberId(members: MemberSummaryDto[], requestedMemberId: string): string {
+  return members.some((summary) => summary.member.id === requestedMemberId)
+    ? requestedMemberId
+    : members[0]?.member.id ?? "";
 }
 
-export function isNaturallyExpired(member: MemberViewDto, lot: EntitlementLotDto): boolean {
-  return lot.expires_on < member.balanceAsOfDate;
+export function normalizeMemberQuery(query: string): string {
+  return query.trim();
 }
 
-export function entitlementLotUiState(member: MemberViewDto, lot: EntitlementLotDto, explicitlyExpired: boolean) {
-  const naturallyExpired = isNaturallyExpired(member, lot);
-  const expired = explicitlyExpired || naturallyExpired;
-  return {
-    expired,
-    canAdjust: !expired,
-    canRecordExpiration: naturallyExpired && !explicitlyExpired
-  };
+export function shouldClearMemberSearchAfterCommit(commandType: CommandRequest["commandType"]): boolean {
+  return commandType === "CREATE_MEMBER";
+}
+
+export function formalEntitlementLotIds(membershipOrders: MembershipOrderSummaryDto[]): Set<string> {
+  return new Set(membershipOrders.flatMap(({ order }) => order.entitlement_lot_id ? [order.entitlement_lot_id] : []));
+}
+
+export function yuanInputToMinor(value: string, wholeYuan = false): number | undefined {
+  const normalized = value.trim();
+  const pattern = wholeYuan ? /^\d+$/ : /^\d+(?:\.\d{1,2})?$/;
+  if (!pattern.test(normalized)) return undefined;
+  const [yuan, fraction = ""] = normalized.split(".");
+  const minor = Number(yuan) * 100 + Number(fraction.padEnd(2, "0"));
+  return Number.isSafeInteger(minor) && minor <= 2_147_483_647 ? minor : undefined;
+}
+
+export function parseEntitlementBalance(value: string): number | undefined {
+  const normalized = value.trim();
+  if (!/^\d+$/.test(normalized)) return undefined;
+  const parsed = Number(normalized);
+  return Number.isSafeInteger(parsed) && parsed <= 2_147_483_647 ? parsed : undefined;
+}
+
+export function isEntitlementLotActive(
+  contract: Pick<MemberContractDto, "status" | "valid_from" | "valid_until"> | undefined,
+  lotExpiresOn: string,
+  asOfDate: string
+): boolean {
+  return contract?.status === "ACTIVE"
+    && contract.valid_from <= asOfDate
+    && contract.valid_until >= asOfDate
+    && lotExpiresOn >= asOfDate;
+}
+
+function entitlementLabel(unitKind: "ROOM_NIGHT" | "BED_NIGHT", units: number): string {
+  return `${units} ${unitKind === "ROOM_NIGHT" ? "间夜" : "床夜"}`;
+}
+
+function productScopeLabel(product: Pick<MembershipProductDto, "code">): string {
+  if (product.code === "SHARED_BATH_SINGLE_30") return "公卫单人间";
+  if (product.code === "PRIVATE_BATH_SINGLE_30") return "独卫单人间";
+  return "公卫四人间单床";
 }
 
 function CreateMemberDialog({ propertyId, onClose, onSubmit }: {
@@ -48,238 +81,485 @@ function CreateMemberDialog({ propertyId, onClose, onSubmit }: {
   const [identityCardNumber, setIdentityCardNumber] = useState("");
   const [phone, setPhone] = useState("");
   const [wechat, setWechat] = useState("");
-  const [validFrom, setValidFrom] = useState("");
-  const [validUntil, setValidUntil] = useState("");
-  const [sourceApplicationRecordId, setSourceApplicationRecordId] = useState("");
 
   function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     onSubmit({
       commandType: "CREATE_MEMBER",
-      title: "登记会员档案与申请",
-      description: "服务端按身份证号匹配：新会员创建档案与首个空合同；既有会员只关联申请，不覆盖档案或自动发放权益。",
+      title: "新建会员档案",
+      description: "请核对会员资料。确认后将创建档案，并加入当前门店的会员列表。",
       input: {
         propertyId,
         fullName: fullName.trim(),
         identityCardNumber: identityCardNumber.trim().toUpperCase(),
         phone: phone.trim(),
-        wechat: wechat.trim(),
-        validFrom,
-        validUntil,
-        ...(sourceApplicationRecordId.trim() ? { sourceApplicationRecordId: sourceApplicationRecordId.trim() } : {})
+        wechat: wechat.trim()
       }
     });
   }
 
-  return <Modal title="登记会员" onClose={onClose} footer={null}>
+  return <Modal title="新建会员" onClose={onClose} footer={null}>
     <form className="modal-form" onSubmit={submit}>
       <div className="form-grid">
-        <label>姓名<input value={fullName} onChange={(event) => setFullName(event.target.value)} required maxLength={200} autoFocus data-testid="member-full-name" /></label>
-        <label>身份证号<input value={identityCardNumber} onChange={(event) => setIdentityCardNumber(event.target.value)} required maxLength={200} data-testid="member-identity-card" /></label>
-        <label>手机号<input value={phone} onChange={(event) => setPhone(event.target.value)} required maxLength={200} inputMode="tel" /></label>
-        <label>微信号<input value={wechat} onChange={(event) => setWechat(event.target.value)} required maxLength={200} /></label>
-        <label>初始合同开始日<input type="date" value={validFrom} onChange={(event) => setValidFrom(event.target.value)} required /></label>
-        <label>初始合同结束日<input type="date" min={validFrom || undefined} value={validUntil} onChange={(event) => setValidUntil(event.target.value)} required /></label>
-        <label className="span-two">飞书申请 Record ID（可选）<input value={sourceApplicationRecordId} onChange={(event) => setSourceApplicationRecordId(event.target.value)} maxLength={200} data-testid="member-source-record" /></label>
+        <label htmlFor="member-full-name">姓名<input id="member-full-name" value={fullName} onChange={(event) => setFullName(event.target.value)} required maxLength={200} autoFocus data-testid="member-full-name" autoComplete="name" /></label>
+        <label htmlFor="member-identity-card">身份证号<input id="member-identity-card" value={identityCardNumber} onChange={(event) => setIdentityCardNumber(event.target.value)} required maxLength={200} data-testid="member-identity-card" autoComplete="off" /></label>
+        <label htmlFor="member-phone">手机号<input id="member-phone" value={phone} onChange={(event) => setPhone(event.target.value)} required maxLength={200} inputMode="tel" autoComplete="tel" data-testid="member-phone" /></label>
+        <label htmlFor="member-wechat">微信号<input id="member-wechat" value={wechat} onChange={(event) => setWechat(event.target.value)} required maxLength={200} autoComplete="off" data-testid="member-wechat" /></label>
       </div>
-      <p className="member-form-note">合同日期仅在身份证号尚未登记、需要创建首个空合同时使用；申请记录只建立外部引用，不授予权益。</p>
-      <div className="form-actions"><button type="button" className="button button-secondary" onClick={onClose}>取消</button><button type="submit" className="button button-primary">继续生成 Preview</button></div>
+      <div className="form-actions">
+        <button type="button" className="button button-secondary" onClick={onClose}>取消</button>
+        <button type="submit" className="button button-primary">核对并创建</button>
+      </div>
     </form>
   </Modal>;
 }
 
-function AddEntitlementLotDialog({ contract, propertyId, balanceAsOfDate, onClose, onSubmit }: {
-  contract: MemberContractDto;
+function CreateMembershipOrderDialog({ propertyId, member, products, onClose, onSubmit }: {
   propertyId: string;
-  balanceAsOfDate: string;
+  member: MemberViewDto["member"];
+  products: MembershipProductDto[];
   onClose: () => void;
   onSubmit: (request: CommandRequest) => void;
 }) {
-  const [unitKind, setUnitKind] = useState<"ROOM_NIGHT" | "BED_NIGHT">("ROOM_NIGHT");
-  const [units, setUnits] = useState("1");
-  const [expiresOn, setExpiresOn] = useState(contract.valid_until);
-  const [validationError, setValidationError] = useState<unknown>();
-  const minimumExpiryDate = contract.valid_from > balanceAsOfDate ? contract.valid_from : balanceAsOfDate;
-
-  function submit(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    const parsedUnits = Number(units);
-    if (!Number.isSafeInteger(parsedUnits) || parsedUnits <= 0) {
-      setValidationError(new Error("新增权益单位必须是正整数"));
-      return;
-    }
-    if (expiresOn < balanceAsOfDate) {
-      setValidationError(new Error("到期日不能早于物业当前日期"));
-      return;
-    }
-    onSubmit({
-      commandType: "ADD_MEMBER_ENTITLEMENT_LOT",
-      title: `新增会员权益批次 · ${unitKind}`,
-      description: "确认后创建独立 entitlement lot 与不可变 ADJUST 账本事实，不改写旧余额。",
-      input: { propertyId, memberContractId: contract.id, unitKind, units: parsedUnits, expiresOn }
-    });
-  }
-
-  return <Modal title="新增会员权益批次" onClose={onClose} footer={null}>
-    <form className="modal-form" onSubmit={submit}>
-      <InlineError error={validationError} title="无法继续" />
-      <div className="form-grid">
-        <label>权益类型<select value={unitKind} onChange={(event) => setUnitKind(event.target.value as "ROOM_NIGHT" | "BED_NIGHT")}><option value="ROOM_NIGHT">ROOM_NIGHT</option><option value="BED_NIGHT">BED_NIGHT</option></select></label>
-        <label>新增单位<input type="number" min="1" step="1" value={units} onChange={(event) => setUnits(event.target.value)} required inputMode="numeric" data-testid="add-entitlement-units" /></label>
-        <label>到期日<input type="date" min={minimumExpiryDate} max={contract.valid_until} value={expiresOn} onChange={(event) => setExpiresOn(event.target.value)} required /></label>
-      </div>
-      <div className="form-actions"><button type="button" className="button button-secondary" onClick={onClose}>取消</button><button type="submit" className="button button-primary">继续生成 Preview</button></div>
-    </form>
-  </Modal>;
-}
-
-function signedQuantity(value: number): string {
-  return value > 0 ? `+${value}` : String(value);
-}
-
-function EntitlementActionDialog({ action, lot, propertyId, balanceAsOfDate, onClose, onSubmit }: {
-  action: MemberAction;
-  lot: EntitlementLotDto;
-  propertyId: string;
-  balanceAsOfDate: string;
-  onClose: () => void;
-  onSubmit: (request: CommandRequest) => void;
-}) {
-  const [quantityDelta, setQuantityDelta] = useState("1");
+  const [productId, setProductId] = useState(products[0]?.id ?? "");
+  const selectedProduct = products.find((product) => product.id === productId) ?? products[0];
+  const [agreedPriceYuan, setAgreedPriceYuan] = useState(() => selectedProduct ? String(selectedProduct.list_price_minor / 100) : "");
   const [adjustmentReason, setAdjustmentReason] = useState("");
-  const [asOfDate, setAsOfDate] = useState(balanceAsOfDate);
-  const [validationError, setValidationError] = useState<unknown>();
-  const isAdjustment = action === "ADJUST_MEMBER_ENTITLEMENT";
+  const [validationError, setValidationError] = useState<string>();
+
+  function selectProduct(nextId: string) {
+    setProductId(nextId);
+    const product = products.find((candidate) => candidate.id === nextId);
+    setAgreedPriceYuan(product ? String(product.list_price_minor / 100) : "");
+    setAdjustmentReason("");
+    setValidationError(undefined);
+  }
 
   function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    setValidationError(undefined);
-    if (isAdjustment) {
-      const parsedDelta = Number(quantityDelta);
-      if (!Number.isSafeInteger(parsedDelta) || parsedDelta === 0) {
-        setValidationError(new Error("调整数量必须是非零整数"));
-        return;
-      }
-      if (!adjustmentReason.trim()) {
-        setValidationError(new Error("请填写调整原因"));
-        return;
-      }
-      onSubmit({
-        commandType: action,
-        title: `调整会员权益 · ${lot.unit_kind}`,
-        description: "服务端将重新校验权益余额和 lot 版本，并追加不可变 ADJUST 事实。",
-        input: { propertyId, entitlementLotId: lot.id, quantityDelta: parsedDelta, adjustmentReason: adjustmentReason.trim() }
-      });
+    if (!selectedProduct) return;
+    const agreedPriceMinor = yuanInputToMinor(agreedPriceYuan, true);
+    if (agreedPriceMinor === undefined) {
+      setValidationError("成交价必须是非负人民币整数元");
       return;
     }
-    if (asOfDate <= lot.expires_on || asOfDate > balanceAsOfDate) {
-      setValidationError(new Error("到期核算日期必须晚于 Lot 到期日，且不得晚于物业当前日期"));
+    if (agreedPriceMinor !== selectedProduct.list_price_minor && !adjustmentReason.trim()) {
+      setValidationError("修改成交价时必须填写调价原因");
       return;
     }
     onSubmit({
-      commandType: action,
-      title: `到期会员权益 · ${lot.unit_kind}`,
-      description: "服务端将按 asOfDate 重新校验到期边界和可用余额，并追加不可变 EXPIRE 事实。",
-      input: { propertyId, entitlementLotId: lot.id, asOfDate }
+      commandType: "CREATE_MEMBERSHIP_ORDER",
+      title: "创建会员订单",
+      description: `为 ${member.full_name} 创建 ${selectedProduct.name}，确认后订单保持待生效。`,
+      input: {
+        propertyId,
+        memberId: member.id,
+        membershipProductId: selectedProduct.id,
+        agreedPriceMinor,
+        ...(agreedPriceMinor !== selectedProduct.list_price_minor ? { priceAdjustmentReason: adjustmentReason.trim() } : {})
+      }
     });
   }
 
-  return <Modal title={isAdjustment ? "调整会员权益" : "执行权益到期"} onClose={onClose} footer={null}>
+  return <Modal title="办理会员" onClose={onClose} footer={null}>
     <form className="modal-form" onSubmit={submit}>
-      <dl className="member-action-context">
-        <div><dt>Lot</dt><dd><code>{lot.id}</code></dd></div>
-        <div><dt>权益类型</dt><dd>{lot.unit_kind}</dd></div>
-        <div><dt>合同到期日</dt><dd>{formatDate(lot.expires_on)}</dd></div>
-      </dl>
-      <InlineError error={validationError} title="无法继续" />
-      {isAdjustment ? <div className="form-grid">
-        <label htmlFor="entitlement-quantity-delta">调整数量（正数增加，负数减少）<input id="entitlement-quantity-delta" type="number" step="1" value={quantityDelta} onChange={(event) => setQuantityDelta(event.target.value)} required inputMode="numeric" /></label>
-        <label htmlFor="entitlement-adjustment-reason">调整原因<textarea id="entitlement-adjustment-reason" rows={3} value={adjustmentReason} onChange={(event) => setAdjustmentReason(event.target.value)} required maxLength={1000} /></label>
-      </div> : <div className="form-grid">
-        <label htmlFor="entitlement-as-of-date">到期核算日期<input id="entitlement-as-of-date" type="date" min={addLocalDateDays(lot.expires_on, 1)} max={balanceAsOfDate} value={asOfDate} onChange={(event) => setAsOfDate(event.target.value)} required /></label>
-        <p className="member-form-note">核算日期必须晚于 Lot 到期日且不晚于物业当前日期；实际到期数量以服务端 Preview 为准。</p>
-      </div>}
-      <div className="form-actions"><button type="button" className="button button-secondary" onClick={onClose}>取消</button><button type="submit" className="button button-primary">继续生成 Preview</button></div>
+      <div className="form-grid">
+        <label className="span-two">会员产品<select value={productId} onChange={(event) => selectProduct(event.target.value)} required data-testid="membership-product">
+          {products.map((product) => <option key={product.id} value={product.id}>{product.name} · {formatMinor(product.list_price_minor, product.currency)}</option>)}
+        </select></label>
+        {selectedProduct ? <div className="membership-product-summary span-two" aria-label="会员产品信息">
+          <div><span>默认价</span><strong>{formatMinor(selectedProduct.list_price_minor, selectedProduct.currency)}</strong></div>
+          <div><span>发放权益</span><strong>{entitlementLabel(selectedProduct.entitlement_unit_kind, selectedProduct.entitlement_units)}</strong></div>
+          <div><span>适用范围</span><strong>{productScopeLabel(selectedProduct)}</strong></div>
+          <div><span>有效期</span><strong>生效日起一年</strong></div>
+        </div> : null}
+        <label>实际成交价（人民币元）<input type="number" min="0" step="1" inputMode="numeric" value={agreedPriceYuan} onChange={(event) => { setAgreedPriceYuan(event.target.value); setValidationError(undefined); }} required data-testid="membership-agreed-price-yuan" /></label>
+        {selectedProduct && yuanInputToMinor(agreedPriceYuan, true) !== selectedProduct.list_price_minor ? <label>调价原因<textarea rows={3} value={adjustmentReason} onChange={(event) => { setAdjustmentReason(event.target.value); setValidationError(undefined); }} required maxLength={1000} data-testid="membership-price-adjustment-reason" /></label> : null}
+      </div>
+      {validationError ? <InlineError error={new Error(validationError)} /> : null}
+      <div className="form-actions"><button type="button" className="button button-secondary" onClick={onClose}>取消</button><button type="submit" className="button button-primary">核对会员订单</button></div>
     </form>
   </Modal>;
+}
+
+function MembershipPaymentDialog({ propertyId, summary, correction, onClose, onSubmit }: {
+  propertyId: string;
+  summary: MembershipOrderSummaryDto;
+  correction?: MembershipPaymentFactDto;
+  onClose: () => void;
+  onSubmit: (request: CommandRequest) => void;
+}) {
+  const [amountYuan, setAmountYuan] = useState(correction ? String(correction.amount_minor / 100) : "");
+  const [transactionReference, setTransactionReference] = useState(correction?.transaction_reference ?? "");
+  const [note, setNote] = useState("");
+  const [validationError, setValidationError] = useState<string>();
+  function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const amountMinor = yuanInputToMinor(amountYuan);
+    if (!amountMinor) {
+      setValidationError("收款金额必须大于 0，最多保留两位小数");
+      return;
+    }
+    if (!transactionReference.trim()) {
+      setValidationError("必须填写企微交易单号");
+      return;
+    }
+    onSubmit(correction ? {
+      commandType: "CORRECT_MEMBERSHIP_PAYMENT",
+      title: "更正企微收款",
+      description: "确认后将冲销原收款并追加更正后的企微收款，原记录不会被删除。",
+      input: { propertyId, membershipOrderId: summary.order.id, originalPaymentFactId: correction.fact_id, correctedAmountMinor: amountMinor, correctedTransactionReference: transactionReference.trim(), ...(note.trim() ? { note: note.trim() } : {}) }
+    } : {
+      commandType: "RECORD_MEMBERSHIP_PAYMENT",
+      title: "登记企微收款",
+      description: "确认本次独立企微收款的金额和交易单号。",
+      input: { propertyId, membershipOrderId: summary.order.id, amountMinor, transactionReference: transactionReference.trim(), ...(note.trim() ? { note: note.trim() } : {}) }
+    });
+  }
+  return <Modal title={correction ? "更正企微收款" : "登记企微收款"} onClose={onClose} footer={null}>
+    <form className="modal-form" onSubmit={submit}>
+      <div className="form-grid">
+        <label>收款金额（人民币元）<input type="number" min="0.01" step="0.01" inputMode="decimal" value={amountYuan} onChange={(event) => { setAmountYuan(event.target.value); setValidationError(undefined); }} required data-testid="membership-payment-yuan" /></label>
+        <label>企微交易单号<input value={transactionReference} onChange={(event) => { setTransactionReference(event.target.value); setValidationError(undefined); }} required maxLength={200} data-testid="membership-payment-reference" /></label>
+        <label className="span-two">备注（可选）<textarea rows={3} value={note} onChange={(event) => setNote(event.target.value)} maxLength={1000} /></label>
+      </div>
+      {validationError ? <InlineError error={new Error(validationError)} /> : null}
+      <div className="form-actions"><button type="button" className="button button-secondary" onClick={onClose}>取消</button><button type="submit" className="button button-primary">{correction ? "核对更正内容" : "核对收款信息"}</button></div>
+    </form>
+  </Modal>;
+}
+
+function MemberList({ members, selectedMemberId, onSelect }: {
+  members: MemberSummaryDto[];
+  selectedMemberId: string;
+  onSelect: (memberId: string) => void;
+}) {
+  return <section className="member-list-panel" aria-labelledby="member-list-heading">
+    <div className="section-title-row">
+      <h2 id="member-list-heading">会员列表</h2>
+      <span>{members.length} 位</span>
+    </div>
+    <ul className="member-list">
+      {members.map(({ member }) => <li key={member.id}>
+        <button
+          type="button"
+          className="member-list-item"
+          aria-pressed={member.id === selectedMemberId}
+          onClick={() => onSelect(member.id)}
+          data-testid="member-list-item"
+        >
+          <strong>{member.full_name}</strong>
+          <span>{member.phone}</span>
+          <small>{member.identity_card_number}</small>
+          <small>微信：{member.wechat}</small>
+        </button>
+      </li>)}
+    </ul>
+  </section>;
+}
+
+function MemberProfile({ member }: { member: MemberViewDto }) {
+  return <section className="member-profile-panel" aria-labelledby="member-profile-heading">
+    <div className="section-title-row">
+      <div>
+        <span className="section-kicker">会员档案</span>
+        <h2 id="member-profile-heading">{member.member.full_name}</h2>
+      </div>
+    </div>
+    <dl className="member-profile-fields">
+      <div><dt>姓名</dt><dd>{member.member.full_name}</dd></div>
+      <div><dt>身份证号</dt><dd>{member.member.identity_card_number}</dd></div>
+      <div><dt>手机号</dt><dd>{member.member.phone}</dd></div>
+      <div><dt>微信号</dt><dd>{member.member.wechat}</dd></div>
+    </dl>
+  </section>;
+}
+
+function ledgerEntryLabel(entryType: MemberViewDto["ledger"][number]["entry_type"]): string {
+  if (entryType === "ADJUST") return "余额更正";
+  if (entryType === "HOLD") return "预订冻结";
+  if (entryType === "RELEASE") return "冻结释放";
+  if (entryType === "CONSUME") return "入住核销";
+  return "权益到期";
+}
+
+export function ledgerEntryDisplayQuantity(
+  entryType: MemberViewDto["ledger"][number]["entry_type"],
+  quantityDelta: number
+): { label: string; quantity: number; prefix: string; tone: string } {
+  if (entryType === "CONSUME") return { label: "本次核销", quantity: 1, prefix: "", tone: "is-negative" };
+  return {
+    label: "余额",
+    quantity: quantityDelta,
+    prefix: quantityDelta > 0 ? "+" : "",
+    tone: quantityDelta > 0 ? "is-positive" : quantityDelta < 0 ? "is-negative" : ""
+  };
+}
+
+function CorrectEntitlementBalanceDialog({ propertyId, lot, currentBalance, onClose, onSubmit }: {
+  propertyId: string;
+  lot: MemberViewDto["lots"][number];
+  currentBalance: number;
+  onClose: () => void;
+  onSubmit: (request: CommandRequest) => void;
+}) {
+  const [targetBalance, setTargetBalance] = useState(String(currentBalance));
+  const [reason, setReason] = useState("");
+  const [validationError, setValidationError] = useState<string>();
+  const unit = lot.unit_kind === "ROOM_NIGHT" ? "间夜" : "床夜";
+
+  function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const target = parseEntitlementBalance(targetBalance);
+    if (target === undefined) {
+      setValidationError(`更正后剩余${unit}数必须是非负整数`);
+      return;
+    }
+    if (target === currentBalance) {
+      setValidationError("更正后余额必须与当前余额不同");
+      return;
+    }
+    if (!reason.trim()) {
+      setValidationError("必须填写余额更正原因");
+      return;
+    }
+    onSubmit({
+      commandType: "CORRECT_MEMBER_ENTITLEMENT_BALANCE",
+      title: "更正会员余额",
+      description: `确认后系统将从当前 ${currentBalance} ${unit}更正为 ${target} ${unit}，并保留原账本历史。`,
+      input: {
+        propertyId,
+        entitlementLotId: lot.id,
+        expectedAvailableBalance: currentBalance,
+        targetAvailableBalance: target,
+        adjustmentReason: reason.trim()
+      }
+    });
+  }
+
+  return <Modal title="更正会员余额" onClose={onClose} footer={null}>
+    <form className="modal-form" onSubmit={submit}>
+      <div className="form-grid">
+        <label>当前可用余额<input value={`${currentBalance} ${unit}`} disabled /></label>
+        <label>{`更正后剩余${unit}数`}<input type="number" min="0" step="1" inputMode="numeric" value={targetBalance} onChange={(event) => { setTargetBalance(event.target.value); setValidationError(undefined); }} required data-testid="target-entitlement-balance" /></label>
+        <label className="span-two">更正原因<textarea rows={3} value={reason} onChange={(event) => { setReason(event.target.value); setValidationError(undefined); }} required maxLength={1000} data-testid="entitlement-adjustment-reason" /></label>
+      </div>
+      {validationError ? <InlineError error={new Error(validationError)} /> : null}
+      <div className="form-actions"><button type="button" className="button button-secondary" onClick={onClose}>取消</button><button type="submit" className="button button-primary">核对余额更正</button></div>
+    </form>
+  </Modal>;
+}
+
+function MemberEntitlementsPanel({ view, disabled, onCorrect }: {
+  view: MemberViewDto;
+  disabled: boolean;
+  onCorrect: (lot: MemberViewDto["lots"][number], currentBalance: number) => void;
+}) {
+  const balanceByLot = new Map(view.lotBalances.map((balance) => [balance.lotId, balance.availableUnits]));
+  const orderByLot = new Map(view.membershipOrders.flatMap((summary) => summary.order.entitlement_lot_id ? [[summary.order.entitlement_lot_id, summary.order] as const] : []));
+  const formalLotIds = formalEntitlementLotIds(view.membershipOrders);
+  const formalLots = view.lots.filter((lot) => formalLotIds.has(lot.id));
+  const formalLedger = view.ledger.filter((entry) => formalLotIds.has(entry.lot_id));
+  const contractById = new Map(view.contracts.map((contract) => [contract.id, contract]));
+  const lotById = new Map(formalLots.map((lot) => [lot.id, lot]));
+  const formalBalance = formalLots.reduce((total, lot) => {
+    total[lot.unit_kind] += balanceByLot.get(lot.id) ?? 0;
+    return total;
+  }, { ROOM_NIGHT: 0, BED_NIGHT: 0 });
+  return <section className="member-entitlements-panel" aria-labelledby="member-entitlements-heading">
+    <div className="section-title-row">
+      <div><span className="section-kicker">会员权益</span><h2 id="member-entitlements-heading">可住宿余额</h2></div>
+      <span>截至 {formatDate(view.balanceAsOfDate)}</span>
+    </div>
+    <div className="member-balance-summary" data-testid="member-balance-summary">
+      <div><span>间夜余额</span><strong>{formalBalance.ROOM_NIGHT} 间夜</strong></div>
+      <div><span>床夜余额</span><strong>{formalBalance.BED_NIGHT} 床夜</strong></div>
+    </div>
+    {!formalLots.length ? <EmptyState title="尚无可住宿权益" detail="会员订单生效后，系统会在这里显示对应的间夜或床夜。" /> : <div className="member-entitlement-lots">
+      {formalLots.map((lot) => {
+        const order = orderByLot.get(lot.id)!;
+        const contract = contractById.get(lot.contract_id);
+        const available = balanceByLot.get(lot.id) ?? 0;
+        const unit = lot.unit_kind === "ROOM_NIGHT" ? "间夜" : "床夜";
+        const active = isEntitlementLotActive(contract, lot.expires_on, view.balanceAsOfDate);
+        return <article key={lot.id} className="member-entitlement-lot" data-testid="member-entitlement-lot">
+          <div className="member-entitlement-heading"><div><h3>{order.product_name}</h3><p>{active ? "有效" : "已失效"}</p></div><strong>{available} {unit}</strong></div>
+          <dl>
+            <div><dt>会员类型</dt><dd>{order.product_name}</dd></div>
+            <div><dt>有效期</dt><dd>{contract ? `${formatDate(contract.valid_from)} 至 ${formatDate(contract.valid_until)}` : `至 ${formatDate(lot.expires_on)}`}</dd></div>
+            <div><dt>初始发放</dt><dd>{lot.total_units} {unit}</dd></div>
+            <div><dt>当前可用</dt><dd><strong>{available} {unit}</strong></dd></div>
+          </dl>
+          {active ? <button type="button" className="button button-secondary button-small" disabled={disabled} onClick={() => onCorrect(lot, available)} data-testid="correct-entitlement-balance"><PencilLine aria-hidden="true" size={15} />更正余额</button> : null}
+        </article>;
+      })}
+    </div>}
+    <section className="member-ledger-history" aria-labelledby="member-ledger-heading" data-testid="member-ledger-history">
+      <div className="membership-subheading"><h3 id="member-ledger-heading">权益变动历史</h3><span>{formalLedger.length} 条</span></div>
+      {!formalLedger.length ? <p className="membership-empty-line">尚无冻结、释放、核销或更正记录</p> : <ol>
+        {[...formalLedger].reverse().map((entry) => {
+          const lot = lotById.get(entry.lot_id);
+          const order = orderByLot.get(entry.lot_id)!;
+          const unit = lot?.unit_kind === "BED_NIGHT" ? "床夜" : "间夜";
+          const displayQuantity = ledgerEntryDisplayQuantity(entry.entry_type, entry.quantity_delta);
+          return <li key={entry.fact_id} data-testid={`member-ledger-entry-${entry.entry_type.toLowerCase()}`}>
+            <div><strong>{ledgerEntryLabel(entry.entry_type)}</strong><span className={displayQuantity.tone} data-testid="member-ledger-quantity">{displayQuantity.label} {displayQuantity.prefix}{displayQuantity.quantity} {unit}</span></div>
+            <small>{order.product_name} · {entry.service_date ? `住宿日期 ${formatDate(entry.service_date)}` : formatDate(entry.created_at)}</small>
+            {entry.entry_type === "ADJUST" ? <p>{entry.reason}</p> : null}
+          </li>;
+        })}
+      </ol>}
+    </section>
+  </section>;
+}
+
+function MembershipOrdersPanel({ view, disabled, onCreate, onPayment, onCorrect, onActivate }: {
+  view: MemberViewDto;
+  disabled: boolean;
+  onCreate: () => void;
+  onPayment: (summary: MembershipOrderSummaryDto) => void;
+  onCorrect: (summary: MembershipOrderSummaryDto, fact: MembershipPaymentFactDto) => void;
+  onActivate: (summary: MembershipOrderSummaryDto) => void;
+}) {
+  return <section className="membership-orders-panel" aria-labelledby="membership-orders-heading">
+    <div className="section-title-row">
+      <div><span className="section-kicker">会员购买</span><h2 id="membership-orders-heading">会员订单</h2></div>
+      <button type="button" className="button button-primary" onClick={onCreate} disabled={disabled || view.membershipProducts.length === 0} data-testid="create-membership-order"><CreditCard aria-hidden="true" size={17} />办理会员</button>
+    </div>
+    {!view.membershipOrders.length ? <EmptyState title="尚无会员订单" detail="办理会员后，可登记多笔企微收款并由工作人员明确生效。" /> : <div className="membership-order-list">
+      {view.membershipOrders.map((summary) => {
+        const { order, paymentFacts } = summary;
+        const reversedIds = new Set(paymentFacts.filter((fact) => fact.reverses_fact_id).map((fact) => fact.reverses_fact_id));
+        const activeCollections = paymentFacts.filter((fact) => fact.fact_type === "COLLECTION" && !reversedIds.has(fact.fact_id));
+        return <article className="membership-order-item" key={order.id} data-testid="membership-order-item">
+          <div className="membership-order-heading">
+            <div><h3>{order.product_name}</h3><p>{entitlementLabel(order.entitlement_unit_kind, order.entitlement_units)} · {order.allowed_inventory_kind === "ROOM" ? "按房使用" : "按床使用"}</p></div>
+            <span className={`membership-status membership-status-${order.status.toLowerCase()}`}>{order.status === "ACTIVE" ? "已生效" : "待生效"}</span>
+          </div>
+          <dl className="membership-order-pricing">
+            <div><dt>标价</dt><dd>{formatMinor(order.listed_price_minor, order.currency)}</dd></div>
+            <div><dt>成交价</dt><dd><strong>{formatMinor(order.agreed_price_minor, order.currency)}</strong></dd></div>
+            <div><dt>调价差额</dt><dd>{formatMinor(order.price_adjustment_minor, order.currency)}</dd></div>
+            <div><dt>有效收款</dt><dd><strong>{formatMinor(summary.paymentTotalMinor, order.currency)}</strong></dd></div>
+          </dl>
+          {order.price_adjustment_reason ? <p className="membership-adjustment-reason"><span>调价原因</span>{order.price_adjustment_reason}</p> : null}
+          <div className={`membership-payment-difference ${summary.paymentDifferenceMinor === 0 ? "is-balanced" : ""}`} data-testid="membership-payment-difference">
+            {summary.paymentDifferenceMinor === 0
+              ? "收款合计与成交价一致"
+              : summary.paymentDifferenceMinor < 0
+                ? `收款比成交价少 ${formatMinor(Math.abs(summary.paymentDifferenceMinor), order.currency)}`
+                : `收款比成交价多 ${formatMinor(summary.paymentDifferenceMinor, order.currency)}`}
+            <small>仅提示差额，不代表自动到账、结清或改价。</small>
+          </div>
+          {order.status === "ACTIVE" ? <div className="membership-activation-summary" data-testid="membership-activation-summary"><BadgeCheck aria-hidden="true" size={18} /><div><strong>{formatDate(order.valid_from ?? undefined)} 至 {formatDate(order.valid_until ?? undefined)}</strong><span>已发放 {entitlementLabel(order.entitlement_unit_kind, order.entitlement_units)}</span></div></div> : null}
+          <section className="membership-payments" aria-label={`${order.product_name}企微收款`}>
+            <div className="membership-subheading"><h4>企微收款记录</h4><span>{activeCollections.length} 笔有效收款</span></div>
+            {!paymentFacts.length ? <p className="membership-empty-line">尚未登记企微收款</p> : <ol>
+              {paymentFacts.map((fact) => {
+                const reversed = fact.fact_type === "COLLECTION" && reversedIds.has(fact.fact_id);
+                return <li key={fact.fact_id} className={fact.fact_type === "REVERSAL" || reversed ? "is-reversed" : ""}>
+                  <div>
+                    <strong>{fact.fact_type === "REVERSAL" ? "冲销原收款" : fact.corrects_fact_id ? "更正后收款" : "企微收款"}</strong>
+                    <span>{formatMinor(fact.net_effect_minor, fact.currency)}</span>
+                    {fact.transaction_reference ? <code>{fact.transaction_reference}</code> : null}
+                    {reversed ? <small>已由后续更正冲销</small> : fact.note ? <small>{fact.note}</small> : null}
+                  </div>
+                  {order.status === "DRAFT" && fact.fact_type === "COLLECTION" && !reversed ? <button type="button" className="button button-secondary button-small" onClick={() => onCorrect(summary, fact)} disabled={disabled}><PencilLine aria-hidden="true" size={15} />更正</button> : null}
+                </li>;
+              })}
+            </ol>}
+          </section>
+          {order.status === "DRAFT" ? <div className="membership-order-actions">
+            <button type="button" className="button button-secondary" onClick={() => onPayment(summary)} disabled={disabled} data-testid="record-membership-payment"><CircleDollarSign aria-hidden="true" size={17} />登记企微收款</button>
+            <button type="button" className="button button-primary" onClick={() => onActivate(summary)} disabled={disabled} data-testid="activate-membership-order"><BadgeCheck aria-hidden="true" size={17} />生效会员订单</button>
+          </div> : null}
+        </article>;
+      })}
+    </div>}
+  </section>;
 }
 
 export function MembersPage() {
   const { principal, propertyId, refreshMeta } = useWorkspace();
   const commandRecovery = usePersistentCommandRecovery({ subjectId: principal.subjectId, scopeId: `property:${propertyId}` });
   const [searchInput, setSearchInput] = useState("");
-  const [searchIdentity, setSearchIdentity] = useState("");
+  const [searchQuery, setSearchQuery] = useState("");
   const [members, setMembers] = useState<MemberSummaryDto[]>([]);
   const [selectedMemberId, setSelectedMemberId] = useState("");
-  const [selectedContractId, setSelectedContractId] = useState("");
   const [member, setMember] = useState<MemberViewDto>();
   const [loadingList, setLoadingList] = useState(true);
   const [loadingMember, setLoadingMember] = useState(false);
   const [error, setError] = useState<unknown>();
   const [recoveryError, setRecoveryError] = useState<unknown>();
   const [refreshToken, setRefreshToken] = useState(0);
-  const [action, setAction] = useState<{ type: MemberAction; lot: EntitlementLotDto }>();
   const [creatingMember, setCreatingMember] = useState(false);
-  const [addingLot, setAddingLot] = useState(false);
+  const [creatingMembershipOrder, setCreatingMembershipOrder] = useState(false);
+  const [paymentOrder, setPaymentOrder] = useState<MembershipOrderSummaryDto>();
+  const [correctingPayment, setCorrectingPayment] = useState<{ summary: MembershipOrderSummaryDto; fact: MembershipPaymentFactDto }>();
+  const [correctingEntitlement, setCorrectingEntitlement] = useState<{ lot: MemberViewDto["lots"][number]; currentBalance: number }>();
   const [command, setCommand] = useState<CommandRequest>();
   const [recoveryDialogOpen, setRecoveryDialogOpen] = useState(false);
   const commandsBlocked = commandRecovery.blocked;
 
   useEffect(() => {
-    setAction(undefined);
     setCreatingMember(false);
-    setAddingLot(false);
+    setCreatingMembershipOrder(false);
+    setPaymentOrder(undefined);
+    setCorrectingPayment(undefined);
+    setCorrectingEntitlement(undefined);
     setCommand(undefined);
     setRecoveryDialogOpen(false);
     setRecoveryError(undefined);
+    setSelectedMemberId("");
   }, [propertyId]);
 
-  const loadMembers = useCallback(async () => {
+  useEffect(() => {
+    let current = true;
     setLoadingList(true);
     setError(undefined);
-    try {
-      const response = await api.members(propertyId, searchIdentity || undefined);
-      setMembers(response.members);
-    } catch (nextError) {
-      setError(nextError);
-    } finally {
-      setLoadingList(false);
-    }
-  }, [propertyId, searchIdentity]);
+    setMembers([]);
+    setMember(undefined);
+    api.members(propertyId, searchQuery || undefined)
+      .then((response) => {
+        if (current) setMembers(response.members);
+      })
+      .catch((nextError) => {
+        if (current) setError(nextError);
+      })
+      .finally(() => {
+        if (current) setLoadingList(false);
+      });
+    return () => { current = false; };
+  }, [propertyId, searchQuery, refreshToken]);
 
-  useEffect(() => { void loadMembers(); }, [loadMembers, refreshToken]);
-
-  const effectiveMemberId = members.some((summary) => summary.member.id === selectedMemberId)
-    ? selectedMemberId
-    : members[0]?.member.id ?? "";
+  const currentMemberId = effectiveMemberId(members, selectedMemberId);
 
   useEffect(() => {
-    if (!effectiveMemberId) {
+    if (!currentMemberId) {
       setMember(undefined);
       setLoadingMember(false);
       return;
     }
     let current = true;
+    setMember(undefined);
     setLoadingMember(true);
     setError(undefined);
-    api.member(effectiveMemberId, propertyId)
+    api.member(currentMemberId, propertyId)
       .then((response) => current && setMember(response))
-      .catch((nextError) => current && setError(nextError))
+      .catch((nextError) => {
+        if (current) {
+          setMember(undefined);
+          setError(nextError);
+        }
+      })
       .finally(() => current && setLoadingMember(false));
     return () => { current = false; };
-  }, [effectiveMemberId, propertyId, refreshToken]);
-
-  const activeContracts = member?.contracts.filter((contract) => contract.status === "ACTIVE") ?? [];
-  const effectiveContract = activeContracts.find((contract) => contract.id === selectedContractId) ?? activeContracts[0];
-  const expiredLotIds = useMemo(
-    () => new Set((member?.ledger ?? []).filter((entry) => entry.entry_type === "EXPIRE").map((entry) => entry.lot_id)),
-    [member?.ledger]
-  );
+  }, [currentMemberId, propertyId, refreshToken]);
 
   function search(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setSelectedMemberId("");
-    setSearchIdentity(searchInput.trim().toUpperCase());
+    setSearchQuery(normalizeMemberQuery(searchInput));
   }
 
   function refresh() {
@@ -291,6 +571,14 @@ export function MembersPage() {
     if (commandsBlocked) return;
     setRecoveryDialogOpen(false);
     setCommand(request);
+  }
+
+  function submitBusinessCommand(request: CommandRequest) {
+    setCreatingMembershipOrder(false);
+    setPaymentOrder(undefined);
+    setCorrectingPayment(undefined);
+    setCorrectingEntitlement(undefined);
+    startCommand(request);
   }
 
   function applyCommittedReceipt(receipt: { result?: Record<string, unknown> }) {
@@ -310,7 +598,7 @@ export function MembersPage() {
       refreshAfterClose = commandRecovery.pending.receipt?.businessCommitted === true;
       if (refreshAfterClose && commandRecovery.pending.receipt) applyCommittedReceipt(commandRecovery.pending.receipt);
       if (commandRecovery.clearResolved()) setRecoveryError(undefined);
-      else setRecoveryError(new Error("无法清除已收口的本地恢复记录；为避免重复权益写入，命令继续保持暂停"));
+      else setRecoveryError(new Error("无法清除已完成操作的本地恢复记录；为避免重复建档，写入继续暂停"));
     }
     setCommand(undefined);
     setRecoveryDialogOpen(false);
@@ -319,89 +607,48 @@ export function MembersPage() {
 
   return <div className="members-page">
     <header className="page-heading page-heading-actions">
-      <div><p className="eyebrow">Membership</p><h1>会员权益</h1><p>身份证唯一匹配、服务端余额与不可变权益事实</p></div>
+      <div><p className="eyebrow">会员管理</p><h1>会员档案</h1><p>查询和维护当前门店的会员资料</p></div>
       <button className="button button-secondary" type="button" onClick={refresh} disabled={loadingList || loadingMember}><RefreshCw className={loadingList || loadingMember ? "spin" : ""} aria-hidden="true" size={17} />刷新</button>
-      <button className="button button-secondary" type="button" onClick={() => setCreatingMember(true)} disabled={commandsBlocked} data-testid="create-member"><UserPlus aria-hidden="true" size={17} />登记会员</button>
-      <button className="button button-primary" type="button" onClick={() => setAddingLot(true)} disabled={commandsBlocked || !effectiveContract || !member || effectiveContract.valid_until < member.balanceAsOfDate} data-testid="add-entitlement-lot"><Plus aria-hidden="true" size={17} />新增权益批次</button>
+      <button className="button button-primary" type="button" onClick={() => setCreatingMember(true)} disabled={commandsBlocked} data-testid="create-member"><UserPlus aria-hidden="true" size={17} />新建会员</button>
     </header>
 
-    <InlineError error={recoveryError} title="恢复记录未收口" />
-    <InlineError error={commandRecovery.error} title="本地命令恢复记录不可用" />
-    {commandRecovery.pending ? <CommandRecoveryBar recovery={commandRecovery.pending} onOpen={openRecoveryDialog} testId="member-command-recovery" /> : null}
+    <InlineError error={recoveryError} title="恢复记录未完成" />
+    <InlineError error={commandRecovery.error} title="本地操作恢复记录不可用" />
+    {commandRecovery.pending ? <CommandRecoveryBar recovery={commandRecovery.pending} onOpen={openRecoveryDialog} testId="member-command-recovery" businessFacing /> : null}
 
-    <form className="member-selector" role="search" aria-label="按身份证号搜索会员" onSubmit={search}>
-      <label htmlFor="member-identity-search">身份证号<input id="member-identity-search" value={searchInput} onChange={(event) => setSearchInput(event.target.value)} placeholder="精确身份证号；留空显示全部" data-testid="member-identity-search" /></label>
+    <form className="member-search" role="search" aria-label="搜索会员" onSubmit={search}>
+      <label htmlFor="member-search-query">搜索会员<input id="member-search-query" value={searchInput} onChange={(event) => setSearchInput(event.target.value)} placeholder="姓名、身份证号、手机号或微信号" data-testid="member-search-query" /></label>
       <button className="button button-secondary" type="submit" disabled={loadingList}><Search aria-hidden="true" size={17} />搜索</button>
-      {searchIdentity ? <button className="button button-secondary" type="button" onClick={() => { setSearchInput(""); setSearchIdentity(""); }}>清除</button> : null}
+      {searchQuery ? <button className="button button-secondary" type="button" onClick={() => { setSearchInput(""); setSearchQuery(""); setSelectedMemberId(""); }}>清除</button> : null}
     </form>
 
-    {members.length ? <section className="member-selector" aria-label="会员选择">
-      <label htmlFor="member-select">会员<select id="member-select" value={effectiveMemberId} onChange={(event) => { setSelectedMemberId(event.target.value); setSelectedContractId(""); }}>
-        {members.map((summary) => <option key={summary.member.id} value={summary.member.id}>{summary.member.full_name} · {summary.member.identity_card_number}</option>)}
-      </select></label>
-      {member?.contracts.length ? <label htmlFor="member-contract-select">有效合同<select id="member-contract-select" value={effectiveContract?.id ?? ""} onChange={(event) => setSelectedContractId(event.target.value)}>
-        {activeContracts.map((contract) => <option key={contract.id} value={contract.id}>{formatDate(contract.valid_from)} 至 {formatDate(contract.valid_until)} · {contract.id}</option>)}
-      </select></label> : null}
-      {effectiveContract ? <StatusBadge value={effectiveContract.status} /> : null}
-    </section> : null}
-
-    <InlineError error={error} title="无法载入会员权益" />
-    {loadingList || loadingMember ? <LoadingBlock label="正在载入会员权益" /> : !members.length ? <EmptyState title="未找到会员" detail="可按身份证号登记新会员，或清除搜索条件查看全部。" /> : member ? <>
-      <section className="member-contract-band" aria-labelledby="member-profile-heading">
-        <div><span>会员档案</span><strong id="member-profile-heading">{member.member.full_name}</strong><code>{member.member.id}</code></div>
-        <div><span>身份证号</span><strong>{member.member.identity_card_number}</strong><small>唯一业务键</small></div>
-        <div><span>联系方式</span><strong>{member.member.phone}</strong><small>{member.member.wechat}</small></div>
-        <div><span>合同</span><strong>{member.contracts.length}</strong><small>{effectiveContract ? `${formatDate(effectiveContract.valid_from)} 至 ${formatDate(effectiveContract.valid_until)}` : "无有效合同"}</small></div>
-      </section>
-
-      <section className="member-summary" aria-label="会员权益汇总">
-        <div><span>余额日期</span><strong>{formatDate(member.balanceAsOfDate)}</strong></div>
-        <div><span>可用 ROOM_NIGHT</span><strong>{member.availableBalance.ROOM_NIGHT}</strong></div>
-        <div><span>可用 BED_NIGHT</span><strong>{member.availableBalance.BED_NIGHT}</strong></div>
-        <div><span>权益 Lot</span><strong>{member.lots.length}</strong></div>
-        <div><span>权益事实</span><strong>{member.ledger.length}</strong></div>
-      </section>
-
-      {member.externalReferences.length ? <section className="member-section" aria-labelledby="member-references-heading">
-        <div className="section-title-row"><h2 id="member-references-heading">外部申请引用</h2><span>{member.externalReferences.length}</span></div>
-        <div className="compact-list">{member.externalReferences.map((reference) => <div key={reference.id}><span>{reference.provider}</span><code>{reference.external_record_id}</code><small>{reference.source_container_id} · {reference.source_table_id}</small></div>)}</div>
-      </section> : null}
-
-      <section className="member-section" aria-labelledby="entitlement-lots-heading">
-        <div className="section-title-row"><h2 id="entitlement-lots-heading">权益 Lots</h2><span>{member.lots.length}</span></div>
-        {member.lots.length ? <div className="table-region" role="region" aria-label="会员权益 Lots" tabIndex={0}>
-          <table className="data-table member-lots-table">
-            <thead><tr><th scope="col">Lot / 类型</th><th scope="col">Lot 初始基数</th><th scope="col">服务端可用余额</th><th scope="col">到期日</th><th scope="col">状态</th><th scope="col">操作</th></tr></thead>
-            <tbody>{member.lots.map((lot) => {
-              const explicitlyExpired = expiredLotIds.has(lot.id);
-              const lotUiState = entitlementLotUiState(member, lot, explicitlyExpired);
-              return <tr key={lot.id}>
-                <th scope="row"><strong>{lot.unit_kind}</strong><code>{lot.id}</code></th>
-                <td>{lot.total_units}</td>
-                <td><strong className="tabular-number">{serverAvailableUnits(member, lot.id)}</strong></td>
-                <td>{formatDate(lot.expires_on)}</td>
-                <td><StatusBadge value={lotUiState.expired ? "EXPIRED" : "ACTIVE"} /></td>
-                <td><div className="row-actions"><button className="button button-compact button-secondary" type="button" onClick={() => setAction({ type: "ADJUST_MEMBER_ENTITLEMENT", lot })} disabled={commandsBlocked || !lotUiState.canAdjust}><SlidersHorizontal aria-hidden="true" size={16} />调整</button><button className="icon-button danger-icon" type="button" onClick={() => setAction({ type: "EXPIRE_MEMBER_ENTITLEMENT", lot })} disabled={commandsBlocked || !lotUiState.canRecordExpiration} aria-label={`记录到期权益 lot ${lot.id}`} title={lotUiState.canRecordExpiration ? "记录自然到期事实" : explicitlyExpired ? "已记录到期事实" : "尚未自然到期"}><CalendarX2 aria-hidden="true" size={17} /></button></div></td>
-              </tr>;
-            })}</tbody>
-          </table>
-        </div> : <EmptyState title="该会员没有权益 Lot" detail="选择有效合同后可新增独立权益批次。" />}
-      </section>
-
-      <section className="member-section" aria-labelledby="entitlement-ledger-heading">
-        <div className="section-title-row"><h2 id="entitlement-ledger-heading">权益 Ledger</h2><span>{member.ledger.length}</span></div>
-        {member.ledger.length ? <div className="table-region" role="region" aria-label="会员权益事实" tabIndex={0}>
-          <table className="data-table member-ledger-table">
-            <thead><tr><th scope="col">Fact ID</th><th scope="col">类型</th><th scope="col">数量变化</th><th scope="col">服务日期</th><th scope="col">订单 / Coverage</th><th scope="col">原因</th></tr></thead>
-            <tbody>{member.ledger.map((entry) => <tr key={entry.fact_id}><th scope="row"><code>{entry.fact_id}</code><small>{formatDateTime(entry.created_at)}</small></th><td><StatusBadge value={entry.entry_type} /></td><td><strong className={entry.quantity_delta < 0 ? "quantity-negative" : "quantity-positive"}>{signedQuantity(entry.quantity_delta)}</strong></td><td>{entry.service_date ?? "-"}</td><td><code>{entry.order_id ?? "-"}</code><small>{entry.coverage_id ?? "-"}</small></td><td className="member-ledger-reason">{entry.reason}</td></tr>)}</tbody>
-          </table>
-        </div> : <EmptyState title="尚无权益事实" detail="冻结、释放、核销、调整或到期后会在此形成永久事实。" />}
-      </section>
-    </> : null}
+    <InlineError error={error} title="无法载入会员档案" />
+    {loadingList ? <LoadingBlock label="正在载入会员列表" /> : !members.length ? <EmptyState title="未找到会员" detail="可更换搜索条件，或新建一位会员。" /> : <div className="member-directory">
+      <MemberList members={members} selectedMemberId={currentMemberId} onSelect={setSelectedMemberId} />
+      {loadingMember ? <LoadingBlock label="正在载入会员档案" /> : member ? <div className="member-detail-stack">
+        <MemberProfile member={member} />
+        <MemberEntitlementsPanel view={member} disabled={commandsBlocked} onCorrect={(lot, currentBalance) => setCorrectingEntitlement({ lot, currentBalance })} />
+        <MembershipOrdersPanel
+          view={member}
+          disabled={commandsBlocked}
+          onCreate={() => setCreatingMembershipOrder(true)}
+          onPayment={setPaymentOrder}
+          onCorrect={(summary, fact) => setCorrectingPayment({ summary, fact })}
+          onActivate={(summary) => startCommand({
+            commandType: "ACTIVATE_MEMBERSHIP_ORDER",
+            title: "生效会员订单",
+            description: "确认当前企微收款合计和差额后，使会员订单生效并从今天起计算一年有效期。",
+            input: { propertyId, membershipOrderId: summary.order.id }
+          })}
+        />
+      </div> : null}
+    </div>}
 
     {creatingMember ? <CreateMemberDialog propertyId={propertyId} onClose={() => setCreatingMember(false)} onSubmit={(request) => { if (commandsBlocked) return; setCreatingMember(false); startCommand(request); }} /> : null}
-    {action && member ? <EntitlementActionDialog action={action.type} lot={action.lot} propertyId={propertyId} balanceAsOfDate={member.balanceAsOfDate} onClose={() => setAction(undefined)} onSubmit={(request) => { if (commandsBlocked) return; setAction(undefined); startCommand(request); }} /> : null}
-    {addingLot && effectiveContract && member ? <AddEntitlementLotDialog contract={effectiveContract} propertyId={propertyId} balanceAsOfDate={member.balanceAsOfDate} onClose={() => setAddingLot(false)} onSubmit={(request) => { if (commandsBlocked) return; setAddingLot(false); startCommand(request); }} /> : null}
+    {creatingMembershipOrder && member ? <CreateMembershipOrderDialog propertyId={propertyId} member={member.member} products={member.membershipProducts} onClose={() => setCreatingMembershipOrder(false)} onSubmit={submitBusinessCommand} /> : null}
+    {paymentOrder ? <MembershipPaymentDialog propertyId={propertyId} summary={paymentOrder} onClose={() => setPaymentOrder(undefined)} onSubmit={submitBusinessCommand} /> : null}
+    {correctingPayment ? <MembershipPaymentDialog propertyId={propertyId} summary={correctingPayment.summary} correction={correctingPayment.fact} onClose={() => setCorrectingPayment(undefined)} onSubmit={submitBusinessCommand} /> : null}
+    {correctingEntitlement ? <CorrectEntitlementBalanceDialog propertyId={propertyId} lot={correctingEntitlement.lot} currentBalance={correctingEntitlement.currentBalance} onClose={() => setCorrectingEntitlement(undefined)} onSubmit={(request) => { setCorrectingEntitlement(undefined); submitBusinessCommand(request); }} /> : null}
     {command ? <CommandDialog
       key={recoveryDialogOpen ? `recovery-${commandRecovery.pending?.confirmationKey ?? "missing"}` : "new-member-command"}
       request={command}
@@ -410,6 +657,14 @@ export function MembersPage() {
         initialConfirmationKey: commandRecovery.pending.confirmationKey,
         ...(commandRecovery.pending.receipt ? { initialReceipt: commandRecovery.pending.receipt } : {})
       } : {})}
+      onCommitted={(receipt) => {
+        applyCommittedReceipt(receipt);
+        if (shouldClearMemberSearchAfterCommit(command.commandType)) {
+          setSearchInput("");
+          setSearchQuery("");
+        }
+        setRefreshToken((value) => value + 1);
+      }}
       onProgress={(progress) => commandRecovery.track(command, progress)}
     /> : null}
   </div>;

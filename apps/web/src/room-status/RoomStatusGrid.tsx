@@ -43,7 +43,11 @@ import {
 import {
   formatRoomStatusDate,
   roomStatusPresentation,
+  roomStatusRowSalesLabel,
   roomStatusSourceLabels,
+  roomStatusUnitDescription,
+  roomStatusUnitLabel,
+  roomStatusUnitLocationLabel,
   RoomStatusMark,
   RoomStatusWarning,
   useRoomStatusMobileViewport
@@ -68,6 +72,17 @@ interface BedOccupancyTooltipState {
   top: number;
   maxHeight: number;
   placement: "ABOVE" | "BELOW";
+}
+
+interface PointerSelectionState {
+  pointerId: number;
+  unitId: string;
+  anchorDate: string;
+  lastServiceDate: string;
+  selection: RoomStatusSelection;
+  touch: boolean;
+  row: HTMLElement;
+  sourceCell: HTMLDivElement;
 }
 
 const roomStatusWeekdayFormatter = new Intl.DateTimeFormat("zh-CN", { weekday: "short", timeZone: "UTC" });
@@ -147,7 +162,7 @@ function cellAccessibleName(
   day: RoomStatusDayDto | null,
   bedOccupancy: RoomStatusBedOccupancyDto | null
 ): string {
-  if (!day) return `${unit.name}，${formatRoomStatusDate(serviceDate)}，状态未知，服务端未返回逐日事实`;
+  if (!day) return `${roomStatusUnitLabel(unit)}，${formatRoomStatusDate(serviceDate)}，状态未知，服务端未返回逐日事实`;
   const status = roomStatusPresentation[day.status].label;
   const intervals = unit.intervals.filter((interval) => day.intervalIds.includes(interval.id));
   const sources = intervals.map((interval) => [
@@ -155,10 +170,10 @@ function cellAccessibleName(
     interval.label,
     interval.primaryOccupantLabel ? `主要居住人 ${interval.primaryOccupantLabel}` : null
   ].filter(Boolean).join(" "));
-  const conflicts = day.conflicts.map((conflict) => `阻断冲突 ${conflict.reason}，${conflict.sourceReference.label}`);
-  const availability = day.available ? "服务端标记可售" : "服务端标记不可售";
+  const conflicts = day.conflicts.length ? ["已有住宿，不能重复安排"] : [];
+  const availability = day.available ? "可以安排" : "当前不可安排";
   const occupancy = bedOccupancy ? bedOccupancyDescription(bedOccupancy) : null;
-  return [unit.name, formatRoomStatusDate(serviceDate), status, availability, occupancy, ...sources, ...conflicts]
+  return [roomStatusUnitLabel(unit), formatRoomStatusDate(serviceDate), status, availability, occupancy, ...sources, ...conflicts]
     .filter(Boolean)
     .join("，");
 }
@@ -171,9 +186,8 @@ function isCellSelected(selection: RoomStatusSelection | null, unitId: string, s
 }
 
 function rowDescription(unit: RoomStatusUnitDto): string {
-  const salesMode = unit.salesMode === "WHOLE_ROOM" ? "整房销售" : unit.salesMode === "BED_SPLIT" ? "拆床销售" : "不可售";
   const kind = unit.kind === "ROOM" ? "房间" : "床位";
-  return `${kind}，${salesMode}，容纳 ${unit.capacity} 人`;
+  return `${kind}，${roomStatusRowSalesLabel(unit)}，容纳 ${unit.capacity} 人`;
 }
 
 const tabbableSelector = [
@@ -231,18 +245,37 @@ export function RoomStatusGrid({
   const isMobile = useRoomStatusMobileViewport();
   const scrollRef = useRef<HTMLDivElement>(null);
   const cellRefs = useRef(new Map<string, HTMLDivElement>());
-  const pointerSelection = useRef<{ pointerId: number; unitId: string; anchorDate: string; touch: boolean } | null>(null);
+  const pointerSelection = useRef<PointerSelectionState | null>(null);
   const scrollFrame = useRef<number | null>(null);
   const scrollRestored = useRef(false);
   const focusRestored = useRef(false);
   const lastFocusRequestToken = useRef(focusRequestToken);
   const pendingKeyboardFocus = useRef<RoomStatusCellFocus | null>(null);
   const [touchSelectionMode, setTouchSelectionMode] = useState(false);
+  const [draggingUnitId, setDraggingUnitId] = useState<string | null>(null);
+  const [pointerPreviewSelection, setPointerPreviewSelection] = useState<RoomStatusSelection | null>(null);
   const [bedOccupancyTooltip, setBedOccupancyTooltip] = useState<BedOccupancyTooltipState | null>(null);
   const bedOccupancyTooltipDismissTimer = useRef<number | null>(null);
   const bedOccupancyTooltipRef = useRef<HTMLDivElement>(null);
   const bedOccupancyTooltipTriggerRef = useRef<HTMLDivElement | null>(null);
   const suppressBedOccupancyTooltipFocusRef = useRef<HTMLDivElement | null>(null);
+  const finishPointerSelection = useCallback((pointerId?: number, commit = false) => {
+    const active = pointerSelection.current;
+    if (!active || (pointerId !== undefined && active.pointerId !== pointerId)) return false;
+    pointerSelection.current = null;
+    if (active.sourceCell.hasPointerCapture(active.pointerId)) {
+      try {
+        active.sourceCell.releasePointerCapture(active.pointerId);
+      } catch {
+        // The browser may release capture while this handler is running.
+      }
+    }
+    setDraggingUnitId(null);
+    setPointerPreviewSelection(null);
+    if (active.touch) setTouchSelectionMode(false);
+    if (commit) onSelectionChange(active.selection);
+    return true;
+  }, [onSelectionChange]);
   const cancelBedOccupancyTooltipDismiss = useCallback(() => {
     if (bedOccupancyTooltipDismissTimer.current === null) return;
     window.clearTimeout(bedOccupancyTooltipDismissTimer.current);
@@ -358,37 +391,37 @@ export function RoomStatusGrid({
     const handlePointerMove = (event: PointerEvent) => {
       const active = pointerSelection.current;
       if (!active || event.pointerId !== active.pointerId) return;
-      const pointedElement = document.elementFromPoint(event.clientX, event.clientY);
-      const intervalTarget = pointedElement?.closest<HTMLElement>(".room-status-interval") ?? null;
-      const directTarget = intervalTarget
-        ? null
-        : pointedElement?.closest<HTMLElement>("[data-room-status-cell='true']") ?? null;
-      const pointedRow = pointedElement?.closest<HTMLElement>("[data-room-status-row]");
-      const target = directTarget ?? [...(pointedRow?.querySelectorAll<HTMLElement>("[data-room-status-cell='true']") ?? [])]
+      event.preventDefault();
+      const target = [...active.row.querySelectorAll<HTMLElement>("[data-room-status-cell='true']")]
         .find((cell) => {
           const bounds = cell.getBoundingClientRect();
           return event.clientX >= bounds.left && event.clientX < bounds.right;
         });
-      if (!target || target.dataset.unitId !== active.unitId || !target.dataset.serviceDate) return;
-      onSelectionChange(selectionFromCells(active.unitId, active.anchorDate, target.dataset.serviceDate));
+      const serviceDate = target?.dataset.serviceDate;
+      if (!serviceDate || serviceDate === active.lastServiceDate) return;
+      active.lastServiceDate = serviceDate;
+      active.selection = selectionFromCells(active.unitId, active.anchorDate, serviceDate);
+      setPointerPreviewSelection(active.selection);
     };
-    const handlePointerEnd = (event: PointerEvent) => {
-      const active = pointerSelection.current;
-      if (active?.pointerId !== event.pointerId) return;
-      pointerSelection.current = null;
-      if (active.touch) setTouchSelectionMode(false);
-    };
+    const handlePointerUp = (event: PointerEvent) => finishPointerSelection(event.pointerId, true);
+    const handlePointerCancel = (event: PointerEvent) => finishPointerSelection(event.pointerId);
+    const handleWindowBlur = () => finishPointerSelection();
     window.addEventListener("pointermove", handlePointerMove);
-    window.addEventListener("pointerup", handlePointerEnd);
-    window.addEventListener("pointercancel", handlePointerEnd);
+    window.addEventListener("pointerup", handlePointerUp);
+    window.addEventListener("pointercancel", handlePointerCancel);
+    window.addEventListener("lostpointercapture", handlePointerCancel, true);
+    window.addEventListener("blur", handleWindowBlur);
     return () => {
       window.removeEventListener("pointermove", handlePointerMove);
-      window.removeEventListener("pointerup", handlePointerEnd);
-      window.removeEventListener("pointercancel", handlePointerEnd);
+      window.removeEventListener("pointerup", handlePointerUp);
+      window.removeEventListener("pointercancel", handlePointerCancel);
+      window.removeEventListener("lostpointercapture", handlePointerCancel, true);
+      window.removeEventListener("blur", handleWindowBlur);
     };
-  }, [onSelectionChange]);
+  }, [finishPointerSelection, onSelectionChange]);
 
   useEffect(() => () => {
+    pointerSelection.current = null;
     if (scrollFrame.current !== null) cancelAnimationFrame(scrollFrame.current);
     if (bedOccupancyTooltipDismissTimer.current !== null) {
       window.clearTimeout(bedOccupancyTooltipDismissTimer.current);
@@ -454,6 +487,7 @@ export function RoomStatusGrid({
         closeBedOccupancyTooltip();
         return;
       }
+      finishPointerSelection();
       onSelectionChange(null);
       return;
     }
@@ -475,9 +509,26 @@ export function RoomStatusGrid({
     const touch = event.pointerType === "touch";
     if (touch && !touchSelectionMode) return;
     event.preventDefault();
-    pointerSelection.current = { pointerId: event.pointerId, unitId: unit.id, anchorDate: serviceDate, touch };
+    const row = event.currentTarget.closest<HTMLElement>("[data-room-status-row]");
+    if (!row) return;
+    pointerSelection.current = {
+      pointerId: event.pointerId,
+      unitId: unit.id,
+      anchorDate: serviceDate,
+      lastServiceDate: serviceDate,
+      selection: selectionFromCells(unit.id, serviceDate, serviceDate),
+      touch,
+      row,
+      sourceCell: event.currentTarget
+    };
+    try {
+      event.currentTarget.setPointerCapture(event.pointerId);
+    } catch {
+      // Synthetic pointer events used by assistive and test tooling may not own a native pointer.
+    }
+    setDraggingUnitId(unit.id);
+    setPointerPreviewSelection(pointerSelection.current.selection);
     onFocusedCellChange({ unitId: unit.id, serviceDate });
-    onSelectionChange(selectionFromCells(unit.id, serviceDate, serviceDate));
     event.currentTarget.focus();
     closeBedOccupancyTooltip();
   };
@@ -572,7 +623,7 @@ export function RoomStatusGrid({
 
   return (
     <section
-      className={`room-status-grid-section${touchSelectionMode ? " is-touch-selection" : ""}`}
+      className={`room-status-grid-section${touchSelectionMode ? " is-touch-selection" : ""}${draggingUnitId ? " is-drag-selecting" : ""}`}
       aria-labelledby="room-status-grid-heading"
       data-testid="room-status-board-range"
       data-range-arrival={board.range.arrivalDate}
@@ -660,7 +711,7 @@ export function RoomStatusGrid({
             const rowLanes = Math.max(1, ...positionedIntervals.map((item) => item.lane + 1));
             return (
               <div
-                className={`room-status-grid-row room-status-grid-row-depth-${depth}`}
+                className={`room-status-grid-row room-status-grid-row-depth-${depth}${draggingUnitId === unit.id ? " is-drag-source-row" : ""}`}
                 role="row"
                 key={unit.id}
                 data-room-status-row={unit.id}
@@ -673,7 +724,7 @@ export function RoomStatusGrid({
                       type="button"
                       className="room-status-expand-button"
                       aria-expanded={expanded}
-                      aria-label={`${expanded ? "收起" : "展开"}${unit.name}床位`}
+                      aria-label={`${expanded ? "收起" : "展开"}${roomStatusUnitLabel(unit)}床位`}
                       title={`${expanded ? "收起" : "展开"}床位`}
                       onClick={() => onToggleRoom(unit.id)}
                     >
@@ -681,8 +732,8 @@ export function RoomStatusGrid({
                     </button>
                   ) : <span className="room-status-expand-spacer" aria-hidden="true" />}
                   <button type="button" className="room-status-resource-detail" onClick={() => onInspectUnit(unit)}>
-                    <strong>{unit.code}</strong>
-                    <span>{unit.name}</span>
+                    <strong>{roomStatusUnitLocationLabel(unit)}</strong>
+                    <span>{roomStatusUnitDescription(unit)}</span>
                     <small>{rowDescription(unit)}</small>
                   </button>
                 </div>
@@ -695,7 +746,7 @@ export function RoomStatusGrid({
                       ? `${bedOccupancy.occupiedBedCount}/${bedOccupancy.totalBedCount}`
                       : null;
                     const bedOccupancyTooltipText = bedOccupancy ? bedOccupancyDescription(bedOccupancy) : undefined;
-                    const selected = isCellSelected(selection, unit.id, date);
+                    const selected = isCellSelected(pointerPreviewSelection ?? selection, unit.id, date);
                     const focusable = effectiveFocus?.unitId === unit.id && effectiveFocus.serviceDate === date;
                     const startingIntervals = intervalsByStartColumn.get(columnIndex) ?? [];
                     return (
@@ -754,14 +805,13 @@ export function RoomStatusGrid({
                         {bedOccupancyRatio ? (
                           <span className="room-status-bed-occupancy" aria-hidden="true">{bedOccupancyRatio}</span>
                         ) : <RoomStatusMark status={status} compact />}
-                        {day?.conflicts.length && !bedOccupancy ? <span className="room-status-cell-conflict">{day.conflicts.length} 个阻断</span> : null}
                         {startingIntervals.map(({ interval, startColumn, endColumn, lane }) => (
                           <button
                             key={interval.id}
                             type="button"
                             className={`room-status-interval room-status-interval-${interval.status.toLowerCase().replaceAll("_", "-")}${interval.blocking ? " is-blocking" : ""}${interval.conflicts.length ? " has-blocking-conflict" : ""}`}
                             style={{ left: 0, width: `${(endColumn - startColumn) * 100}%`, top: `calc(5px + ${lane} * 25px)` }}
-                            aria-label={`${interval.label}，${roomStatusSourceLabels[interval.sourceKind]}${interval.primaryOccupantLabel ? `，主要居住人 ${interval.primaryOccupantLabel}` : ""}，${formatRoomStatusDate(interval.startDate)}至${formatRoomStatusDate(interval.endDate)}，${roomStatusPresentation[interval.status].label}${interval.blocking ? "，阻断库存" : "，不阻断库存"}${interval.conflicts.length ? `，${interval.conflicts.length} 个阻断冲突` : ""}`}
+                            aria-label={`${interval.label}，${roomStatusSourceLabels[interval.sourceKind]}${interval.primaryOccupantLabel ? `，主要居住人 ${interval.primaryOccupantLabel}` : ""}，${formatRoomStatusDate(interval.startDate)}至${formatRoomStatusDate(interval.endDate)}，${roomStatusPresentation[interval.status].label}`}
                             title={`${roomStatusSourceLabels[interval.sourceKind]} · ${interval.primaryOccupantLabel ?? interval.label}`}
                             onPointerDown={(event) => event.stopPropagation()}
                             onDoubleClick={(event) => event.stopPropagation()}

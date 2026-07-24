@@ -104,7 +104,6 @@ async function openInternalUseCommand(page: Page, candidate: InternalUseCandidat
   await unitSelect.selectOption(candidate.unitId);
   await page.getByLabel("入住日期", { exact: true }).fill(candidate.arrivalDate);
   await page.getByLabel("退房日期", { exact: true }).fill(candidate.departureDate);
-  await page.getByRole("button", { name: "应用选区", exact: true }).click();
   await page.getByRole("button", { name: "放置内部占用", exact: true }).click();
   await page.getByLabel("内部占用原因").fill(businessReason);
   await page.getByRole("button", { name: "继续生成 Preview", exact: true }).click();

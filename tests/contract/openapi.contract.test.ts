@@ -17,9 +17,25 @@ type JsonSchema = Record<string, unknown>;
 const commandInputContract: Record<(typeof commandTypes)[number], { required: string[]; properties: string[] }> = {
   CREATE_MEMBER: {
     required: ["propertyId", "fullName", "identityCardNumber", "phone", "wechat"],
-    properties: ["propertyId", "fullName", "identityCardNumber", "phone", "wechat", "validFrom", "validUntil", "memberContractId", "sourceApplicationRecordId"]
+    properties: ["propertyId", "fullName", "identityCardNumber", "phone", "wechat"]
   },
-  CREATE_ORDER: { required: ["propertyId", "quoteId", "primaryGuest", "bookingChannelCode"], properties: ["propertyId", "quoteId", "primaryGuest", "bookingChannelCode", "channelOrderReference", "freeStayReason"] },
+  CREATE_MEMBERSHIP_ORDER: {
+    required: ["propertyId", "memberId", "membershipProductId", "agreedPriceMinor"],
+    properties: ["propertyId", "memberId", "membershipProductId", "agreedPriceMinor", "priceAdjustmentReason"]
+  },
+  RECORD_MEMBERSHIP_PAYMENT: {
+    required: ["propertyId", "membershipOrderId", "amountMinor", "transactionReference"],
+    properties: ["propertyId", "membershipOrderId", "amountMinor", "transactionReference", "note"]
+  },
+  CORRECT_MEMBERSHIP_PAYMENT: {
+    required: ["propertyId", "membershipOrderId", "originalPaymentFactId", "correctedAmountMinor", "correctedTransactionReference"],
+    properties: ["propertyId", "membershipOrderId", "originalPaymentFactId", "correctedAmountMinor", "correctedTransactionReference", "note"]
+  },
+  ACTIVATE_MEMBERSHIP_ORDER: {
+    required: ["propertyId", "membershipOrderId"],
+    properties: ["propertyId", "membershipOrderId"]
+  },
+  CREATE_ORDER: { required: ["propertyId", "quoteId", "primaryGuest"], properties: ["propertyId", "quoteId", "primaryGuest", "bookingChannelCode", "channelOrderReference", "freeStayReason"] },
   EXTEND_STAY: { required: ["propertyId", "orderId", "newDepartureDate"], properties: ["propertyId", "orderId", "newDepartureDate"] },
   SHORTEN_STAY: { required: ["propertyId", "orderId", "newDepartureDate"], properties: ["propertyId", "orderId", "newDepartureDate"] },
   MOVE_UNIT: { required: ["propertyId", "orderId", "newInventoryUnitId", "effectiveDate"], properties: ["propertyId", "orderId", "newInventoryUnitId", "effectiveDate"] },
@@ -42,6 +58,10 @@ const commandInputContract: Record<(typeof commandTypes)[number], { required: st
     properties: ["propertyId", "memberContractId", "unitKind", "units", "expiresOn"]
   },
   ADJUST_MEMBER_ENTITLEMENT: { required: ["propertyId", "entitlementLotId", "quantityDelta", "adjustmentReason"], properties: ["propertyId", "entitlementLotId", "quantityDelta", "adjustmentReason"] },
+  CORRECT_MEMBER_ENTITLEMENT_BALANCE: {
+    required: ["propertyId", "entitlementLotId", "targetAvailableBalance", "expectedAvailableBalance", "adjustmentReason"],
+    properties: ["propertyId", "entitlementLotId", "targetAvailableBalance", "expectedAvailableBalance", "adjustmentReason"]
+  },
   EXPIRE_MEMBER_ENTITLEMENT: { required: ["propertyId", "entitlementLotId", "asOfDate"], properties: ["propertyId", "entitlementLotId", "asOfDate"] },
   ISSUE_TOKEN: { required: ["propertyId", "subjectId", "label", "accessCeiling", "expiresAt", "tokenSecret"], properties: ["propertyId", "subjectId", "label", "accessCeiling", "expiresAt", "tokenSecret"] },
   ROTATE_TOKEN: { required: ["propertyId", "tokenId", "tokenSecret"], properties: ["propertyId", "tokenId", "expiresAt", "tokenSecret"] },
@@ -155,6 +175,11 @@ describe("OpenAPI 3.1 command contract", () => {
     ]));
     const quoteResponse = document.paths["/api/v1/quotes"].post.responses["200"].content["application/json"].schema;
     expect(quoteResponse).toMatchObject({ additionalProperties: false, required: ["quote", "receipt"] });
+    const quoteRequest = document.paths["/api/v1/quotes"].post.requestBody.content["application/json"].schema;
+    expect(quoteRequest.required).toEqual([
+      "propertyId", "inventoryUnitId", "arrivalDate", "departureDate", "pricingPolicyVersionId"
+    ]);
+    expect(quoteRequest.properties.stayType).toBeDefined();
     const recoveryCommandType = document.paths["/api/v1/command-results"].get.parameters
       .find((parameter: { name: string }) => parameter.name === "commandType").schema;
     expect(recoveryCommandType.anyOf.map((variant: { enum: string[] }) => variant.enum[0]).sort())
@@ -201,7 +226,8 @@ describe("OpenAPI 3.1 command contract", () => {
     expect(JSON.stringify((effectGuest.properties as Record<string, JsonSchema>).nickname)).toContain('"type":"null"');
     const createMemberInput = (variants.get("CREATE_MEMBER")!.properties as Record<string, JsonSchema>).input!;
     expect((createMemberInput.properties as Record<string, JsonSchema>).identityCardNumber).toMatchObject({ minLength: 1, maxLength: 200 });
-    expect((createMemberInput.properties as Record<string, JsonSchema>).validFrom).toMatchObject({ pattern: "^\\d{4}-\\d{2}-\\d{2}$" });
+    expect(createMemberInput.properties).not.toHaveProperty("validFrom");
+    expect(createMemberInput.properties).not.toHaveProperty("sourceApplicationRecordId");
     const expiryInput = (variants.get("EXPIRE_MEMBER_ENTITLEMENT")!.properties as Record<string, JsonSchema>).input!;
     expect((expiryInput.properties as Record<string, JsonSchema>).asOfDate!).toMatchObject({ pattern: "^\\d{4}-\\d{2}-\\d{2}$" });
     for (const commandType of ["ISSUE_TOKEN", "ROTATE_TOKEN"] as const) {
@@ -534,7 +560,7 @@ describe("OpenAPI 3.1 command contract", () => {
 
     const errorSchema = document.paths["/api/v1/quotes"].post.responses["400"].content["application/json"].schema;
     expect(errorSchema.additionalProperties).toBe(false);
-    expect(errorSchema.properties.details.anyOf).toHaveLength(13);
+    expect(errorSchema.properties.details.anyOf).toHaveLength(14);
     const receiptSchema = document.paths["/api/v1/receipts/{id}"].get.responses["200"].content["application/json"].schema;
     expect(JSON.stringify(receiptSchema)).not.toContain("tokenSecret");
     expect(JSON.stringify(receiptSchema)).toContain("bookingChannelCode");
@@ -834,6 +860,61 @@ describe("OpenAPI 3.1 command contract", () => {
     expect(quote.json()).toMatchObject({ code: "IDEMPOTENCY_KEY_REQUIRED", retryable: false });
   });
 
+  it("derives paid stay type from dates and rejects an inconsistent compatibility value", async () => {
+    const omitted = await app.inject({
+      method: "POST",
+      url: "/api/v1/quotes",
+      headers: {
+        authorization: `Bearer ${demo.writeToken}`,
+        "content-type": "application/json",
+        "idempotency-key": "contract-derived-stay-type",
+        "x-correlation-id": "contract-derived-stay-type"
+      },
+      payload: {
+        propertyId: demo.propertyId,
+        inventoryUnitId: "unit_room_104",
+        arrivalDate: "2026-07-26",
+        departureDate: "2026-08-05",
+        pricingPolicyVersionId: demo.publicPricingPolicyId
+      }
+    });
+    expect(omitted.statusCode, omitted.body).toBe(200);
+    expect(omitted.json().quote).toMatchObject({
+      stayType: "CUSTOM",
+      currentContractAmount: { currency: "CNY", minorUnits: 108_600 }
+    });
+
+    const before = await database.selectFrom("command_executions")
+      .select(({ fn }) => fn.countAll<number>().as("count")).executeTakeFirstOrThrow();
+    const mismatch = await app.inject({
+      method: "POST",
+      url: "/api/v1/quotes",
+      headers: {
+        authorization: `Bearer ${demo.writeToken}`,
+        "content-type": "application/json",
+        "idempotency-key": "contract-mismatched-stay-type",
+        "x-correlation-id": "contract-mismatched-stay-type"
+      },
+      payload: {
+        propertyId: demo.propertyId,
+        inventoryUnitId: "unit_room_104",
+        stayType: "TRANSIENT",
+        arrivalDate: "2026-08-20",
+        departureDate: "2026-08-30",
+        pricingPolicyVersionId: demo.publicPricingPolicyId
+      }
+    });
+    expect(mismatch.statusCode, mismatch.body).toBe(422);
+    expect(mismatch.json()).toMatchObject({
+      code: "PRICING_POLICY_UNCONFIGURED",
+      message: "住宿类型与 10 晚住宿不一致，请重新报价",
+      retryable: false
+    });
+    const after = await database.selectFrom("command_executions")
+      .select(({ fn }) => fn.countAll<number>().as("count")).executeTakeFirstOrThrow();
+    expect(Number(after.count)).toBe(Number(before.count));
+  });
+
   it("uses an HttpOnly session for Web while preserving the same subject grants", async () => {
     const login = await app.inject({ method: "POST", url: "/api/v1/auth/login", payload: { username: "operator", password: "demo-pass-2026" } });
     expect(login.statusCode).toBe(200);
@@ -920,36 +1001,39 @@ describe("OpenAPI 3.1 command contract", () => {
       fullName: "Contract API Member",
       identityCardNumber: "test-contract-api-member-id",
       phone: "13800000333",
-      wechat: "contract-api-member",
-      validFrom: "2026-11-01",
-      validUntil: "2027-10-31",
-      sourceApplicationRecordId: "rec_contract_api_member"
+      wechat: "contract-api-member"
     });
-    expect(registeredMember.result).toMatchObject({
-      memberCreated: true,
-      memberContractCreated: true,
-      externalReferenceCreated: true
-    });
+    expect(registeredMember.result).toMatchObject({ memberCreated: true });
     const memberId = registeredMember.result.memberId as string;
-    const memberContractId = registeredMember.result.memberContractId as string;
-    expect(registeredMember.resourceRefs).toEqual([
-      memberId,
-      memberContractId,
-      registeredMember.result.memberExternalReferenceId
-    ]);
+    expect(registeredMember.resourceRefs).toEqual([memberId]);
     const memberSearch = await app.inject({
       method: "GET",
-      url: `/api/v1/members?propertyId=${demo.propertyId}&identityCardNumber=TEST-CONTRACT-API-MEMBER-ID`,
+      url: `/api/v1/members?propertyId=${demo.propertyId}&query=contract-api`,
       headers: { authorization: `Bearer ${demo.writeToken}` }
     });
     expect(memberSearch.statusCode).toBe(200);
     expect(memberSearch.json()).toMatchObject({
       members: [{
-        member: { id: memberId, identity_card_number: "TEST-CONTRACT-API-MEMBER-ID", full_name: "Contract API Member" },
-        contracts: [{ id: memberContractId, member_id: memberId }],
-        availableBalance: { ROOM_NIGHT: 0, BED_NIGHT: 0 }
+        member: { id: memberId, identity_card_number: "TEST-CONTRACT-API-MEMBER-ID", full_name: "Contract API Member" }
       }]
     });
+    expect(Object.keys((memberSearch.json() as { members: Array<Record<string, unknown>> }).members[0]!)).toEqual(["member"]);
+    const allMembersWithEmptyQuery = await app.inject({
+      method: "GET",
+      url: `/api/v1/members?propertyId=${demo.propertyId}&query=`,
+      headers: { authorization: `Bearer ${demo.writeToken}` }
+    });
+    expect(allMembersWithEmptyQuery.statusCode).toBe(200);
+    expect((allMembersWithEmptyQuery.json() as { members: Array<{ member: { id: string } }> }).members)
+      .toEqual(expect.arrayContaining([expect.objectContaining({ member: expect.objectContaining({ id: memberId }) })]));
+    const metaAfterMemberCreate = await app.inject({
+      method: "GET",
+      url: "/api/v1/meta",
+      headers: { authorization: `Bearer ${demo.writeToken}` }
+    });
+    expect(metaAfterMemberCreate.statusCode).toBe(200);
+    expect((metaAfterMemberCreate.json() as { members: Array<{ id: string }> }).members)
+      .toEqual(expect.arrayContaining([expect.objectContaining({ id: memberId })]));
     const member = await app.inject({
       method: "GET", url: `/api/v1/members/${memberId}?propertyId=${demo.propertyId}`,
       headers: { authorization: `Bearer ${demo.writeToken}` }
@@ -957,12 +1041,34 @@ describe("OpenAPI 3.1 command contract", () => {
     expect(member.statusCode).toBe(200);
     expect(member.json()).toMatchObject({
       member: { id: memberId, identity_card_number: "TEST-CONTRACT-API-MEMBER-ID" },
-      contracts: [{ id: memberContractId, member_id: memberId }],
+      contracts: [],
       lots: [],
       ledger: [],
-      externalReferences: [{ provider: "FEISHU_BASE", external_record_id: "rec_contract_api_member", property_id: demo.propertyId }],
+      externalReferences: [],
       availableBalance: { ROOM_NIGHT: 0, BED_NIGHT: 0 }
     });
+    const duplicateMember = await app.inject({
+      method: "POST",
+      url: "/api/v1/command-previews",
+      headers: {
+        authorization: `Bearer ${demo.writeToken}`,
+        "content-type": "application/json",
+        "idempotency-key": "contract-duplicate-member-preview",
+        "x-correlation-id": "contract-duplicate-member-preview"
+      },
+      payload: {
+        commandType: "CREATE_MEMBER",
+        input: {
+          propertyId: demo.propertyId,
+          fullName: "Duplicate Contract API Member",
+          identityCardNumber: " test-contract-api-member-id ",
+          phone: "13800000999",
+          wechat: "duplicate-contract-member"
+        }
+      }
+    });
+    expect(duplicateMember.statusCode).toBe(409);
+    expect(duplicateMember.json()).toMatchObject({ code: "VALIDATION_ERROR", message: "该身份证号已登记，不能重复创建会员档案" });
     const audit = await app.inject({
       method: "GET", url: `/api/v1/audit?propertyId=${demo.propertyId}`,
       headers: { authorization: `Bearer ${demo.writeToken}` }

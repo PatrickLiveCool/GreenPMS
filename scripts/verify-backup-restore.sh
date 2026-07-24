@@ -15,7 +15,7 @@ restore_point="$workdir/restore-point.dump"
 boundary_marker="__qintopia_restore_boundary_$$_$(date +%s)_${RANDOM}__"
 sentinel_property_id="prop_restore_sentinel_${run_id}"
 fixture_reference="RESTORE-${run_id}"
-catalog_batch_id="qintopia-2026-feishu-revision-561-user-confirmed-v3"
+catalog_batch_id="qintopia-2026-feishu-revision-561-user-confirmed-v4"
 trap 'docker exec "$container" dropdb -U "$user" --if-exists "$source_database" >/dev/null 2>&1 || true; docker exec "$container" dropdb -U "$user" --if-exists "$target_database" >/dev/null 2>&1 || true; rm -rf "$workdir"' EXIT
 
 run_app_command() {
@@ -54,7 +54,8 @@ ALLOW_RESTORE=true POSTGRES_CONTAINER="$container" POSTGRES_USER="$user" POSTGRE
 source_marker="$(docker exec "$container" psql -U "$user" -d "$source_database" -Atc "SELECT count(*) FROM schema_migrations WHERE name = '$boundary_marker'")"
 target_marker="$(docker exec "$container" psql -U "$user" -d "$target_database" -Atc "SELECT count(*) FROM schema_migrations WHERE name = '$boundary_marker'")"
 target_sentinel="$(docker exec "$container" psql -U "$user" -d "$target_database" -Atc "SELECT count(*) FROM properties WHERE id = '$sentinel_property_id'")"
-required_migrations="$(docker exec "$container" psql -U "$user" -d "$target_database" -Atc "SELECT count(*) FROM schema_migrations WHERE name IN ('001_initial.sql','002_immutability.sql','003_active_coverage_uniqueness.sql','004_security_identity_guards.sql','005_core_identity_and_entitlement_guards.sql','006_property_scoped_idempotency.sql','007_reference_catalog.sql','008_reference_catalog_sealing.sql','009_booking_channels_and_transaction_references.sql','010_qintopia_2026_catalog_pricing_and_free_stays.sql','011_core_fact_shape_guards.sql','012_legacy_demo_inventory_catalog_backfill.sql','013_room_status_operations.sql','014_new_order_primary_guest_nickname.sql')")"
+required_migrations="$(docker exec "$container" psql -U "$user" -d "$target_database" -Atc "SELECT count(*) FROM schema_migrations WHERE name IN ('001_initial.sql','002_immutability.sql','003_active_coverage_uniqueness.sql','004_security_identity_guards.sql','005_core_identity_and_entitlement_guards.sql','006_property_scoped_idempotency.sql','007_reference_catalog.sql','008_reference_catalog_sealing.sql','009_booking_channels_and_transaction_references.sql','010_qintopia_2026_catalog_pricing_and_free_stays.sql','011_core_fact_shape_guards.sql','012_legacy_demo_inventory_catalog_backfill.sql','013_room_status_operations.sql','014_new_order_primary_guest_nickname.sql','015_generated_room_operational_codes.sql','016_member_property_links.sql','017_membership_orders.sql','018_member_stay_identity_and_coverage_guards.sql','019_member_stay_booking_channel_rules.sql')")"
+member_property_link_count="$(docker exec "$container" psql -U "$user" -d "$target_database" -Atc 'SELECT count(*) FROM member_property_links')"
 operational_reference_columns="$(docker exec "$container" psql -U "$user" -d "$target_database" -Atc "SELECT count(*) FROM information_schema.columns WHERE (table_name = 'orders' AND column_name IN ('booking_channel_code','channel_order_reference')) OR (table_name = 'collection_facts' AND column_name = 'transaction_reference')")"
 operational_reference_triggers="$(docker exec "$container" psql -U "$user" -d "$target_database" -Atc "SELECT count(*) FROM pg_trigger WHERE NOT tgisinternal AND tgname IN ('orders_validate_new_channel','collection_facts_validate_new_transaction_reference')")"
 one_stay_violations="$(docker exec "$container" psql -U "$user" -d "$target_database" -Atc 'SELECT count(*) FROM orders o LEFT JOIN stays s ON s.order_id=o.id GROUP BY o.id HAVING count(s.id) <> 1' | wc -l | tr -d ' ')"
@@ -79,7 +80,8 @@ fixture_audit_count="$(docker exec "$container" psql -U "$user" -d "$target_data
 test "$source_marker" = "1"
 test "$target_marker" = "0"
 test "$target_sentinel" = "1"
-test "$required_migrations" = "14"
+test "$required_migrations" = "19"
+test "$member_property_link_count" -ge 1
 test "$operational_reference_columns" = "3"
 test "$operational_reference_triggers" = "2"
 test "$one_stay_violations" = "0"

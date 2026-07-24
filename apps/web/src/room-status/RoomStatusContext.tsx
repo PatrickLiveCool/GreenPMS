@@ -1,13 +1,10 @@
-import { useEffect, useId, useMemo, useRef, useState } from "react";
+import { useEffect, useId, useMemo, useState } from "react";
 import {
   AlertTriangle,
   ArrowRight,
   CalendarRange,
   Clock3,
-  ExternalLink,
-  History,
   Layers3,
-  ReceiptText,
   ShieldAlert
 } from "lucide-react";
 import type {
@@ -24,8 +21,10 @@ import {
   formatRoomStatusDate,
   formatRoomStatusDateTime,
   roomStatusActionLabels,
-  roomStatusBlockingFactLabels,
+  roomStatusSaleCapabilityLabel,
+  roomStatusSelectedSaleLabel,
   roomStatusSourceLabels,
+  roomStatusUnitLabel,
   RoomStatusMark,
   RoomStatusWarning
 } from "./roomStatusPresentation";
@@ -58,64 +57,20 @@ function flattenUnits(rooms: readonly RoomStatusUnitDto[]): RoomStatusUnitDto[] 
 
 function unitOptionLabel(unit: RoomStatusUnitDto): string {
   const kind = unit.kind === "ROOM" ? "房间" : "床位";
-  return `${unit.code} · ${unit.name}（${kind}）`;
+  return `${roomStatusUnitLabel(unit)}（${kind}）`;
 }
 
-function ReferenceList({ references, onOpen }: { references: readonly RoomStatusReferenceDto[]; onOpen: (reference: RoomStatusReferenceDto) => void }) {
-  if (!references.length) return <p className="room-status-context-empty">当前获权视图没有对象引用。</p>;
-  return (
-    <ul className="room-status-reference-list">
-      {references.map((reference) => (
-        <li key={`${reference.type}:${reference.id}`}>
-          {reference.href ? (
-            <button type="button" onClick={() => onOpen(reference)}>
-              <span><strong>{reference.label}</strong><small>{reference.type}</small></span>
-              <code>{reference.id}</code>
-              <ExternalLink aria-hidden="true" size={15} />
-            </button>
-          ) : (
-            <div className="room-status-reference-static">
-              <span><strong>{reference.label}</strong><small>{reference.type}</small></span>
-              <code>{reference.id}</code>
-            </div>
-          )}
-        </li>
-      ))}
-    </ul>
-  );
-}
-
-function ConflictList({ conflicts, onOpenReference }: { conflicts: readonly RoomStatusConflictDto[]; onOpenReference: (reference: RoomStatusReferenceDto) => void }) {
-  if (!conflicts.length) return <p className="room-status-context-empty">服务端没有返回阻断冲突。</p>;
+function ConflictList({ conflicts }: { conflicts: readonly RoomStatusConflictDto[] }) {
+  if (!conflicts.length) return <p className="room-status-context-empty">当前所选日期可以安排住宿。</p>;
   return (
     <ul className="room-status-conflict-list">
       {conflicts.map((conflict) => (
         <li key={conflict.id}>
           <div>
             <AlertTriangle aria-hidden="true" size={17} />
-            <strong>{conflict.reason}</strong>
+            <strong>{roomStatusSourceLabels[conflict.sourceKind]} 已有住宿，不能重复安排</strong>
             <span>{formatRoomStatusDate(conflict.startDate)}至{formatRoomStatusDate(conflict.endDate)}</span>
           </div>
-          <dl>
-            <dt>请求 / 实际库存</dt>
-            <dd><code>{conflict.requestedInventoryUnitId}</code><span> / </span><code>{conflict.actualInventoryUnitId}</code></dd>
-            <dt>阻断事实</dt>
-            <dd>{roomStatusBlockingFactLabels[conflict.blockingFactKind]}</dd>
-            <dt>Claim</dt>
-            <dd>{conflict.claimIds.length ? conflict.claimIds.map((claimId) => <code key={claimId}>{claimId} </code>) : "不适用"}</dd>
-            <dt>来源</dt>
-            <dd>{roomStatusSourceLabels[conflict.sourceKind]}</dd>
-          </dl>
-          {conflict.sourceReference.href ? (
-            <button type="button" className="room-status-text-button" onClick={() => onOpenReference(conflict.sourceReference)}>
-              查看 {conflict.sourceReference.label}<ArrowRight aria-hidden="true" size={15} />
-            </button>
-          ) : (
-            <div className="room-status-conflict-source-static">
-              <span>{conflict.sourceReference.label}</span>
-              <code>{conflict.sourceReference.id}</code>
-            </div>
-          )}
         </li>
       ))}
     </ul>
@@ -139,7 +94,6 @@ export function RoomStatusContext({
 }: RoomStatusContextProps) {
   const units = useMemo(() => flattenUnits(board.rooms), [board.rooms]);
   const dateErrorId = useId();
-  const dateErrorRef = useRef<HTMLDivElement>(null);
   const initialUnitId = selection?.unitId ?? selectedUnit?.id ?? "";
   const [draft, setDraft] = useState<SelectionDraft>({
     unitId: initialUnitId,
@@ -169,28 +123,27 @@ export function RoomStatusContext({
     const intervals = selectedInterval ? [selectedInterval, ...relatedIntervals] : [...relatedIntervals];
     return [...new Map(intervals.map((interval) => [interval.id, interval])).values()];
   }, [relatedIntervals, selectedInterval]);
-  const references = useMemo(() => [...new Map(contextIntervals
-    .flatMap((interval) => interval.references)
-    .map((reference) => [`${reference.type}:${reference.id}`, reference])).values()], [contextIntervals]);
-  const histories = useMemo(() => [...new Map(contextIntervals
-    .flatMap((interval) => interval.history)
-    .map((item) => [`${item.occurredAt}:${item.commandId ?? "none"}:${item.receiptId ?? "none"}:${item.action}`, item])).values()]
-    .sort((left, right) => right.occurredAt.localeCompare(left.occurredAt)), [contextIntervals]);
   const status = selectedInterval?.status ?? selectedDay?.status;
-  const contextTitle = selectedInterval?.label ?? selectedUnit?.name ?? "尚未选择房源";
+  const contextTitle = selectedInterval?.label ?? (selectedUnit ? roomStatusUnitLabel(selectedUnit) : "尚未选择房源");
 
   const changeUnit = (unitId: string) => {
-    setDraft((current) => ({ ...current, unitId }));
+    const nextDraft = { ...draft, unitId };
+    setDraft(nextDraft);
     const unit = units.find((candidate) => candidate.id === unitId);
     if (unit) onSelectedUnitChange(unit);
+    const nextSelection = selectionFromInputs(nextDraft.unitId, nextDraft.arrivalDate, nextDraft.departureDate);
+    if (nextSelection
+      && nextSelection.arrivalDate >= board.range.arrivalDate
+      && nextSelection.departureDate <= board.range.departureDate) onSelectionChange(nextSelection);
   };
 
-  const applyDraftSelection = () => {
-    if (draftSelection) {
-      onSelectionChange(draftSelection);
-      return;
-    }
-    dateErrorRef.current?.focus();
+  const changeDraftDate = (field: "arrivalDate" | "departureDate", value: string) => {
+    const nextDraft = { ...draft, [field]: value };
+    setDraft(nextDraft);
+    const nextSelection = selectionFromInputs(nextDraft.unitId, nextDraft.arrivalDate, nextDraft.departureDate);
+    if (nextSelection
+      && nextSelection.arrivalDate >= board.range.arrivalDate
+      && nextSelection.departureDate <= board.range.departureDate) onSelectionChange(nextSelection);
   };
 
   return (
@@ -208,7 +161,7 @@ export function RoomStatusContext({
           <CalendarRange aria-hidden="true" size={17} />
           <h3 id="room-status-selection-heading">日期选区</h3>
         </div>
-        <p>拖选的等价输入。应用后只更新本地半开区间，不创建订单、Claim 或 Block。</p>
+        <p>修改房源或日期后自动更新住宿草稿，不会创建订单。</p>
         <label>房间或床位
           <select data-testid="room-status-unit-select" value={draft.unitId} onChange={(event) => changeUnit(event.target.value)}>
             <option value="">请选择房源</option>
@@ -224,7 +177,7 @@ export function RoomStatusContext({
               max={board.range.departureDate}
               aria-invalid={draftDateError ? "true" : undefined}
               aria-describedby={draftDateError ? dateErrorId : undefined}
-              onChange={(event) => setDraft((current) => ({ ...current, arrivalDate: event.target.value }))}
+              onChange={(event) => changeDraftDate("arrivalDate", event.target.value)}
             />
           </label>
           <label>退房日期
@@ -235,23 +188,13 @@ export function RoomStatusContext({
               max={board.range.departureDate}
               aria-invalid={draftDateError ? "true" : undefined}
               aria-describedby={draftDateError ? dateErrorId : undefined}
-              onChange={(event) => setDraft((current) => ({ ...current, departureDate: event.target.value }))}
+              onChange={(event) => changeDraftDate("departureDate", event.target.value)}
             />
           </label>
-        </div>
-        <div className="room-status-selection-actions">
-          <button type="button" className="room-status-button room-status-button-secondary" disabled={!selection} onClick={() => onSelectionChange(null)}>清除选区</button>
-          <button
-            type="button"
-            className="room-status-button"
-            disabled={!draft.unitId || !draft.arrivalDate || !draft.departureDate}
-            onClick={applyDraftSelection}
-          >应用选区</button>
         </div>
         {draftDateError ? (
           <div
             id={dateErrorId}
-            ref={dateErrorRef}
             className="room-status-field-error-summary"
             role="alert"
             tabIndex={-1}
@@ -269,11 +212,10 @@ export function RoomStatusContext({
             <h3 id="room-status-unit-heading">库存单元</h3>
           </div>
           <dl className="room-status-context-facts">
-            <dt>稳定 ID</dt><dd><code>{selectedUnit.id}</code></dd>
-            <dt>房号 / 名称</dt><dd>{selectedUnit.code} · {selectedUnit.name}</dd>
+            <dt>楼栋 / 房源</dt><dd>{roomStatusUnitLabel(selectedUnit)}</dd>
             <dt>粒度</dt><dd>{selectedUnit.kind === "ROOM" ? "房间" : "床位"}</dd>
-            <dt>销售模式</dt><dd>{selectedUnit.salesMode === "WHOLE_ROOM" ? "整房销售" : selectedUnit.salesMode === "BED_SPLIT" ? "拆床销售" : "不可售"}</dd>
-            <dt>房型 / 产品</dt><dd>{selectedUnit.roomTypeCode ?? "未记录"} · {selectedUnit.pricingProductCode ?? "未记录"}</dd>
+            <dt>当前选择</dt><dd>{roomStatusSelectedSaleLabel(selectedUnit)}</dd>
+            <dt>房间可售方式</dt><dd>{roomStatusSaleCapabilityLabel(selectedUnit)}</dd>
             <dt>容纳人数</dt><dd>{selectedUnit.capacity}</dd>
           </dl>
         </section>
@@ -286,17 +228,11 @@ export function RoomStatusContext({
             <h3 id="room-status-source-heading">来源事实</h3>
           </div>
           <dl className="room-status-context-facts">
-            <dt>区间 ID</dt><dd><code>{selectedInterval.id}</code></dd>
-            <dt>来源类型</dt><dd>{roomStatusSourceLabels[selectedInterval.sourceKind]}</dd>
+            <dt>业务类型</dt><dd>{roomStatusSourceLabels[selectedInterval.sourceKind]}</dd>
             <dt>主要居住人</dt><dd>{selectedInterval.primaryOccupantLabel ?? "不适用"}</dd>
-            <dt>当前窗口区间</dt><dd><code>[{selectedInterval.startDate}, {selectedInterval.endDate})</code></dd>
-            <dt>来源完整区间</dt><dd><code>[{selectedInterval.sourceStartDate}, {selectedInterval.sourceEndDate})</code></dd>
-            <dt>显示 / 实际库存</dt><dd><code>{selectedInterval.displayInventoryUnitId}</code><span> / </span><code>{selectedInterval.actualInventoryUnitId}</code></dd>
-            <dt>是否阻断</dt><dd>{selectedInterval.blocking ? "是" : "否"}</dd>
+            <dt>住宿日期</dt><dd>{formatRoomStatusDate(selectedInterval.sourceStartDate)}至{formatRoomStatusDate(selectedInterval.sourceEndDate)}</dd>
             <dt>原因</dt><dd>{selectedInterval.reason ?? "未提供原因"}</dd>
-            <dt>Claim</dt><dd>{selectedInterval.claimIds.length ? selectedInterval.claimIds.map((id) => <code key={id}>{id} </code>) : "无"}</dd>
           </dl>
-          <ReferenceList references={references} onOpen={onOpenReference} />
         </section>
       ) : selectedDay ? (
         <section className="room-status-context-section" aria-labelledby="room-status-day-heading">
@@ -324,65 +260,26 @@ export function RoomStatusContext({
               <li key={interval.id}>
                 <strong>{roomStatusSourceLabels[interval.sourceKind]} · {interval.label}</strong>
                 <dl className="room-status-context-facts">
-                  <dt>区间 ID</dt><dd><code>{interval.id}</code></dd>
-                  <dt>来源类型</dt><dd>{interval.sourceKind}</dd>
-                  <dt>来源完整区间</dt><dd><code>[{interval.sourceStartDate}, {interval.sourceEndDate})</code></dd>
-                  <dt>显示 / 实际库存</dt><dd><code>{interval.displayInventoryUnitId}</code><span> / </span><code>{interval.actualInventoryUnitId}</code></dd>
-                  <dt>Claim</dt><dd>{interval.claimIds.length ? interval.claimIds.map((id) => <code key={id}>{id} </code>) : "无"}</dd>
+                  <dt>住宿日期</dt><dd>{formatRoomStatusDate(interval.sourceStartDate)}至{formatRoomStatusDate(interval.sourceEndDate)}</dd>
                 </dl>
               </li>
             ))}
           </ol>
-          <ReferenceList references={references} onOpen={onOpenReference} />
         </section>
       ) : null}
 
       <section className="room-status-context-section" aria-labelledby="room-status-conflicts-heading">
         <div className="room-status-context-section-heading">
           <AlertTriangle aria-hidden="true" size={17} />
-          <h3 id="room-status-conflicts-heading">精确冲突</h3>
+          <h3 id="room-status-conflicts-heading">日期占用</h3>
         </div>
-        <ConflictList conflicts={conflicts} onOpenReference={onOpenReference} />
+        <ConflictList conflicts={conflicts} />
       </section>
-
-      {contextIntervals.length ? (
-        <section className="room-status-context-section" aria-labelledby="room-status-history-heading">
-          <div className="room-status-context-section-heading">
-            <History aria-hidden="true" size={17} />
-            <h3 id="room-status-history-heading">事实历史</h3>
-          </div>
-          {histories.length ? (
-            <ol className="room-status-history-list">
-              {histories.map((item, index) => (
-                <li key={`${item.occurredAt}:${item.commandId ?? index}`}>
-                  <strong>{item.action}</strong>
-                  <span>{formatRoomStatusDateTime(item.occurredAt)} · {item.source} · actor {item.actorId ?? "已脱敏 / 未记录"}</span>
-                  <dl>
-                    <dt>Command</dt><dd><code>{item.commandId ?? "无"}</code></dd>
-                    <dt>Correlation</dt><dd><code>{item.correlationId ?? "无"}</code></dd>
-                    <dt>Receipt</dt>
-                    <dd>{item.receiptId ? (
-                      <button
-                        type="button"
-                        className="room-status-inline-reference"
-                        aria-label={`Receipt ${item.receiptId}`}
-                        onClick={() => onOpenReceipt(item.receiptId!)}
-                      >
-                        <ReceiptText aria-hidden="true" size={14} /><code>{item.receiptId}</code>
-                      </button>
-                    ) : "无"}</dd>
-                  </dl>
-                </li>
-              ))}
-            </ol>
-          ) : <p className="room-status-context-empty">当前获权视图没有历史记录。</p>}
-        </section>
-      ) : null}
 
       <section className="room-status-context-actions" aria-labelledby="room-status-actions-heading">
         <div className="room-status-context-section-heading">
           <ArrowRight aria-hidden="true" size={17} />
-          <h3 id="room-status-actions-heading">服务端允许动作</h3>
+          <h3 id="room-status-actions-heading">可执行操作</h3>
         </div>
         {allowedActions.length ? (
           <ul>
@@ -403,7 +300,6 @@ export function RoomStatusContext({
         <Clock3 aria-hidden="true" size={15} />
         <span>数据时点 {formatRoomStatusDateTime(board.asOf)}</span>
         <span>有效至 {formatRoomStatusDateTime(board.freshUntil)}</span>
-        <code>{board.revision}</code>
       </footer>
     </aside>
   );

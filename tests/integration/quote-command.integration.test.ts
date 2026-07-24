@@ -129,6 +129,20 @@ describe("recoverable CREATE_QUOTE command on PostgreSQL", () => {
     expect(await artifactCounts()).toEqual([1, 1, 1, 1]);
   });
 
+  it("canonicalizes an omitted paid stay type before hashing and persistence", async () => {
+    const input: CreateQuoteCommandInputDto = {
+      propertyId: demo.propertyId,
+      inventoryUnitId: "unit_room_104",
+      arrivalDate: "2026-07-26",
+      departureDate: "2026-08-05",
+      pricingPolicyVersionId: demo.publicPricingPolicyId
+    };
+    const result = await executeQuoteCommand(db, readPrincipal, input, metadata("quote-derived-type"));
+    expect(result.quote).toMatchObject({ stayType: "CUSTOM", currentContractAmount: { minorUnits: 108_600 } });
+    const execution = await db.selectFrom("command_executions").select("request_hash").executeTakeFirstOrThrow();
+    expect(execution.request_hash).toBe(stableHash({ ...input, stayType: "CUSTOM" }));
+  });
+
   it("rejects a reused key with a different payload without changing the committed result", async () => {
     const commandMetadata = metadata("quote-conflict");
     const first = await executeQuoteCommand(db, readPrincipal, baseInput, commandMetadata);

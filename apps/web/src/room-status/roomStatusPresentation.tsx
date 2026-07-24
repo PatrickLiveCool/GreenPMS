@@ -11,7 +11,13 @@ import {
   Sparkles,
   Wrench
 } from "lucide-react";
-import type { RoomStatusActionCode, RoomStatusBlockingFactKind, RoomStatusSourceKind, RoomStatusStatus } from "@qintopia/contracts";
+import type {
+  RoomStatusActionCode,
+  RoomStatusBlockingFactKind,
+  RoomStatusSourceKind,
+  RoomStatusStatus,
+  RoomStatusUnitDto
+} from "@qintopia/contracts";
 
 type StatusIcon = ComponentType<SVGProps<SVGSVGElement> & { size?: string | number }>;
 
@@ -58,6 +64,49 @@ export const roomStatusActionLabels: Record<RoomStatusActionCode, string> = {
   RELEASE_INTERNAL_USE: "释放内部占用",
   COMPLETE_CLEANING: "完成清洁"
 };
+
+type RoomStatusSalesPresentationUnit = Pick<RoomStatusUnitDto, "kind" | "salesMode">;
+type RoomStatusUnitIdentity = Pick<RoomStatusUnitDto, "kind" | "code" | "name" | "buildingCode">;
+
+function roomStatusUnitNameParts(unit: RoomStatusUnitIdentity): string[] {
+  return unit.name.split(/\s*·\s*/).map((part) => part.trim()).filter(Boolean);
+}
+
+export function roomStatusUnitDescription(unit: RoomStatusUnitIdentity): string {
+  const parts = roomStatusUnitNameParts(unit);
+  const roomCode = unit.kind === "BED" ? unit.code.replace(/-[^-]+$/, "") : unit.code;
+  if (parts[0] === unit.code || parts[0] === roomCode) parts.shift();
+  return parts.join(" ") || (unit.kind === "ROOM" ? "房间" : "床位");
+}
+
+export function roomStatusUnitLocationLabel(unit: RoomStatusUnitIdentity): string {
+  return [unit.buildingCode ? `${unit.buildingCode}栋` : null, unit.code].filter(Boolean).join(" ");
+}
+
+export function roomStatusUnitLabel(unit: RoomStatusUnitIdentity): string {
+  const parts = roomStatusUnitNameParts(unit);
+  const roomCode = unit.kind === "BED" ? unit.code.replace(/-[^-]+$/, "") : unit.code;
+  const nameCarriesLocation = parts[0] === unit.code || parts[0] === roomCode;
+  const localLabel = nameCarriesLocation ? parts.join(" ") : [unit.code, ...parts].join(" ");
+  return [unit.buildingCode ? `${unit.buildingCode}栋` : null, localLabel].filter(Boolean).join(" ");
+}
+
+export function roomStatusSelectedSaleLabel(unit: RoomStatusSalesPresentationUnit): string {
+  if (unit.salesMode === "UNAVAILABLE") return "不可售";
+  return unit.kind === "ROOM" ? "整房销售" : "单床销售";
+}
+
+export function roomStatusSaleCapabilityLabel(unit: RoomStatusSalesPresentationUnit): string {
+  if (unit.salesMode === "UNAVAILABLE") return "当前不可售";
+  if (unit.salesMode === "BED_SPLIT") return "支持整房及单床销售";
+  return "仅整房销售";
+}
+
+export function roomStatusRowSalesLabel(unit: RoomStatusSalesPresentationUnit): string {
+  if (unit.salesMode === "UNAVAILABLE") return "不可售";
+  if (unit.kind === "BED") return "单床销售";
+  return unit.salesMode === "BED_SPLIT" ? "支持整房及单床销售" : "整房销售";
+}
 
 export function formatRoomStatusDate(value: string): string {
   const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);

@@ -7,6 +7,7 @@ import {
   type Database
 } from "@qintopia/db";
 import type { Kysely } from "kysely";
+import { enumerateServiceDates, paidStayTypeForNights } from "@qintopia/domain";
 import { createQuoteForTesting } from "../../packages/db/src/pricing-service.ts";
 import { demo } from "../../packages/db/src/seed.ts";
 import { resetTestDatabase } from "../helpers/database.ts";
@@ -49,7 +50,7 @@ async function createOrder(options: {
   stayType?: StayType;
   freeStayReason?: string;
 }) {
-  const stayType = options.stayType ?? "CUSTOM";
+  const stayType = options.stayType ?? paidStayTypeForNights(enumerateServiceDates(options.arrivalDate, options.departureDate).length);
   const quote = await createQuoteForTesting(db, {
     propertyId: demo.propertyId,
     inventoryUnitId: options.unitId,
@@ -113,6 +114,64 @@ describe.sequential("QinTopia 2026 pricing policy on PostgreSQL", () => {
       pricingPolicyVersionId: demo.publicPricingPolicyId
     });
     expect(effective.currentContractAmount.minorUnits).toBe(5_800);
+  });
+
+  it("automatically uses the 7-night band for room 104 across a calendar month", async () => {
+    const quote = await createQuoteForTesting(db, {
+      propertyId: demo.propertyId,
+      inventoryUnitId: "unit_room_104",
+      stayType: "CUSTOM",
+      arrivalDate: "2026-07-26",
+      departureDate: "2026-08-05",
+      pricingPolicyVersionId: demo.publicPricingPolicyId
+    });
+
+    expect(quote.currentContractAmount.minorUnits).toBe(108_600);
+    expect(quote.cashLines).toEqual([
+      expect.objectContaining({ lineKind: "STAY_TOTAL", pricingBandAnchorNights: 7 })
+    ]);
+
+    await expect(createQuoteForTesting(db, {
+      propertyId: demo.propertyId,
+      inventoryUnitId: "unit_room_104",
+      stayType: "TRANSIENT",
+      arrivalDate: "2026-07-26",
+      departureDate: "2026-08-05",
+      pricingPolicyVersionId: demo.publicPricingPolicyId
+    })).rejects.toMatchObject({
+      code: "PRICING_POLICY_UNCONFIGURED",
+      message: "住宿类型与 10 晚住宿不一致，请重新报价"
+    });
+  });
+
+  it("returns a concrete business conflict while preserving the original order", async () => {
+    await createOrder({
+      prefix: "stage-one-conflict",
+      unitId: "unit_room_104",
+      arrivalDate: "2026-08-10",
+      departureDate: "2026-08-12"
+    });
+
+    await expect(createQuoteForTesting(db, {
+      propertyId: demo.propertyId,
+      inventoryUnitId: "unit_room_104",
+      stayType: "TRANSIENT",
+      arrivalDate: "2026-08-11",
+      departureDate: "2026-08-13",
+      pricingPolicyVersionId: demo.publicPricingPolicyId
+    })).rejects.toMatchObject({
+      code: "INVENTORY_CONFLICT",
+      message: "104 在 2026-08-11 至 2026-08-12 已有住宿，不能重复安排",
+      details: {
+        inventoryUnitCode: "104",
+        overlapStartDate: "2026-08-11",
+        overlapEndDate: "2026-08-12",
+        claimIds: [expect.stringMatching(/^claim_/)]
+      }
+    });
+
+    const orders = await db.selectFrom("orders").select(({ fn }) => fn.countAll<number>().as("count")).executeTakeFirstOrThrow();
+    expect(Number(orders.count)).toBe(1);
   });
 
   it("uses one cumulative band across a product move and drops a prior manual target on the next revision", async () => {

@@ -15,8 +15,12 @@ const effectContractDatabaseUrl = process.env.EFFECT_CONTRACT_DATABASE_URL
   ?? "postgres://qintopia:qintopia@127.0.0.1:55432/qintopia_effect_contract";
 
 const expectedEffectKeys: Record<CommandType, string[]> = {
-  CREATE_MEMBER: ["contract", "externalReference", "member", "memberContractId", "memberId", "operation", "profileMatch", "submittedProfile"],
-  CREATE_ORDER: ["arrivalDate", "bookingChannelCode", "channelOrderReference", "departureDate", "freeStayReason", "inventoryUnit", "memberContractId", "pricing", "pricingPolicyVersionId", "primaryGuest", "quoteId", "stayType"],
+  CREATE_MEMBER: ["member", "memberId", "operation", "propertyLink"],
+  CREATE_MEMBERSHIP_ORDER: ["member", "operation", "pricing", "product", "status"],
+  RECORD_MEMBERSHIP_PAYMENT: ["memberName", "membershipOrderId", "operation", "payment", "productName", "status", "totals"],
+  CORRECT_MEMBERSHIP_PAYMENT: ["memberName", "membershipOrderId", "operation", "original", "originalPaymentFactId", "productName", "replacement", "status", "totals"],
+  ACTIVATE_MEMBERSHIP_ORDER: ["agreedPrice", "entitlementUnitKind", "entitlementUnits", "fromStatus", "memberName", "membershipOrderId", "operation", "paymentDifference", "paymentTotal", "productName", "toStatus", "validFrom", "validUntil"],
+  CREATE_ORDER: ["arrivalDate", "bookingChannelCode", "channelOrderReference", "departureDate", "freeStayReason", "inventoryUnit", "memberContractId", "memberId", "pricing", "pricingPolicyVersionId", "primaryGuest", "quoteId", "stayType"],
   EXTEND_STAY: ["after", "before", "inventoryUnitId", "orderId"],
   SHORTEN_STAY: ["after", "before", "inventoryUnitId", "orderId"],
   MOVE_UNIT: ["effectiveDate", "fromInventoryUnit", "orderId", "pricing", "stayTimeline", "toInventoryUnit"],
@@ -36,6 +40,7 @@ const expectedEffectKeys: Record<CommandType, string[]> = {
   REFRESH_MEMBER_COVERAGE: ["before", "inventoryUnitId", "orderId", "pricing", "stayTimeline"],
   ADD_MEMBER_ENTITLEMENT_LOT: ["contractId", "expiresOn", "unitKind", "units"],
   ADJUST_MEMBER_ENTITLEMENT: ["adjustmentReason", "availableAfter", "availableBefore", "contractId", "entitlementLotId", "quantityDelta", "unitKind"],
+  CORRECT_MEMBER_ENTITLEMENT_BALANCE: ["adjustmentReason", "availableAfter", "availableBefore", "contractId", "entitlementLotId", "quantityDelta", "unitKind"],
   EXPIRE_MEMBER_ENTITLEMENT: ["asOfDate", "contractId", "entitlementLotId", "entryType", "expiresOn", "quantityDelta", "remainingAvailable", "unitKind"],
   ISSUE_TOKEN: ["accessCeiling", "expiresAt", "label", "subjectId"],
   ROTATE_TOKEN: ["accessCeiling", "expiresAt", "label", "operation", "subjectId", "tokenId"],
@@ -101,19 +106,24 @@ async function confirm(preview: Preview): Promise<Record<string, unknown>> {
   return (response.json() as { result: Record<string, unknown> }).result;
 }
 
-async function quote(options: { arrivalDate?: string; departureDate?: string; memberContractId?: string } = {}) {
+async function quote(options: {
+  arrivalDate?: string;
+  departureDate?: string;
+  inventoryUnitId?: string;
+  memberId?: string;
+} = {}) {
   const response = await app.inject({
     method: "POST",
     url: "/api/v1/quotes",
     headers: headers("effect-create-quote"),
     payload: {
       propertyId: demo.propertyId,
-      inventoryUnitId: demo.roomId,
+      inventoryUnitId: options.inventoryUnitId ?? demo.roomId,
       stayType: "TRANSIENT",
       arrivalDate: options.arrivalDate ?? "2028-04-10",
       departureDate: options.departureDate ?? "2028-04-14",
       pricingPolicyVersionId: demo.transientPolicyId,
-      ...(options.memberContractId ? { memberContractId: options.memberContractId } : {})
+      ...(options.memberId ? { memberId: options.memberId } : {})
     }
   });
   expect(response.statusCode, response.body).toBe(200);
@@ -134,6 +144,20 @@ afterAll(async () => {
 });
 
 describe("Command effect HTTP contract", () => {
+  it("requires CREATE_MEMBER previews to keep the internal member id unset", () => {
+    expect(Value.Check(CommandEffectSchema, {
+      operation: "CREATE_MEMBER_PROFILE",
+      memberId: "member_leaked",
+      member: {
+        fullName: "Contract Member",
+        identityCardNumber: "CONTRACT-MEMBER-ID",
+        phone: "13800000000",
+        wechat: "contract-member"
+      },
+      propertyLink: { operation: "CREATE" }
+    })).toBe(false);
+  });
+
   it("serializes and validates the real Preview effect for every command type", async () => {
     const covered = new Set<CommandType>();
     const capture = async (commandType: CommandType, input: Record<string, unknown>) => {
@@ -147,9 +171,34 @@ describe("Command effect HTTP contract", () => {
       fullName: "Effect Contract Member",
       identityCardNumber: "TEST-EFFECT-MEMBER-ID-001",
       phone: "13800000001",
-      wechat: "effect-contract-member",
-      validFrom: "2028-01-01",
-      validUntil: "2029-12-31"
+      wechat: "effect-contract-member"
+    });
+
+    const membershipOrder = await capture("CREATE_MEMBERSHIP_ORDER", {
+      propertyId: demo.propertyId,
+      memberId: demo.memberId,
+      membershipProductId: "membership_product_shared_bath_single_v1",
+      agreedPriceMinor: 162000
+    });
+    const membershipOrderResult = await confirm(membershipOrder);
+    const membershipPayment = await capture("RECORD_MEMBERSHIP_PAYMENT", {
+      propertyId: demo.propertyId,
+      membershipOrderId: membershipOrderResult.membershipOrderId,
+      amountMinor: 100000,
+      transactionReference: "WX-EFFECT-MEMBER-001"
+    });
+    const membershipPaymentResult = await confirm(membershipPayment);
+    const correctedMembershipPayment = await capture("CORRECT_MEMBERSHIP_PAYMENT", {
+      propertyId: demo.propertyId,
+      membershipOrderId: membershipOrderResult.membershipOrderId,
+      originalPaymentFactId: membershipPaymentResult.paymentFactId,
+      correctedAmountMinor: 162000,
+      correctedTransactionReference: "WX-EFFECT-MEMBER-002"
+    });
+    await confirm(correctedMembershipPayment);
+    await capture("ACTIVATE_MEMBERSHIP_ORDER", {
+      propertyId: demo.propertyId,
+      membershipOrderId: membershipOrderResult.membershipOrderId
     });
 
     const maintenance = await capture("LOCK_MAINTENANCE", {
@@ -190,6 +239,13 @@ describe("Command effect HTTP contract", () => {
       entitlementLotId: demo.roomLotId,
       quantityDelta: 1,
       adjustmentReason: "Effect contract adjustment"
+    });
+    await capture("CORRECT_MEMBER_ENTITLEMENT_BALANCE", {
+      propertyId: demo.propertyId,
+      entitlementLotId: demo.roomLotId,
+      expectedAvailableBalance: 2,
+      targetAvailableBalance: 3,
+      adjustmentReason: "Effect contract target-balance correction"
     });
 
     const propertyToday = todayInTimeZone("Asia/Shanghai");
@@ -288,16 +344,18 @@ describe("Command effect HTTP contract", () => {
     const memberPriced = await quote({
       arrivalDate: "2028-05-10",
       departureDate: "2028-05-12",
-      memberContractId: demo.memberContractId
+      inventoryUnitId: "unit_room_d_gen_01",
+      memberId: demo.memberId
     });
     const memberOrder = await capture("CREATE_ORDER", {
       propertyId: demo.propertyId,
       quoteId: memberPriced.quoteId,
-      primaryGuest: { fullName: "Effect Contract Member Guest", nickname: "Effect Member" },
-      bookingChannelCode: "WECOM",
-      channelOrderReference: null
+      primaryGuest: { fullName: "Effect Contract Member Guest", nickname: "Effect Member" }
     });
-    const memberOrderId = (await confirm(memberOrder)).orderId as string;
+    expect(memberOrder.effect).toMatchObject({ bookingChannelCode: null, channelOrderReference: null });
+    const memberOrderResult = await confirm(memberOrder);
+    expect(memberOrderResult).toMatchObject({ bookingChannelCode: null, channelOrderReference: null });
+    const memberOrderId = memberOrderResult.orderId as string;
     await capture("REFRESH_MEMBER_COVERAGE", { propertyId: demo.propertyId, orderId: memberOrderId });
 
     const collection = await capture("RECORD_COLLECTION", {

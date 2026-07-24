@@ -5,7 +5,7 @@
 > 机器可执行目录：`packages/db/catalog/qintopia-2026-reference-catalog.json`
 > `schemaVersion`：`2.0.0`
 >
-> `importId/catalogVersion`：`qintopia-2026-feishu-revision-561-user-confirmed-v3`
+> `importId/catalogVersion`：`qintopia-2026-feishu-revision-561-user-confirmed-v4`
 >
 > 物业范围：`prop_qintopia_demo` / `QTP-SH`；时区 `Asia/Shanghai`；币种 `CNY`
 
@@ -44,8 +44,8 @@
 | A | A01 标间 2、A02 标间 2、A03 大床 1、A04 大床 1 | 4 | 6 |
 | B | B01 单人 1、B02 单人 1、B03 标间 2、B04 标间 2 | 4 | 6 |
 | C | C01-C04 独卫单人间，各 1 | 4 | 4 |
-| D | D-GEN-01/02 公卫单人间，各 1；D-GEN-03/04/05 公卫标间，各 2 | 5 | 8 |
-| E | E-GEN-01 独卫标间 2、E-GEN-02 独卫单人 1、E-GEN-03 独卫套房 2 | 3 | 5 |
+| D | D01/02 公卫单人间，各 1；D03/04/05 公卫标间，各 2 | 5 | 8 |
+| E | E01 独卫标间 2、E02 独卫单人 1、E03 独卫套房 2 | 3 | 5 |
 | 1栋 | 101/102/103/105/107/108/109 四人间，各 4；104/106 两人间，各 2 | 9 | 32 |
 | 2栋 | 201/205 公卫单人间，各 1；202/203/206 四人间，各 4；204 两人间 2 | 6 | 16 |
 | 3栋 | 301-304 公卫单人间，各 1；305-309 公卫标间，各 2 | 9 | 14 |
@@ -54,7 +54,7 @@
 ### 编码来源
 
 - 当前业务楼栋名为 C 栋；源表 `I01-I04` 只作为来源追溯，运营编码为 `C01-C04`。
-- 飞书明细没有 D/E 的稳定房号。`D-GEN-*`、`E-GEN-*` 是 PMS 生成编码，`codeProvenance=PMS_GENERATED`，不得描述成源表原始房号。
+- 飞书明细没有 D/E 的稳定房号。`D01-D05`、`E01-E03` 是 PMS 生成的运营房号，`codeProvenance=PMS_GENERATED`，不得描述成源表原始房号；内部库存 ID 继续保留最初生成时的稳定值。
 - 2 床房物理床号使用 A/B，4 床房使用 A/B/C/D。物理床号不会让仅按间售卖的房型自动变成 `BED` 销售库存。
 - 套房的两张实体床均为大床；大床房每间一张大床。当前机器目录只执行套房 `2` 张物理床及 A/B 标签，尚未把“大床”保存成独立 `bedKind` 字段。
 
@@ -92,22 +92,22 @@
 │   └── C04 单人间独卫 [ROOM基础: unit_room_c04; private_bath_single_room]
 │       └── 实体床 1张 [无BED库存]
 ├── D栋（5房 / 8实体床；源标签“养蜂”）
-│   ├── D-GEN-01 单人间公卫 [ROOM基础: unit_room_d_gen_01; shared_bath_single_room]
+│   ├── D01 单人间公卫 [ROOM基础: unit_room_d_gen_01; shared_bath_single_room]
 │   │   └── 实体床 1张 [无BED库存]
-│   ├── D-GEN-02 单人间公卫 [ROOM基础: unit_room_d_gen_02; shared_bath_single_room]
+│   ├── D02 单人间公卫 [ROOM基础: unit_room_d_gen_02; shared_bath_single_room]
 │   │   └── 实体床 1张 [无BED库存]
-│   ├── D-GEN-03 标间公卫 [ROOM基础: unit_room_d_gen_03; shared_bath_standard_room]
+│   ├── D03 标间公卫 [ROOM基础: unit_room_d_gen_03; shared_bath_standard_room]
 │   │   └── 物理床 A/B [仅标签，无BED库存]
-│   ├── D-GEN-04 标间公卫 [ROOM基础: unit_room_d_gen_04; shared_bath_standard_room]
+│   ├── D04 标间公卫 [ROOM基础: unit_room_d_gen_04; shared_bath_standard_room]
 │   │   └── 物理床 A/B [仅标签，无BED库存]
-│   └── D-GEN-05 标间公卫 [ROOM基础: unit_room_d_gen_05; shared_bath_standard_room]
+│   └── D05 标间公卫 [ROOM基础: unit_room_d_gen_05; shared_bath_standard_room]
 │       └── 物理床 A/B [仅标签，无BED库存]
 ├── E栋（3房 / 5实体床；源标签“蝴蝶”）
-│   ├── E-GEN-01 标间独卫 [ROOM基础: unit_room_e_gen_01; private_bath_standard_room]
+│   ├── E01 标间独卫 [ROOM基础: unit_room_e_gen_01; private_bath_standard_room]
 │   │   └── 物理床 A/B [仅标签，无BED库存]
-│   ├── E-GEN-02 单人间独卫 [ROOM基础: unit_room_e_gen_02; private_bath_single_room]
+│   ├── E02 单人间独卫 [ROOM基础: unit_room_e_gen_02; private_bath_single_room]
 │   │   └── 实体床 1张 [无BED库存]
-│   └── E-GEN-03 套房独卫 [ROOM基础: unit_room_e_gen_03; private_bath_suite_room]
+│   └── E03 套房独卫 [ROOM基础: unit_room_e_gen_03; private_bath_suite_room]
 │       └── 大床 A/B [仅物理标签，无BED库存]
 ├── 1栋（9房 / 32实体床；32个BED基础 + 9个ROOM组合）
 │   ├── 101 四人间公卫 [ROOM组合: unit_room_101; shared_bath_quad_whole_room]

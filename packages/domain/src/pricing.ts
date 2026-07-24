@@ -82,6 +82,10 @@ export function isTransientDuration(nights: number): boolean {
   return nights < 7;
 }
 
+export function paidStayTypeForNights(nights: number): "TRANSIENT" | "CUSTOM" {
+  return isTransientDuration(nights) ? "TRANSIENT" : "CUSTOM";
+}
+
 export function durationBandAnchorNights(nights: number): DurationBandAnchorNights {
   if (!Number.isSafeInteger(nights) || nights < 1) throw new DomainError("VALIDATION_ERROR", "Stay nights must be a positive integer");
   if (nights < 7) return 1;

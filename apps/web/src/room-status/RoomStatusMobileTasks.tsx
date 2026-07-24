@@ -19,8 +19,8 @@ import {
   formatRoomStatusDate,
   formatRoomStatusDateTime,
   roomStatusActionLabels,
-  roomStatusBlockingFactLabels,
   roomStatusSourceLabels,
+  roomStatusUnitLabel,
   RoomStatusMark,
   useRoomStatusMobileViewport
 } from "./roomStatusPresentation";
@@ -265,14 +265,14 @@ export function RoomStatusMobileTasks({
                     onClick={() => openTask(interval)}
                   >
                     <span className="room-status-mobile-task-title">
-                      <strong>{unit ? `${unit.code} · ${unit.name}` : interval.displayInventoryUnitId}</strong>
+                      <strong>{unit ? roomStatusUnitLabel(unit) : interval.displayInventoryUnitId}</strong>
                       <RoomStatusMark status={interval.status} compact />
                     </span>
                     {interval.primaryOccupantLabel ? <span>主要居住人 · {interval.primaryOccupantLabel}</span> : null}
                     <span>{interval.label}</span>
                     <small>来源完整区间 {formatRoomStatusDate(interval.sourceStartDate)}至{formatRoomStatusDate(interval.sourceEndDate)} · {roomStatusSourceLabels[interval.sourceKind]}</small>
                     {!unit ? <small className="room-status-mobile-task-warning">库存单元未包含在当前查询页，保留稳定 ID。</small> : null}
-                    {interval.conflicts.length ? <small className="room-status-mobile-task-warning">{interval.conflicts.length} 个服务端阻断冲突</small> : null}
+                    {interval.conflicts.length ? <small className="room-status-mobile-task-warning">{interval.conflicts.length} 个日期占用</small> : null}
                   </button>
                   {primaryAction ? (
                     <button type="button" className="room-status-button room-status-mobile-primary-action" onClick={() => onAction(primaryAction, interval, unit)}>
@@ -329,7 +329,7 @@ export function RoomStatusMobileTasks({
             <section aria-labelledby={`${tabsId}-detail-range`}>
               <h3 id={`${tabsId}-detail-range`}><CalendarDays aria-hidden="true" size={18} />房源与日期</h3>
               <dl>
-                <dt>房源</dt><dd>{detailUnit ? `${detailUnit.code} · ${detailUnit.name}` : "当前查询页未包含房源名称"}</dd>
+                <dt>房源</dt><dd>{detailUnit ? roomStatusUnitLabel(detailUnit) : "当前查询页未包含房源名称"}</dd>
                 <dt>营业日期</dt><dd><code>{detailInterval.businessDate}</code></dd>
                 <dt>任务显示区间</dt><dd><code>[{detailInterval.startDate}, {detailInterval.endDate})</code></dd>
                 <dt>来源完整区间</dt><dd><code>[{detailInterval.sourceStartDate}, {detailInterval.sourceEndDate})</code></dd>
@@ -384,8 +384,8 @@ export function RoomStatusMobileTasks({
             ) : null}
             {detailInterval.conflicts.length ? (
               <section className="room-status-mobile-detail-conflicts" aria-labelledby={`${tabsId}-detail-conflicts`}>
-                <h3 id={`${tabsId}-detail-conflicts`}><ShieldAlert aria-hidden="true" size={18} />阻断冲突</h3>
-                <ul>{detailInterval.conflicts.map((conflict) => <li key={conflict.id}><strong>{conflict.reason}</strong><span>{conflict.startDate} 至 {conflict.endDate}</span><span>{roomStatusBlockingFactLabels[conflict.blockingFactKind]}</span><code>{conflict.claimId ?? conflict.sourceReference.id}</code></li>)}</ul>
+                <h3 id={`${tabsId}-detail-conflicts`}><ShieldAlert aria-hidden="true" size={18} />日期占用</h3>
+                <ul>{detailInterval.conflicts.map((conflict) => <li key={conflict.id}><strong>{roomStatusSourceLabels[conflict.sourceKind]} 已有住宿，不能重复安排</strong><span>{formatRoomStatusDate(conflict.startDate)}至{formatRoomStatusDate(conflict.endDate)}</span></li>)}</ul>
               </section>
             ) : null}
             <section aria-labelledby={`${tabsId}-detail-freshness`}>

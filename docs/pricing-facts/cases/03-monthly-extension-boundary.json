@@ -13,7 +13,7 @@
   "priceInputs": {
     "policyVersionReference": "policy_qintopia_public_2026_rev561_v1",
     "initialProductCode": "private_bath_suite_room",
-    "initialInventoryUnitReference": "ROOM-E-GEN-03",
+    "initialInventoryUnitReference": "ROOM-E03",
     "initialDepartureDate": "2026-03-30"
   },
   "coverageSet": [],
@@ -37,7 +37,7 @@
           "lineKind": "STAY_TOTAL",
           "pricingBandAnchorNights": 14,
           "calculationSegments": [{
-            "inventoryUnitReference": "ROOM-E-GEN-03",
+            "inventoryUnitReference": "ROOM-E03",
             "pricingProductCode": "private_bath_suite_room",
             "arrivalDate": "2026-03-01",
             "departureDate": "2026-03-30",
@@ -64,7 +64,7 @@
           "lineKind": "STAY_TOTAL",
           "pricingBandAnchorNights": 30,
           "calculationSegments": [{
-            "inventoryUnitReference": "ROOM-E-GEN-03",
+            "inventoryUnitReference": "ROOM-E03",
             "pricingProductCode": "private_bath_suite_room",
             "arrivalDate": "2026-03-01",
             "departureDate": "2026-03-31",
@@ -85,7 +85,7 @@
       "lineKind": "STAY_TOTAL",
       "pricingBandAnchorNights": 30,
       "calculationSegments": [{
-        "inventoryUnitReference": "ROOM-E-GEN-03",
+        "inventoryUnitReference": "ROOM-E03",
         "pricingProductCode": "private_bath_suite_room",
         "arrivalDate": "2026-03-01",
         "departureDate": "2026-03-31",

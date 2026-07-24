@@ -9,12 +9,110 @@ import type { Database } from "./schema.ts";
 export interface QuoteRequest {
   propertyId: string;
   inventoryUnitId: string;
-  stayType: StayType;
+  stayType?: StayType;
   arrivalDate: string;
   departureDate: string;
   pricingPolicyVersionId: string;
+  memberId?: string;
   memberContractId?: string;
   requesterSubjectId?: string;
+}
+
+interface MemberCoverageResolution {
+  memberContractId?: string;
+  coverageCandidates: CoverageCandidate[];
+}
+
+export async function resolveMemberCoverage(db: DbExecutor, options: {
+  propertyId: string;
+  memberId: string;
+  inventoryUnitKind: InventoryUnitKind;
+  roomTypeCode: string | null;
+  dates: string[];
+  preserved?: CoverageCandidate[];
+}): Promise<MemberCoverageResolution> {
+  const member = await db.selectFrom("member_property_links")
+    .select("member_id")
+    .where("member_id", "=", options.memberId)
+    .where("property_id", "=", options.propertyId)
+    .executeTakeFirst();
+  if (!member) throw new DomainError("NOT_FOUND", "当前门店未找到该会员档案", 404);
+  if (!options.roomTypeCode) throw new DomainError("ENTITLEMENT_CONFLICT", "所选房源缺少会员房型信息，不能使用会员权益", 409);
+
+  const propertyToday = await propertyLocalToday(db, options.propertyId);
+  const rows = await db.selectFrom("membership_orders")
+    .innerJoin("member_contracts", "member_contracts.id", "membership_orders.contract_id")
+    .innerJoin("entitlement_lots", "entitlement_lots.id", "membership_orders.entitlement_lot_id")
+    .leftJoin("entitlement_ledger", "entitlement_ledger.lot_id", "entitlement_lots.id")
+    .select([
+      "membership_orders.allowed_room_type_code",
+      "membership_orders.allowed_inventory_kind",
+      "membership_orders.entitlement_unit_kind",
+      "member_contracts.id as contract_id",
+      "member_contracts.valid_from",
+      "member_contracts.valid_until",
+      "entitlement_lots.id as lot_id",
+      "entitlement_lots.expires_on",
+      "entitlement_lots.total_units",
+      sql<string>`cast(coalesce(sum(entitlement_ledger.quantity_delta), 0) as text)`.as("ledger_delta"),
+      sql<string>`cast(count(*) filter (where entitlement_ledger.entry_type = 'EXPIRE') as text)`.as("expire_count")
+    ])
+    .where("membership_orders.member_id", "=", options.memberId)
+    .where("membership_orders.property_id", "=", options.propertyId)
+    .where("membership_orders.status", "=", "ACTIVE")
+    .where("member_contracts.status", "=", "ACTIVE")
+    .groupBy([
+      "membership_orders.allowed_room_type_code",
+      "membership_orders.allowed_inventory_kind",
+      "membership_orders.entitlement_unit_kind",
+      "member_contracts.id",
+      "member_contracts.valid_from",
+      "member_contracts.valid_until",
+      "entitlement_lots.id",
+      "entitlement_lots.expires_on",
+      "entitlement_lots.total_units"
+    ])
+    .execute();
+
+  const matching = rows.filter((row) => row.allowed_room_type_code === options.roomTypeCode
+    && row.allowed_inventory_kind === options.inventoryUnitKind
+    && row.entitlement_unit_kind === entitlementKindFor(options.inventoryUnitKind));
+  if (matching.length === 0) {
+    throw new DomainError("ENTITLEMENT_CONFLICT", "该会员的已生效权益不适用于所选房型", 409);
+  }
+  const validForStay = matching.filter((row) => row.expires_on >= propertyToday
+    && parsePostgresBigInt(row.expire_count, "Entitlement expiration count") === 0n
+    && options.dates.some((date) => row.valid_from <= date && date <= row.valid_until && date <= row.expires_on));
+  const preserved = (options.preserved ?? []).filter((item) => options.dates.includes(item.serviceDate));
+  if (validForStay.length === 0) return { coverageCandidates: preserved };
+
+  const remaining = new Map(validForStay.map((row) => [
+    row.lot_id,
+    entitlementAvailableBalance(row.total_units, row.ledger_delta)
+  ]));
+  const coverageCandidates: CoverageCandidate[] = [...preserved];
+  const alreadyCovered = new Set(preserved.map((item) => item.serviceDate));
+  const usedContractIds = new Set<string>();
+  for (const serviceDate of options.dates) {
+    if (alreadyCovered.has(serviceDate)) continue;
+    const eligible = validForStay.filter((row) => row.valid_from <= serviceDate
+      && serviceDate <= row.valid_until
+      && serviceDate <= row.expires_on
+      && (remaining.get(row.lot_id) ?? 0) > 0);
+    if (eligible.length > 1) {
+      throw new DomainError("ENTITLEMENT_CONFLICT", "该会员有多份权益可覆盖同一住宿日期，消耗顺序尚未确认，暂不能创建会员住宿", 409);
+    }
+    const selected = eligible[0];
+    if (!selected) continue;
+    remaining.set(selected.lot_id, (remaining.get(selected.lot_id) ?? 0) - 1);
+    usedContractIds.add(selected.contract_id);
+    coverageCandidates.push({ serviceDate, entitlementLotId: selected.lot_id });
+  }
+  if (usedContractIds.size > 1) {
+    throw new DomainError("ENTITLEMENT_CONFLICT", "本次住宿需要跨多份会员权益，消耗顺序尚未确认，暂不能创建会员住宿", 409);
+  }
+  const memberContractId = usedContractIds.values().next().value ?? (validForStay.length === 1 ? validForStay[0]!.contract_id : undefined);
+  return { ...(memberContractId ? { memberContractId } : {}), coverageCandidates };
 }
 
 export type StoredQuote = StoredQuoteDto;
@@ -113,24 +211,64 @@ async function enforceQuoteQuota(db: Transaction<Database>, propertyId: string, 
 
 export async function createQuoteInTransaction(db: Transaction<Database>, request: QuoteRequest): Promise<StoredQuote> {
   await enforceQuoteQuota(db, request.propertyId, request.requesterSubjectId);
-  if (request.stayType === "FREE" && request.memberContractId) {
-    throw new DomainError("PRICING_POLICY_UNCONFIGURED", "Free stays cannot use member entitlement coverage", 409);
-  }
   const unit = await loadInventoryUnit(db, request.propertyId, request.inventoryUnitId);
   const policy = await loadPricingPolicy(db, request.propertyId, request.pricingPolicyVersionId);
   const availability = await listAvailability(db, request.propertyId, request.arrivalDate, request.departureDate, unit.kind);
   const selected = availability.find((candidate) => candidate.id === unit.id);
-  if (!selected?.available) throw new DomainError("INVENTORY_CONFLICT", "Inventory is not available for the requested dates", 409);
   const dates = enumerateServiceDates(request.arrivalDate, request.departureDate);
-  if (request.stayType === "TRANSIENT" && !isTransientDuration(dates.length)) {
-    throw new DomainError("PRICING_POLICY_UNCONFIGURED", "TRANSIENT stays must be strictly shorter than 7 nights", 422);
+  const derivedPaidStayType = isTransientDuration(dates.length) ? "TRANSIENT" : "CUSTOM";
+  const stayType = request.stayType === "FREE" ? "FREE" : derivedPaidStayType;
+  if (request.memberId && request.memberContractId) {
+    throw new DomainError("VALIDATION_ERROR", "会员报价只能选择会员档案，不能同时指定会员合同");
   }
-  const coverageCandidates = await allocateCoverageCandidates(db, {
-    propertyId: request.propertyId,
-    inventoryUnitKind: unit.kind,
-    dates,
-    ...(request.memberContractId ? { memberContractId: request.memberContractId } : {})
-  });
+  if (request.stayType !== undefined && request.stayType !== "FREE" && request.stayType !== derivedPaidStayType) {
+    throw new DomainError(
+      "PRICING_POLICY_UNCONFIGURED",
+      `住宿类型与 ${dates.length} 晚住宿不一致，请重新报价`,
+      422
+    );
+  }
+  if (stayType === "FREE" && (request.memberId || request.memberContractId)) {
+    throw new DomainError("PRICING_POLICY_UNCONFIGURED", "Free stays cannot use member entitlement coverage", 409);
+  }
+  if (!selected) throw new DomainError("NOT_FOUND", "Inventory unit not found", 404);
+  if (!selected.available) {
+    const firstBlockedIndex = selected.nights.findIndex((night) => !night.available);
+    const firstBlocked = selected.nights[firstBlockedIndex];
+    let endIndex = firstBlockedIndex;
+    while (endIndex + 1 < selected.nights.length && !selected.nights[endIndex + 1]!.available) endIndex += 1;
+    const overlapEnd = dates[endIndex + 1] ?? request.departureDate;
+    throw new DomainError(
+      "INVENTORY_CONFLICT",
+      `${unit.code} 在 ${firstBlocked!.serviceDate} 至 ${overlapEnd} 已有住宿，不能重复安排`,
+      409,
+      false,
+      {
+        inventoryUnitCode: unit.code,
+        overlapStartDate: firstBlocked!.serviceDate,
+        overlapEndDate: overlapEnd,
+        claimIds: firstBlocked!.blockingClaimIds
+      }
+    );
+  }
+  const memberCoverage = request.memberId
+    ? await resolveMemberCoverage(db, {
+      propertyId: request.propertyId,
+      memberId: request.memberId,
+      inventoryUnitKind: unit.kind,
+      roomTypeCode: unit.roomTypeCode,
+      dates
+    })
+    : {
+      memberContractId: request.memberContractId,
+      coverageCandidates: await allocateCoverageCandidates(db, {
+        propertyId: request.propertyId,
+        inventoryUnitKind: unit.kind,
+        dates,
+        ...(request.memberContractId ? { memberContractId: request.memberContractId } : {})
+      })
+    };
+  const coverageCandidates = memberCoverage.coverageCandidates;
   const calculated = calculatePricing({
     propertyId: request.propertyId,
     inventoryUnitId: unit.id,
@@ -138,23 +276,25 @@ export async function createQuoteInTransaction(db: Transaction<Database>, reques
     inventoryProductCode: unit.pricingProductCode,
     arrivalDate: request.arrivalDate,
     departureDate: request.departureDate,
-    stayType: request.stayType,
+    stayType,
     policy,
-    memberCoverage: Boolean(request.memberContractId),
+    memberCoverage: Boolean(request.memberId || request.memberContractId),
     coverageCandidates
   });
   const quoteId = newId("quote");
   const expiresAt = new Date(Date.now() + 15 * 60_000);
-  const inputHash = stableHash(request);
+  const normalizedRequest = { ...request, stayType };
+  const inputHash = stableHash(normalizedRequest);
   await db.insertInto("quotes").values({
     id: quoteId,
     property_id: request.propertyId,
     inventory_unit_id: unit.id,
-    stay_type: request.stayType,
+    stay_type: stayType,
     arrival_date: request.arrivalDate,
     departure_date: request.departureDate,
     policy_version_id: policy.id,
-    member_contract_id: request.memberContractId ?? null,
+    member_id: request.memberId ?? null,
+    member_contract_id: memberCoverage.memberContractId ?? null,
     requester_subject_id: request.requesterSubjectId ?? null,
     input_hash: inputHash,
     coverage_set: JSON.stringify(calculated.coverageSet),
@@ -168,7 +308,7 @@ export async function createQuoteInTransaction(db: Transaction<Database>, reques
     quoteId,
     propertyId: request.propertyId,
     inventoryUnitId: unit.id,
-    stayType: request.stayType,
+    stayType,
     arrivalDate: request.arrivalDate,
     departureDate: request.departureDate,
     pricingPolicyVersionId: policy.id,
@@ -177,7 +317,8 @@ export async function createQuoteInTransaction(db: Transaction<Database>, reques
     cashRemainder: calculated.cashRemainder,
     currentContractAmount: calculated.currentContractAmount,
     expiresAt: expiresAt.toISOString(),
-    ...(request.memberContractId ? { memberContractId: request.memberContractId } : {}),
+    ...(request.memberId ? { memberId: request.memberId } : {}),
+    ...(memberCoverage.memberContractId ? { memberContractId: memberCoverage.memberContractId } : {}),
     inputHash
   };
 }
@@ -217,6 +358,7 @@ export async function loadStoredQuote(db: DbExecutor, quoteId: string, requireFr
     cashRemainder: { currency: row.currency, minorUnits: row.cash_remainder_minor },
     currentContractAmount: { currency: row.currency, minorUnits: row.current_contract_amount_minor },
     expiresAt: expiresAt.toISOString(),
+    ...(row.member_id ? { memberId: row.member_id } : {}),
     ...(row.member_contract_id ? { memberContractId: row.member_contract_id } : {}),
     inputHash: row.input_hash
   };

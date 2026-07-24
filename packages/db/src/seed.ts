@@ -1,6 +1,6 @@
 import { hashPassword, sha256 } from "@qintopia/domain";
 import { pathToFileURL } from "node:url";
-import type { Insertable, Kysely } from "kysely";
+import { sql, type Insertable, type Kysely } from "kysely";
 import { createDatabase } from "./database.ts";
 import { loadBundledQintopia2026Catalog } from "./reference-catalog.ts";
 import type { Database } from "./schema.ts";
@@ -19,7 +19,8 @@ export const demo = {
   memberId: "member_demo_profile",
   memberContractId: "member_demo_contract",
   roomLotId: "lot_demo_room_nights",
-  bedLotId: "lot_demo_bed_nights",
+  membershipOrderId: "membership_order_demo_shared_single",
+  membershipPaymentFactId: "membership_payment_demo_shared_single",
   operatorSubjectId: "subject_demo_operator",
   agentSubjectId: "subject_demo_agent",
   readToken: "qtp_demo_read_token_2026",
@@ -31,7 +32,11 @@ function slug(value: string): string {
 }
 
 function roomUnitId(operationalCode: string): string {
-  return `unit_room_${slug(operationalCode)}`;
+  const generatedAlias = /^([DE])(0[1-5])$/.exec(operationalCode);
+  const stableCode = generatedAlias
+    ? `${generatedAlias[1]}-GEN-${generatedAlias[2]}`
+    : operationalCode;
+  return `unit_room_${slug(stableCode)}`;
 }
 
 export function publicPricingPolicyId(): string {
@@ -159,10 +164,79 @@ export async function seedDemo(db: Kysely<Database>, options: { includeProtocolF
     valid_until: "2029-12-31",
     version: 1
   }).onConflict((oc) => oc.column("id").doUpdateSet({ member_id: demo.memberId })).execute();
-  await db.insertInto("entitlement_lots").values([
-    { id: demo.roomLotId, contract_id: demo.memberContractId, unit_kind: "ROOM_NIGHT", total_units: 2, expires_on: "2029-12-31", version: 1 },
-    { id: demo.bedLotId, contract_id: demo.memberContractId, unit_kind: "BED_NIGHT", total_units: 2, expires_on: "2029-12-31", version: 1 }
-  ]).onConflict((oc) => oc.column("id").doNothing()).execute();
+  const memberPropertyLinksTable = await sql<{ table_name: string | null }>`
+    select to_regclass('public.member_property_links')::text as table_name
+  `.execute(db);
+  if (memberPropertyLinksTable.rows[0]?.table_name) {
+    await db.insertInto("member_property_links").values({
+      member_id: demo.memberId,
+      property_id: demo.propertyId
+    }).onConflict((oc) => oc.columns(["member_id", "property_id"]).doNothing()).execute();
+  }
+  await db.insertInto("entitlement_lots").values({
+    id: demo.roomLotId,
+    contract_id: demo.memberContractId,
+    unit_kind: "ROOM_NIGHT",
+    total_units: 2,
+    expires_on: "2029-12-31",
+    version: 1
+  }).onConflict((oc) => oc.column("id").doNothing()).execute();
+  const membershipOrdersTable = await sql<{ table_name: string | null }>`
+    select to_regclass('public.membership_orders')::text as table_name
+  `.execute(db);
+  if (membershipOrdersTable.rows[0]?.table_name) {
+    await db.insertInto("membership_orders").values({
+      id: demo.membershipOrderId,
+      property_id: demo.propertyId,
+      member_id: demo.memberId,
+      product_id: "membership_product_shared_bath_single_v1",
+      product_code: "SHARED_BATH_SINGLE_30",
+      product_version: 1,
+      product_name: "公卫单人间会员",
+      listed_price_minor: 162_000,
+      agreed_price_minor: 162_000,
+      price_adjustment_minor: 0,
+      price_adjustment_reason: null,
+      currency: "CNY",
+      entitlement_unit_kind: "ROOM_NIGHT",
+      entitlement_units: 2,
+      allowed_room_type_code: "shared_bath_single",
+      allowed_inventory_kind: "ROOM",
+      status: "ACTIVE",
+      activated_at: new Date("2026-01-01T00:00:00.000Z"),
+      valid_from: "2026-01-01",
+      valid_until: "2029-12-31",
+      contract_id: demo.memberContractId,
+      entitlement_lot_id: demo.roomLotId,
+      version: 1,
+      created_by_command_id: "seed_demo_membership_order",
+      activated_by_command_id: "seed_demo_membership_order"
+    }).onConflict((oc) => oc.column("id").doNothing()).execute();
+    const existingPaymentFact = await db.selectFrom("membership_payment_facts")
+      .select("fact_id")
+      .where("membership_order_id", "=", demo.membershipOrderId)
+      .limit(1)
+      .executeTakeFirst();
+    if (!existingPaymentFact) {
+      await db.insertInto("membership_payment_facts").values({
+        fact_id: demo.membershipPaymentFactId,
+        membership_order_id: demo.membershipOrderId,
+        fact_type: "COLLECTION",
+        amount_minor: 162_000,
+        net_effect_minor: 162_000,
+        currency: "CNY",
+        transaction_reference: "DEMO-WECOM-20260101-001",
+        corrects_fact_id: null,
+        reverses_fact_id: null,
+        note: "Demo 会员订单企微收款",
+        command_id: "seed_demo_membership_payment"
+      }).onConflict((oc) => oc.column("fact_id").doNothing()).execute();
+    }
+    await db.updateTable("member_contracts").set({ membership_order_id: demo.membershipOrderId })
+      .where("id", "=", demo.memberContractId)
+      .where("membership_order_id", "is", null)
+      .execute();
+  }
 }
 
 async function runSeed() {

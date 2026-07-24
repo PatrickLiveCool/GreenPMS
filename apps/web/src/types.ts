@@ -182,13 +182,80 @@ export interface MemberViewDto {
   lotBalances: MemberLotBalanceDto[];
   availableBalance: MemberAvailableBalanceDto;
   balanceAsOfDate: string;
+  membershipProducts: MembershipProductDto[];
+  membershipOrders: MembershipOrderSummaryDto[];
+}
+
+export interface MembershipProductDto {
+  id: string;
+  code: string;
+  version: number;
+  name: string;
+  list_price_minor: number;
+  currency: string;
+  entitlement_unit_kind: "ROOM_NIGHT" | "BED_NIGHT";
+  entitlement_units: number;
+  validity_period: "P1Y";
+  allowed_room_type_code: string;
+  allowed_inventory_kind: "ROOM" | "BED";
+  status: "PUBLISHED";
+  created_at: string;
+}
+
+export interface MembershipOrderDto {
+  id: string;
+  property_id: string;
+  member_id: string;
+  product_id: string;
+  product_code: string;
+  product_version: number;
+  product_name: string;
+  listed_price_minor: number;
+  agreed_price_minor: number;
+  price_adjustment_minor: number;
+  price_adjustment_reason: string | null;
+  currency: string;
+  entitlement_unit_kind: "ROOM_NIGHT" | "BED_NIGHT";
+  entitlement_units: number;
+  allowed_room_type_code: string;
+  allowed_inventory_kind: "ROOM" | "BED";
+  status: "DRAFT" | "ACTIVE";
+  activated_at: string | null;
+  valid_from: string | null;
+  valid_until: string | null;
+  contract_id: string | null;
+  entitlement_lot_id: string | null;
+  version: number;
+  created_by_command_id: string;
+  activated_by_command_id: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface MembershipPaymentFactDto {
+  fact_id: string;
+  membership_order_id: string;
+  fact_type: "COLLECTION" | "REVERSAL";
+  amount_minor: number;
+  net_effect_minor: number;
+  currency: string;
+  transaction_reference: string | null;
+  corrects_fact_id: string | null;
+  reverses_fact_id: string | null;
+  note: string;
+  command_id: string;
+  created_at: string;
+}
+
+export interface MembershipOrderSummaryDto {
+  order: MembershipOrderDto;
+  paymentFacts: MembershipPaymentFactDto[];
+  paymentTotalMinor: number;
+  paymentDifferenceMinor: number;
 }
 
 export interface MemberSummaryDto {
   member: MemberDto;
-  contracts: MemberContractDto[];
-  availableBalance: MemberAvailableBalanceDto;
-  balanceAsOfDate: string;
 }
 
 export interface MetaDto {
@@ -253,6 +320,7 @@ export interface OrderRowDto {
   channel_order_reference: string | null;
   free_stay_reason: string | null;
   pricing_policy_version_id: string;
+  member_id: string | null;
   member_contract_id: string | null;
   current_revision_id: string | null;
   version: number;
@@ -361,6 +429,7 @@ export interface CommandRequest {
   input: Record<string, unknown>;
   title: string;
   description: string;
+  presentation?: "MEMBER_STAY";
 }
 
 export type {
