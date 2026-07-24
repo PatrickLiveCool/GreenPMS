@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { AuthPrincipal, CommandEnvelope, ReceiptDto } from "@qintopia/contracts";
-import { confirmCommandPreview, createCommandPreview, findCommandResult, getOrderView, listAvailability, loadActiveStayTimeline, loadOrderContext, type Database } from "@qintopia/db";
+import { confirmCommandPreview, createCommandPreview, findCommandResult, getOrderView, listAvailability, loadActiveStayTimeline, loadOrderContext, propertyLocalToday, type Database } from "@qintopia/db";
 import { newOpaqueSecret } from "@qintopia/domain";
 import { sql, type Kysely } from "kysely";
 import { demo } from "../../packages/db/src/seed.ts";
@@ -20,6 +20,12 @@ let sequence = 0;
 function metadata(prefix: string) {
   sequence += 1;
   return { idempotencyKey: `${prefix}-${sequence}`, correlationId: `${prefix}-${sequence}` };
+}
+
+function addDays(date: string, days: number): string {
+  const value = new Date(`${date}T00:00:00.000Z`);
+  value.setUTCDate(value.getUTCDate() + days);
+  return value.toISOString().slice(0, 10);
 }
 
 async function previewAndConfirm(envelope: CommandEnvelope, prefix: string): Promise<ReceiptDto> {
@@ -609,31 +615,35 @@ describe("PostgreSQL core operations", () => {
   });
 
   it("supports move, extension, and shortening while checked in", async () => {
+    const arrivalDate = await propertyLocalToday(db, demo.propertyId);
+    const moveDate = addDays(arrivalDate, 1);
+    const originalDepartureDate = addDays(arrivalDate, 3);
+    const extendedDepartureDate = addDays(arrivalDate, 4);
     const created = await createOrder(demo.roomId, "checked-in-amendments", {
       stayType: "FREE",
-      arrival: "2026-07-21",
-      departure: "2026-07-24"
+      arrival: arrivalDate,
+      departure: originalDepartureDate
     });
     const orderId = created.result!.orderId as string;
     await previewAndConfirm({ commandType: "CHECK_IN", input: { propertyId: demo.propertyId, orderId } }, "checked-in-amendments-check-in");
     await previewAndConfirm({
       commandType: "MOVE_UNIT",
-      input: { propertyId: demo.propertyId, orderId, newInventoryUnitId: demo.secondRoomId, effectiveDate: "2026-07-22" }
+      input: { propertyId: demo.propertyId, orderId, newInventoryUnitId: demo.secondRoomId, effectiveDate: moveDate }
     }, "checked-in-amendments-move");
     await previewAndConfirm({
       commandType: "EXTEND_STAY",
-      input: { propertyId: demo.propertyId, orderId, newDepartureDate: "2026-07-25" }
+      input: { propertyId: demo.propertyId, orderId, newDepartureDate: extendedDepartureDate }
     }, "checked-in-amendments-extend");
     await previewAndConfirm({
       commandType: "SHORTEN_STAY",
-      input: { propertyId: demo.propertyId, orderId, newDepartureDate: "2026-07-24" }
+      input: { propertyId: demo.propertyId, orderId, newDepartureDate: originalDepartureDate }
     }, "checked-in-amendments-shorten");
     const context = await loadOrderContext(db, orderId);
     expect(context.order.status).toBe("CHECKED_IN");
     expect(await loadActiveStayTimeline(db, context)).toEqual([
-      { serviceDate: "2026-07-21", inventoryUnitId: demo.roomId },
-      { serviceDate: "2026-07-22", inventoryUnitId: demo.secondRoomId },
-      { serviceDate: "2026-07-23", inventoryUnitId: demo.secondRoomId }
+      { serviceDate: arrivalDate, inventoryUnitId: demo.roomId },
+      { serviceDate: moveDate, inventoryUnitId: demo.secondRoomId },
+      { serviceDate: addDays(arrivalDate, 2), inventoryUnitId: demo.secondRoomId }
     ]);
   });
 
